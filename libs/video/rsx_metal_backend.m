@@ -58,6 +58,7 @@
 
 #include "rsx_commands.h"
 #include "rsx_metal_backend.h"
+#include "rsx_host_mouse.h"
 #include "rsx_vertex_fetch.h"
 #include "rsx_primitives.h"
 #include "rsx_vp_decompiler.h"
@@ -80,6 +81,12 @@ static NSWindow*           s_window;
 static volatile uint8_t    s_keys[256];    /* host keys down, by macOS virtual keycode */
 static volatile int        s_key_focus;    /* game window is key and the app is active */
 static id                  s_key_monitor;
+/* The window's mouse, for a port played with it (rsx_host_mouse.h). */
+static volatile int        s_mouse_want;      /* the port asked for the cursor */
+static volatile int        s_mouse_held;      /* and has it: the window is in front */
+static int                 s_mouse_dx, s_mouse_dy, s_mouse_wheel;   /* since last taken (atomic) */
+static volatile unsigned   s_mouse_buttons;   /* bit n: button n is down, while held */
+static double              s_mouse_fx, s_mouse_fy, s_mouse_fwheel;  /* main thread: fractions carried over */
 static int                 s_headless;
 static int                 s_closed;
 static int                 s_ready;
@@ -536,6 +543,86 @@ static void read_display_options(u32* ww, u32* wh)
     }
 }
 
+/* Main thread: take the cursor or give it back. Held, the cursor is hidden
+ * and no longer follows the mouse, so it cannot leave the window or reach
+ * the Dock or a hot corner, while the mouse's events still carry its motion;
+ * it is first put at the middle of the picture, the place it comes back at. */
+static void host_mouse_apply(void)
+{
+    const int hold = s_mouse_want && s_window != nil && s_key_focus && ![s_window isMiniaturized];
+    if (hold && !s_mouse_held) {
+        NSRect r = [s_window convertRectToScreen:[[s_window contentView] frame]];
+        NSScreen* primary = [[NSScreen screens] firstObject];   /* Quartz counts down from its top */
+        if (primary)
+            CGWarpMouseCursorPosition(CGPointMake(NSMidX(r), NSMaxY([primary frame]) - NSMidY(r)));
+        CGAssociateMouseAndMouseCursorPosition(false);
+        [NSCursor hide];
+        /* What the mouse did while it was someone else's is not ours. */
+        s_mouse_fx = s_mouse_fy = s_mouse_fwheel = 0;
+        __atomic_store_n(&s_mouse_dx, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_mouse_dy, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_mouse_wheel, 0, __ATOMIC_RELAXED);
+        s_mouse_buttons = 0;
+        s_mouse_held = 1;
+    } else if (!hold && s_mouse_held) {
+        s_mouse_held = 0;
+        s_mouse_buttons = 0;
+        CGAssociateMouseAndMouseCursorPosition(true);
+        [NSCursor unhide];
+    }
+}
+
+/* Main thread: one of the mouse's events while the cursor is held. */
+static void host_mouse_event(NSEvent* ev)
+{
+    switch (ev.type) {
+    case NSEventTypeMouseMoved:
+    case NSEventTypeLeftMouseDragged:
+    case NSEventTypeRightMouseDragged:
+    case NSEventTypeOtherMouseDragged: {
+        /* Points, a fraction at a time on some devices: whole counts go out,
+         * the rest waits for the next event. */
+        s_mouse_fx += ev.deltaX;
+        s_mouse_fy += ev.deltaY;
+        const int ix = (int)s_mouse_fx, iy = (int)s_mouse_fy;
+        s_mouse_fx -= ix;
+        s_mouse_fy -= iy;
+        if (ix) __atomic_add_fetch(&s_mouse_dx, ix, __ATOMIC_RELAXED);
+        if (iy) __atomic_add_fetch(&s_mouse_dy, iy, __ATOMIC_RELAXED);
+        break;
+    }
+    case NSEventTypeScrollWheel: {
+        /* As the device turned, whatever "natural scrolling" makes of it. A
+         * wheel sends an event a notch; a trackpad sends points, and the
+         * glide after the fingers lift is not the player's. */
+        double dy = ev.scrollingDeltaY;
+        if (ev.directionInvertedFromDevice) dy = -dy;
+        int notches = 0;
+        if (!ev.hasPreciseScrollingDeltas) {
+            notches = dy > 0 ? 1 : dy < 0 ? -1 : 0;
+        } else if (ev.momentumPhase == NSEventPhaseNone) {
+            s_mouse_fwheel += dy;
+            notches = (int)(s_mouse_fwheel / 40.0);
+            s_mouse_fwheel -= notches * 40.0;
+        }
+        if (notches) __atomic_add_fetch(&s_mouse_wheel, notches, __ATOMIC_RELAXED);
+        break;
+    }
+    case NSEventTypeLeftMouseDown:
+    case NSEventTypeRightMouseDown:
+    case NSEventTypeOtherMouseDown:
+        if (ev.buttonNumber >= 0 && ev.buttonNumber < 32) s_mouse_buttons |= 1u << ev.buttonNumber;
+        break;
+    case NSEventTypeLeftMouseUp:
+    case NSEventTypeRightMouseUp:
+    case NSEventTypeOtherMouseUp:
+        if (ev.buttonNumber >= 0 && ev.buttonNumber < 32) s_mouse_buttons &= ~(1u << ev.buttonNumber);
+        break;
+    default:
+        break;
+    }
+}
+
 static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];
@@ -625,9 +712,36 @@ static int create_window_impl(const char* title)
      * still quits. Focus comes from notifications on this thread, and losing
      * it releases every key: AppKit never delivers the keyUp for a key that
      * was held across a focus change. */
+    /* Shift, Control and Option send no key event, only a change of flags:
+     * each side's own bit (IOLLEvent.h's NX_DEVICE*KEYMASK) is that key's
+     * state, under its virtual keycode. And the mouse, for a port played with
+     * it: while the cursor is held (host_mouse_apply) its events are taken
+     * here and go no further, so a click cannot land on the title bar the
+     * hidden cursor may be over; otherwise they are AppKit's as before. */
+    [s_window setAcceptsMouseMovedEvents:YES];
+    const NSEventMask mouse_mask =
+        NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged |
+        NSEventMaskOtherMouseDragged | NSEventMaskScrollWheel | NSEventMaskLeftMouseDown |
+        NSEventMaskLeftMouseUp | NSEventMaskRightMouseDown | NSEventMaskRightMouseUp |
+        NSEventMaskOtherMouseDown | NSEventMaskOtherMouseUp;
     s_key_monitor = [NSEvent addLocalMonitorForEventsMatchingMask:
-                                 (NSEventMaskKeyDown | NSEventMaskKeyUp)
+                                 (NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged | mouse_mask)
                                              handler:^NSEvent*(NSEvent* ev) {
+        if (ev.type == NSEventTypeFlagsChanged) {
+            const NSUInteger f = ev.modifierFlags;
+            s_keys[0x38] = (f & 0x0002u) != 0;   /* left Shift    */
+            s_keys[0x3C] = (f & 0x0004u) != 0;   /* right Shift   */
+            s_keys[0x3B] = (f & 0x0001u) != 0;   /* left Control  */
+            s_keys[0x3E] = (f & 0x2000u) != 0;   /* right Control */
+            s_keys[0x3A] = (f & 0x0020u) != 0;   /* left Option   */
+            s_keys[0x3D] = (f & 0x0040u) != 0;   /* right Option  */
+            return ev;
+        }
+        if (ev.type != NSEventTypeKeyDown && ev.type != NSEventTypeKeyUp) {
+            if (!s_mouse_held) return ev;
+            host_mouse_event(ev);
+            return nil;
+        }
         unsigned kc  = (unsigned)ev.keyCode & 0xFFu;
         int      cmd = (ev.modifierFlags & NSEventModifierFlagCommand) != 0;
         if (ev.type == NSEventTypeKeyDown) { if (!cmd) s_keys[kc] = 1; }
@@ -639,6 +753,7 @@ static int create_window_impl(const char* title)
         int f = [NSApp isActive] && [s_window isKeyWindow];
         if (!f) memset((void*)s_keys, 0, sizeof s_keys);
         s_key_focus = f;
+        host_mouse_apply();
     };
     NSNotificationCenter* nc = [NSNotificationCenter defaultCenter];
     for (NSNotificationName name in @[ NSWindowDidBecomeKeyNotification,
@@ -647,6 +762,7 @@ static int create_window_impl(const char* title)
                                        NSApplicationDidResignActiveNotification ])
         [nc addObserverForName:name object:nil queue:nil usingBlock:focus];
     s_key_focus = 1;
+    host_mouse_apply();   /* asked for before there was a window */
     return 0;
 }
 
@@ -5561,6 +5677,11 @@ void rsx_metal_backend_shutdown(void)
             s_inflight = nil;
         }
 #if !TARGET_OS_IPHONE
+        if (s_mouse_held) {
+            s_mouse_want = 0;
+            if ([NSThread isMainThread]) host_mouse_apply();
+            else dispatch_sync(dispatch_get_main_queue(), ^{ host_mouse_apply(); });
+        }
         if (s_window) { [s_window close]; s_window = nil; }
 #endif
         free(s_verts); s_verts = NULL;
@@ -5595,6 +5716,42 @@ int rsx_metal_backend_window_focused(void)
 #else
     return 0;
 #endif
+}
+
+int rsx_metal_backend_mouse_button_down(unsigned button)
+{
+    return button < 32u ? (int)((s_mouse_buttons >> button) & 1u) : 0;
+}
+
+/* rsx_host_mouse.h, for this backend's window (rsx_host_mouse.c leaves these
+ * to it on Apple platforms). */
+void rsx_host_mouse_capture(int on)
+{
+    on = on ? 1 : 0;
+    if (__atomic_exchange_n((int*)&s_mouse_want, on, __ATOMIC_SEQ_CST) == on) return;
+#if !TARGET_OS_IPHONE
+    if ([NSThread isMainThread]) host_mouse_apply();
+    else dispatch_async(dispatch_get_main_queue(), ^{ host_mouse_apply(); });
+#endif
+}
+
+int rsx_host_mouse_captured(void) { return s_mouse_held; }
+
+void rsx_host_mouse_take_motion(int* dx, int* dy)
+{
+    *dx = __atomic_exchange_n(&s_mouse_dx, 0, __ATOMIC_RELAXED);
+    *dy = __atomic_exchange_n(&s_mouse_dy, 0, __ATOMIC_RELAXED);
+}
+
+int rsx_host_mouse_take_wheel(void) { return __atomic_exchange_n(&s_mouse_wheel, 0, __ATOMIC_RELAXED); }
+
+/* Escape never closed this window (the key monitor takes every plain key). */
+void rsx_host_window_escape_closes(int on) { (void)on; }
+void rsx_host_mouse_attach(void* hwnd) { (void)hwnd; }
+int rsx_host_mouse_message(void* hwnd, unsigned msg, uintptr_t wp, intptr_t lp, intptr_t* result)
+{
+    (void)hwnd; (void)msg; (void)wp; (void)lp; (void)result;
+    return 0;
 }
 
 /* Main thread: the window after a display change (s_disp_window_pending).
@@ -5647,11 +5804,76 @@ static int display_apply(void)
     return 1;
 }
 
+#if !TARGET_OS_IPHONE
+/* PS3RECOMP_METAL_EVENT_FILE=<path>: input from a file, for a run with no one
+ * at the keyboard. At a pump, if the file is there, each of its lines becomes
+ * an event sent the way the window server's are -- through the monitor above,
+ * so the same code takes it -- and the file is removed:
+ *
+ *   key <keycode> <1|0>     a key goes down or up (a macOS virtual keycode)
+ *   flags <flags>           the modifier flags change to this
+ *   move <dx> <dy>          the mouse moves
+ *   button <n> <1|0>        a mouse button (0 left, 1 right, 2 middle, ...)
+ *   wheel <notches>         the wheel turns (+ away from the player)
+ *
+ * Numbers as strtol reads them (0x.. for hexadecimal). */
+static void event_file_poll(void)
+{
+    static const char* path = (const char*)1;
+    if (path == (const char*)1) { path = getenv("PS3RECOMP_METAL_EVENT_FILE"); if (path && !*path) path = NULL; }
+    if (!path) return;
+    FILE* f = fopen(path, "r");
+    if (!f) return;
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char what[16];
+        long a = 0, b = 0;
+        const int n = sscanf(line, "%15s %li %li", what, &a, &b);
+        if (n < 2) continue;
+        const NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+        const NSInteger win = s_window.windowNumber;
+        NSEvent* ev = nil;
+        if (!strcmp(what, "key") && n == 3) {
+            ev = [NSEvent keyEventWithType:(b ? NSEventTypeKeyDown : NSEventTypeKeyUp)
+                                  location:NSZeroPoint modifierFlags:0 timestamp:now windowNumber:win context:nil
+                                characters:@"" charactersIgnoringModifiers:@"" isARepeat:NO
+                                   keyCode:(unsigned short)a];
+        } else if (!strcmp(what, "flags")) {
+            ev = [NSEvent keyEventWithType:NSEventTypeFlagsChanged
+                                  location:NSZeroPoint modifierFlags:(NSEventModifierFlags)a timestamp:now
+                              windowNumber:win context:nil characters:@"" charactersIgnoringModifiers:@""
+                                 isARepeat:NO keyCode:0];
+        } else {
+            CGEventRef cg = NULL;
+            if (!strcmp(what, "move") && n == 3) {
+                cg = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, CGPointZero, kCGMouseButtonLeft);
+                if (cg) {
+                    CGEventSetIntegerValueField(cg, kCGMouseEventDeltaX, a);
+                    CGEventSetIntegerValueField(cg, kCGMouseEventDeltaY, b);
+                }
+            } else if (!strcmp(what, "button") && n == 3) {
+                const CGEventType t = a == 0 ? (b ? kCGEventLeftMouseDown : kCGEventLeftMouseUp)
+                                    : a == 1 ? (b ? kCGEventRightMouseDown : kCGEventRightMouseUp)
+                                             : (b ? kCGEventOtherMouseDown : kCGEventOtherMouseUp);
+                cg = CGEventCreateMouseEvent(NULL, t, CGPointZero, (CGMouseButton)a);
+            } else if (!strcmp(what, "wheel")) {
+                cg = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 1, (int32_t)a);
+            }
+            if (cg) { ev = [NSEvent eventWithCGEvent:cg]; CFRelease(cg); }
+        }
+        if (ev) [NSApp sendEvent:ev];
+    }
+    fclose(f);
+    remove(path);
+}
+#endif
+
 static int pump_messages_impl(void)
 {
 #if !TARGET_OS_IPHONE
     if (s_headless || !s_ready) return 0;
     @autoreleasepool {
+        event_file_poll();
         for (;;) {
             NSEvent* ev = [NSApp nextEventMatchingMask:NSEventMaskAny
                                              untilDate:[NSDate distantPast]

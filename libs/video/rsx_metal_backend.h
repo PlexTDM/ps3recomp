@@ -37,6 +37,10 @@ int  rsx_metal_backend_pump_messages(void);
  * key reads released once it is not). Both read 0 in headless mode. */
 int  rsx_metal_backend_key_down(unsigned keycode);
 int  rsx_metal_backend_window_focused(void);
+/* The mouse's buttons while the cursor is held for a port (rsx_host_mouse.h,
+ * which this backend implements for its window): 0 left, 1 right, 2 middle,
+ * then the others in the device's order. */
+int  rsx_metal_backend_mouse_button_down(unsigned button);
 
 /* Present one frame: clear the drawable to the colour last received through the
  * RSX clear method, then hand it to the compositor. */

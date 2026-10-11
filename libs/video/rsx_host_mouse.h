@@ -8,8 +8,11 @@
  * moment the focus is.
  *
  * Windows: the D3D12 and Vulkan engines hand their window and its messages
- * to rsx_host_mouse_attach / rsx_host_mouse_message. Elsewhere the calls do
- * nothing and there is never any motion.
+ * to rsx_host_mouse_attach / rsx_host_mouse_message. macOS: the Metal
+ * backend has the window and implements the calls itself; motion is the
+ * events' own (points, with the system's tracking speed in them, as every
+ * pointing device there reports), and Escape never closed that window.
+ * Elsewhere the calls do nothing and there is never any motion.
  */
 #ifndef PS3RECOMP_RSX_HOST_MOUSE_H
 #define PS3RECOMP_RSX_HOST_MOUSE_H

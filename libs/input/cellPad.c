@@ -704,6 +704,8 @@ static void pad_poll_host_input(void)
     int focused = 1;
 #ifdef _WIN32
     focused = pad_host_window_focused();
+#elif defined(__APPLE__)
+    if (rsx_metal_backend_window_focused) focused = rsx_metal_backend_window_focused();
 #endif
     memset(&in, 0, sizeof in);
     in.lx = in.ly = in.rx = in.ry = 128;

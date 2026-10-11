@@ -129,7 +129,11 @@ int rsx_host_mouse_take_wheel(void)
 
 void rsx_host_window_escape_closes(int on) { InterlockedExchange(&s_escape_closes, on ? 1 : 0); }
 
-#else /* !_WIN32 */
+#elif defined(__APPLE__)
+
+/* The Metal backend's window: rsx_metal_backend.m has these. */
+
+#else
 
 void rsx_host_mouse_capture(int on) { (void)on; }
 int rsx_host_mouse_captured(void) { return 0; }
