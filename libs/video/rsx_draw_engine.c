@@ -125,6 +125,8 @@ typedef struct {
     u64 last_use_serial;
     u64 watch_stamp;       /* vm_watch_arm's stamp when the bytes were last hashed */
     u32 watched;           /* every page under it was protected then              */
+    u32 standin_gen;       /* s_standin_gen when the port was last asked          */
+    const void* standin;   /* the stand-in's bytes it was uploaded from, or NULL  */
 } eng_texture;
 
 struct eng_pipe_job;
@@ -850,19 +852,58 @@ static double eng_now_ms(void)
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
+/* The port's stand-ins for the title's textures (rsx_draw_engine.h). */
+static rsx_texture_standin_fn s_standin_fn;
+static void* s_standin_user;
+static volatile u32 s_standin_gen;
+static const void* s_upload_standin;   /* what the last eng_texture_upload used */
+
+void rsx_draw_engine_set_texture_standin(rsx_texture_standin_fn fn, void* user)
+{
+    s_standin_fn = fn;
+    s_standin_user = user;
+    s_standin_gen++;
+}
+
+void rsx_draw_engine_texture_standins_changed(void)
+{
+    s_standin_gen++;
+}
+
+static int eng_standin_ask(u32 fmt, u32 w, u32 h, u32 levels, const u8* src,
+                           u32 span, int cube, rsx_texture_standin* sub)
+{
+    memset(sub, 0, sizeof *sub);
+    return s_standin_fn && !cube &&
+           s_standin_fn(s_standin_user, fmt, w, h, levels, src, span, sub) &&
+           sub->bytes && sub->w && sub->h &&
+           sub->w <= ENG_MAX_TEX_DIM && sub->h <= ENG_MAX_TEX_DIM;
+}
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap)
 {
+    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+    const u8* src = eng_guest_ptr(NULL, location, offset, span);
+    if (!src) return 0;
+    s_fstat.tex++; s_fstat.tex_bytes += span;
+
+    /* The port's stand-in, if it has one for these bytes: from here on the
+     * texture is the stand-in's, under the guest's place in the cache. */
+    s_upload_standin = NULL;
+    { rsx_texture_standin sub;
+      if (eng_standin_ask(fmt, w, h, levels, src, span, cube, &sub)) {
+          s_upload_standin = src = sub.bytes;
+          fmt = sub.fmt; w = sub.w; h = sub.h;
+          levels = sub.levels ? sub.levels : 1; pitch = sub.pitch;
+      } }
+
     rsx_tex_level lv[RSX_MAX_TEXTURE_LEVELS];
     const u32 nlv = rsx_texture_mip_chain(fmt, w, h, levels, pitch, lv);
     if (!nlv || !lv[0].tl.face_bytes) return 0;
     const u32 faces = cube ? 6u : 1u;
     const u32 face_stride = cube
         ? rsx_texture_cube_face_stride(fmt, w, h, levels, pitch) : 0u;
-    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    const u8* src = eng_guest_ptr(NULL, location, offset, span);
-    if (!src) return 0;
-    s_fstat.tex++; s_fstat.tex_bytes += span;
 
     /* TEX_DUMP_DIR=<dir>: log every upload, and write each 8-bit (B8) upload at
      * least 256 wide -- a Bink video plane -- as a PPM, so "is the decoder
@@ -988,6 +1029,25 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             e->pitch != pitch || e->remap != remap ||
             e->cubemap != (u32)(cube != 0))
             continue;
+        /* The port's stand-ins changed: ask about this texture again, and
+         * upload it again only if the answer is another one. */
+        const u32 standin_gen = s_standin_gen;
+        if (e->handle && e->standin_gen != standin_gen) {
+            e->standin_gen = standin_gen;
+            const u8* src = eng_guest_ptr(NULL, location, offset, span);
+            rsx_texture_standin sub;
+            const void* now = src && eng_standin_ask(fmt, w, h, levels, src, span, cube, &sub)
+                              ? (const void*)sub.bytes : NULL;
+            if (src && now != e->standin) {
+                const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
+                                                     levels, pitch, cube, remap);
+                if (fresh) {
+                    g.be->texture_release(g.be->user, e->handle);
+                    e->handle = fresh;
+                    e->standin = s_upload_standin;
+                }
+            }
+        }
         if (e->handle && e->last_hash_frame != g.frames) {
             e->last_hash_frame = g.frames;
             int need_hash = 1;
@@ -1031,6 +1091,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                     g.be->texture_release(g.be->user, e->handle);
                     e->handle = fresh;
                     e->content_hash = hash;
+                    e->standin = s_upload_standin;
                 }
             }
         }
@@ -1060,8 +1121,10 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     if (eng_tex_watch_on()) { u64 st = 0; e.watched = (u32)eng_tex_watch_arm(location, offset, span, &st); e.watch_stamp = st; }
     { int readable = 0;
       e.content_hash = eng_texture_content_hash(location, offset, span, &readable); }
+    e.standin_gen = s_standin_gen;
     e.handle = eng_texture_upload(location, offset, fmt, w, h, levels, pitch,
                                   cube, remap);
+    e.standin = s_upload_standin;
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
     if (e.handle || !evicted) g.textures[index] = e;
     return e.handle;

@@ -266,6 +266,28 @@ void rsx_draw_engine_set_default(int on);
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
+
+/* A port's stand-in for one of the title's textures. The engine asks at every
+ * upload of a 2D texture, with the guest's description of it and its bytes
+ * (the whole mip chain, `span` bytes); a nonzero return hands back another
+ * texture in a guest format, which is decoded and uploaded in its place. Its
+ * size may differ where the title samples by normalised coordinates: a
+ * larger stand-in is then only sharper. The bytes must stay valid while the
+ * texture may be asked about again, and one answer is told from another by
+ * its `bytes` pointer. Called on the FIFO walker's thread. */
+typedef struct rsx_texture_standin {
+    const u8* bytes;
+    u32 fmt;               /* CELL_GCM_TEXTURE_* with its layout flags */
+    u32 w, h, levels, pitch;
+} rsx_texture_standin;
+typedef int (*rsx_texture_standin_fn)(void* user, u32 fmt, u32 w, u32 h, u32 levels,
+                                      const u8* bytes, u32 span,
+                                      rsx_texture_standin* out);
+void rsx_draw_engine_set_texture_standin(rsx_texture_standin_fn fn, void* user);
+/* The port's answers changed (another set of button glyphs, say): every
+ * cached texture is asked again at its next use. Any thread. */
+void rsx_draw_engine_texture_standins_changed(void);
+
 /* A backend's occlusion-query result: the samples that passed for the query
  * that GET_REPORT named report_index. Forwarded to the GCM report table. */
 void rsx_draw_engine_query_result(u32 report_index, u64 count);
