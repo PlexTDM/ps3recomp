@@ -200,6 +200,18 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* What a host port holds, for a port that shows the pad's own button names
+ * in place of the DualShock 3's. NONE is also the keyboard that stands in for
+ * port 0 with nothing plugged in. Any thread. */
+#define CELL_PAD_HOST_NONE    0
+#define CELL_PAD_HOST_XBOX    1
+#define CELL_PAD_HOST_PS3     2
+#define CELL_PAD_HOST_PS4     3
+#define CELL_PAD_HOST_PS5     4
+#define CELL_PAD_HOST_SWITCH  5
+#define CELL_PAD_HOST_OTHER   6   /* a pad of no known family */
+int cellPad_host_kind(u32 port);
+
 #ifdef __cplusplus
 }
 #endif

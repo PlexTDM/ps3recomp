@@ -98,6 +98,14 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
 static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
+/* What each host port holds (CELL_PAD_HOST_*): written where the backend
+ * finds and loses its pads, read by anyone. */
+static volatile int s_host_kind[PAD_MAX_HOST_PORTS];
+
+int cellPad_host_kind(u32 port)
+{
+    return port < PAD_MAX_HOST_PORTS ? s_host_kind[port] : CELL_PAD_HOST_NONE;
+}
 
 /* ---------------------------------------------------------------------------
  * XInput backend
@@ -145,11 +153,13 @@ static void pad_poll_xinput(void)
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
             s_host_state[i].connected = 0;
+            s_host_kind[i] = CELL_PAD_HOST_NONE;
             next_probe[i] = now + 1000;
             continue;
         }
 
         s_host_state[i].connected = 1;
+        s_host_kind[i] = CELL_PAD_HOST_XBOX;   /* XInput sees no other family */
         XINPUT_GAMEPAD* gp = &state.Gamepad;
 
         /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
@@ -294,6 +304,32 @@ static int pad_sdl_start(void)
     return 1;
 }
 
+/* The pad's family, as SDL names it. */
+static int pad_sdl_kind(SDL_GameController* gc)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    switch (SDL_GameControllerGetType(gc)) {
+    case SDL_CONTROLLER_TYPE_XBOX360:
+    case SDL_CONTROLLER_TYPE_XBOXONE:             return CELL_PAD_HOST_XBOX;
+    case SDL_CONTROLLER_TYPE_PS3:                 return CELL_PAD_HOST_PS3;
+    case SDL_CONTROLLER_TYPE_PS4:                 return CELL_PAD_HOST_PS4;
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    case SDL_CONTROLLER_TYPE_PS5:                 return CELL_PAD_HOST_PS5;
+#endif
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO: return CELL_PAD_HOST_SWITCH;
+#if SDL_VERSION_ATLEAST(2, 24, 0)
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return CELL_PAD_HOST_SWITCH;
+#endif
+    default:                                      return CELL_PAD_HOST_OTHER;
+    }
+#else
+    (void)gc;
+    return CELL_PAD_HOST_OTHER;
+#endif
+}
+
 /* Put every pad SDL knows and no slot holds into the lowest free slot.
  *
  * By instance id, not device index: the index of a pad shifts down when one
@@ -316,6 +352,7 @@ static void pad_sdl_open_new(void)
         SDL_GameController* gc = SDL_GameControllerOpen(d);
         if (!gc) continue;
         s_sdl_controllers[slot] = gc;
+        s_host_kind[slot] = pad_sdl_kind(gc);
         const char* name = SDL_GameControllerName(gc);
         printf("[cellPad] port %d: %s\n", slot, name ? name : "controller");
         fflush(stdout);
@@ -336,6 +373,7 @@ static void pad_sdl_read(PadHostState* st)
             fflush(stdout);
             SDL_GameControllerClose(gc);
             s_sdl_controllers[i] = NULL;
+            s_host_kind[i] = CELL_PAD_HOST_NONE;
         }
     }
     pad_sdl_open_new();
