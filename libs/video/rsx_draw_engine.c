@@ -925,7 +925,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       if (ul < 0) ul = getenv("TEX_UP_LOG") ? 1 : 0;   /* the log line alone, no PPMs */
       if (dd || ul) {
           static int n = 0, saved = 0;
-          if (n++ < 400 || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */) {
+          if ((n < 400 && ++n) || (fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8, any layout flags */) {
               /* A B8 plane's mean, so "are the decoder's pixels there" is in
                * the log line itself: a Bink plane of a real picture averages
                * tens to a hundred-odd; all-zero planes shade the YUV->RGB
@@ -1780,10 +1780,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         rsx_fp_set_unnorm_units(0, NULL);
         rsx_fp_set_texel_ops(NULL);
         rsx_fp_set_saturate_alpha(0);
-        if (unnorm_mask) { static int n = 0; if (n++ < 6)
+        if (unnorm_mask) { static int n = 0; if (n < 6 && ++n)
             fprintf(stderr, "[rsx engine] unnormalised units 0x%X (unit %u %ux%u)\n", unnorm_mask,
                     __builtin_ctz(unnorm_mask), unnorm_dim[__builtin_ctz(unnorm_mask)][0], unnorm_dim[__builtin_ctz(unnorm_mask)][1]); }
-        if (shadow_mask) { static int n = 0; if (n++ < 6)
+        if (shadow_mask) { static int n = 0; if (n < 6 && ++n)
             fprintf(stderr, "[rsx engine] shadow-compare units 0x%X (func of first: %u)\n",
                     shadow_mask, shadow_funcs[__builtin_ctz(shadow_mask)]); }
         if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
@@ -2596,7 +2596,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     const u32 view = g.be->surface_view
                         ? g.be->surface_view(g.be->user, snap, t.remap & 0xFFFFu, t.format) : 0;
                     textures[u] = view ? view : snap;
-                    { static int _n = 0; if (_n++ < 4)
+                    { static int _n = 0; if (_n < 4 && ++_n)
                         fprintf(stderr, "[rsx engine] unit %u samples its own target s%u: bound a copy\n", u, i); }
                 }
                 break;
@@ -2657,12 +2657,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                     found = 1;
                     const u32 snap = eng_zdepth_snapshot(i, t.width, t.height);
                     if (snap) textures[u] = snap;
-                    else { static int n = 0; if (n++ < 6)
+                    else { static int n = 0; if (n < 6 && ++n)
                         fprintf(stderr, "[rsx engine] depth texture unit %u (loc %u off 0x%08X %ux%u): tracked zeta %u has no snapshot (handle %u had_write %u)\n",
                                 u, t.location, t.offset, t.width, t.height, i, g.zdepths[i].handle, g.zdepths[i].had_write); }
                     break;
                 }
-            if (!found) { static int n = 0; if (n++ < 6) {
+            if (!found) { static int n = 0; if (n < 6 && ++n) {
                 fprintf(stderr, "[rsx engine] depth texture unit %u (loc %u off 0x%08X %ux%u zfunc %u): no tracked zeta matches; zetas:",
                         u, t.location, t.offset, t.width, t.height, (t.wrap >> 28) & 0xFu);
                 for (u32 i = 0; i < g.n_zdepths; i++) fprintf(stderr, " %u:%u/0x%08X/%ux%u%s", i, g.zdepths[i].location, g.zdepths[i].offset, g.zdepths[i].w, g.zdepths[i].h, current_zslot == i ? "(bound)" : "");

@@ -579,7 +579,7 @@ static int mem_alloc(const VkMemoryRequirements* req, VkMemoryPropertyFlags want
             m->mem = VK_NULL_HANDLE;
             ReleaseSRWLockExclusive(&s_mem_lock);
             static int n = 0;
-            if (n++ < 8) fprintf(stderr, "[rsx engine/vulkan] out of device memory (%llu bytes)\n", (unsigned long long)ai.allocationSize);
+            if (n < 8 && ++n) fprintf(stderr, "[rsx engine/vulkan] out of device memory (%llu bytes)\n", (unsigned long long)ai.allocationSize);
             return 0;
         }
         m->type = (u32)type; m->image = image; m->size = ai.allocationSize; m->dedicated = dedicated;
@@ -724,7 +724,7 @@ static u32 eng_image(EngObjKind kind, VkFormat fmt, u32 w, u32 h, u32 mips, u32 
     VkImage img = VK_NULL_HANDLE;
     if (vkCreateImage(s_dev, &ii, NULL, &img) != VK_SUCCESS) {
         static int n = 0;
-        if (n++ < 16) fprintf(stderr, "[rsx engine/vulkan] image %ux%u fmt %d failed\n", w, h, (int)fmt);
+        if (n < 16 && ++n) fprintf(stderr, "[rsx engine/vulkan] image %ux%u fmt %d failed\n", w, h, (int)fmt);
         return 0;
     }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(s_dev, img, &req);
@@ -1022,7 +1022,7 @@ static VkShaderModule eng_module(const char* hlsl, int stage, const char* what)
     const u32 n = rsx_hlsl_to_spirv(hlsl, stage, &words, log, sizeof log);
     if (!n) {
         static int k = 0;
-        if (k++ < 32) fprintf(stderr, "[rsx engine/vulkan] %s: HLSL -> SPIR-V failed: %.900s\n", what, log);
+        if (k < 32 && ++k) fprintf(stderr, "[rsx engine/vulkan] %s: HLSL -> SPIR-V failed: %.900s\n", what, log);
         return VK_NULL_HANDLE;
     }
     VkShaderModuleCreateInfo mi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -1151,7 +1151,7 @@ static VkPipeline eng_build_pso(EngPipeline* p, int cls, VkShaderModule fs)
     const VkResult r = vkCreateGraphicsPipelines(s_dev, VK_NULL_HANDLE, 1, &gi, NULL, &pso);
     if (r != VK_SUCCESS) {
         static int n = 0;
-        if (n++ < 16) fprintf(stderr, "[rsx engine/vulkan] pipeline failed: %d\n", (int)r);
+        if (n < 16 && ++n) fprintf(stderr, "[rsx engine/vulkan] pipeline failed: %d\n", (int)r);
         return VK_NULL_HANDLE;
     }
     return pso;

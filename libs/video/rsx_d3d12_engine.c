@@ -616,7 +616,7 @@ static ID3D12Resource* make_texture(DXGI_FORMAT fmt, u32 w, u32 h, u32 mips, u32
                       &IID_ID3D12Resource, (void**)&r);
     if (FAILED(hr)) {
         static int n = 0;
-        if (n++ < 16) fprintf(stderr, "[rsx engine/d3d12] texture %ux%u fmt %d failed: 0x%08lX\n", w, h, (int)fmt, (long)hr);
+        if (n < 16 && ++n) fprintf(stderr, "[rsx engine/d3d12] texture %ux%u fmt %d failed: 0x%08lX\n", w, h, (int)fmt, (long)hr);
         return NULL;
     }
     return r;
@@ -1273,7 +1273,7 @@ static ID3DBlob* eng_compile(const char* src, u32 len, const char* entry, const 
                             D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_IEEE_STRICTNESS, 0, &b, &e);
     if (FAILED(hr)) {
         static int n = 0;
-        if (n++ < 32)
+        if (n < 32 && ++n)
             fprintf(stderr, "[rsx engine/d3d12] %s compile failed: %.900s\n", what,
                     e ? (const char*)CALL0(e, GetBufferPointer) : "no diagnostic");
         RELEASE(e);
@@ -2194,7 +2194,7 @@ static ID3D12PipelineState* eng_pso(u32 pipeline, int cls)
     if (p->pso[cls]) RELEASE(pso);
     else if (FAILED(hr)) {
         static int n = 0;
-        if (n++ < 16) fprintf(stderr, "[rsx engine/d3d12] pipeline state failed: 0x%08lX (removed 0x%08lX)\n",
+        if (n < 16 && ++n) fprintf(stderr, "[rsx engine/d3d12] pipeline state failed: 0x%08lX (removed 0x%08lX)\n",
                               (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
         p->failed[cls] = 1;
     } else p->pso[cls] = pso;
@@ -2792,7 +2792,7 @@ static int eng_ms_make(u32 h)
     if (FAILED(CALL(s_dev, CreateCommittedResource, &hp, D3D12_HEAP_FLAG_NONE, &td, st, &cv,
                     &IID_ID3D12Resource, (void**)&o->ms))) {
         static int n = 0;
-        if (n++ < 4) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u target %ux%u failed\n", s_ms_n, o->w, o->h);
+        if (n < 4 && ++n) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u target %ux%u failed\n", s_ms_n, o->w, o->h);
         o->ms = NULL;
         return 0;
     }
@@ -2949,7 +2949,7 @@ static ID3D12PipelineState* eng_pso_ms(u32 pipeline, int cls)
     if (p->psoms[cls] || n != s_ms_n) RELEASE(pso);
     else if (FAILED(hr)) {
         static int nf = 0;
-        if (nf++ < 16) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u pipeline state failed: 0x%08lX (pipeline %u class %d)\n",
+        if (nf < 16 && ++nf) fprintf(stderr, "[rsx engine/d3d12] MSAA x%u pipeline state failed: 0x%08lX (pipeline %u class %d)\n",
                                n, (long)hr, pipeline, cls);
         p->failedms[cls] = 1;
     }
@@ -3212,7 +3212,7 @@ static ID3D12PipelineState* eng_copy_pso_build(u32 pipeline, int cls, DXGI_FORMA
         if (*slot && *slot_fmt == fmt) { RELEASE(pso); pso = *slot; }
         else if (FAILED(hr)) {
             static int n = 0;
-            if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] snapshot-copy pipeline failed: 0x%08lX\n", (long)hr);
+            if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] snapshot-copy pipeline failed: 0x%08lX\n", (long)hr);
             *failed = 1; pso = NULL;
         } else if (ms && ps_blob != s_snap_copy_ms_ps) {
             RELEASE(pso);   /* the sample count changed meanwhile: stale */
@@ -3424,7 +3424,7 @@ static void eng_encode_records(void)
             if (done) {
                 s_snap_incr_n++;
                 static int said = 0;
-                if (said++ < 2)
+                if (said < 2 && ++said)
                     fprintf(stderr, "[rsx engine/d3d12] own-target snapshot brought up to date by %u copy draw(s) instead of a full copy\n",
                             sy[k].n);
             }
@@ -3916,7 +3916,7 @@ static void eng_submit(u32 present_surface, int wait)
                           (!s_vsync && s_tearing && s_display != DISP_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (FAILED(hr)) {
             static int n = 0;
-            if (n++ < 8) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
+            if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
                                  (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
         }
         if (hl > 0.0) QueryPerformanceCounter(&pq1);

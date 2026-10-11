@@ -120,7 +120,7 @@ static VkDescriptorSet eng_set(const EngSetDesc* d)
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(s_dev, &ai, &set) != VK_SUCCESS) {
         static int n = 0;
-        if (n++ < 4) fprintf(stderr, "[rsx engine/vulkan] descriptor pool exhausted\n");
+        if (n < 4 && ++n) fprintf(stderr, "[rsx engine/vulkan] descriptor pool exhausted\n");
         return VK_NULL_HANDLE;
     }
     VkDescriptorBufferInfo bvs = { d->vs_buf, 0, ENG_UBO_RANGE }, bfs = { d->fs_buf, 0, ENG_UBO_RANGE };
@@ -820,7 +820,7 @@ static void eng_submit(u32 present_surface, int wait)
     const VkResult sr = vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
     if (sr != VK_SUCCESS) {
         static int n = 0;
-        if (n++ < 8) fprintf(stderr, "[rsx engine/vulkan] submit failed: %d\n", (int)sr);
+        if (n < 8 && ++n) fprintf(stderr, "[rsx engine/vulkan] submit failed: %d\n", (int)sr);
         if (sr == VK_ERROR_DEVICE_LOST) s_ready = 0;
     }
     s_slot_fence[s_slot] = f;
