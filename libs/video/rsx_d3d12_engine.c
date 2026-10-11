@@ -74,7 +74,7 @@
 #define ENG_MAX_BUFS      16384
 #define ENG_ALIGN         256u
 #define ENG_STAGE_MAX     (384u << 20)
-#define ENG_STAGE_START   (16u << 20)
+#define ENG_STAGE_CHUNK   (16u << 20)
 #define ENG_FRAMES        4           /* allocator slots */
 #define ENG_INFLIGHT      2           /* windowed presents queued at most */
 #define ENG_SRV_PER_SLOT  16384u      /* shader-visible SRV descriptors per slot */
@@ -101,6 +101,8 @@ typedef struct {
     D3D12_RESOURCE_STATES state;
     int has_rtv, has_dsv;       /* RTV/DSV written at slot handle-1      */
     int retired;
+    u32 heap;                   /* a placed texture: its heap + 1, and    */
+    u64 heap_off, heap_size;    /* its range there (see the texture heaps) */
     /* MSAA (see eng_ms_*): the multisampled twin a 3D pass draws into, made
      * at the pass's first use; `res` stays the single-sampled one that every
      * read uses. ms_dirty: the twin has draws `res` lacks, in host pixels
@@ -265,15 +267,21 @@ typedef struct {
     u32   up_off, up_sub, up_w, up_h, up_pitch;
 } EngRecord;
 
-/* One UPLOAD-heap arena, mapped for its whole life. */
+/* One UPLOAD-heap chunk, mapped for its whole life. What a submit stages is
+ * a chain of them (see staging). */
 typedef struct {
     ID3D12Resource* res;
     u8* mapped;
+    D3D12_GPU_VIRTUAL_ADDRESS va;
     u32 cap;
+    u32 base, used;   /* in a chain: where it starts in the records' offsets, and its fill */
     u64 fence;        /* the submit that last used it */
-    int in_use;       /* handed to a submit that may still be running */
+    u32 seq;          /* and that submit's number */
+    int in_use;       /* 1: handed to a submit that may still be running; 2: in the chain being built */
 } EngStage;
-#define ENG_STAGE_POOL 8
+#define ENG_STAGE_POOL 64
+#define ENG_STAGE_KEEP 8      /* chunks kept however long they go unused */
+#define ENG_STAGE_IDLE 600u   /* submits a chunk beyond those is kept unused */
 
 
 typedef struct { u32 slot, index; } EngVisReport;
@@ -281,7 +289,6 @@ typedef struct { u32 slot, index; } EngVisReport;
 /* A submit the GPU may still be running. */
 typedef struct {
     u64 fence;
-    int stage;                       /* index into s_stage, -1 none */
     u32 q_slot, q_count;             /* its queries, in allocator slot q_slot's region */
     u32* q_vis;                      /* vis counter per query */
     EngVisReport* reports; u32 n_reports;
@@ -365,8 +372,8 @@ static EngRecord s_rec[ENG_MAX_RECORDS]; static u32 s_rec_count, s_dropped;
 static EngRecord s_pending;
 static ID3D12Resource* s_buf[ENG_MAX_BUFS]; static u32 s_buf_bytes[ENG_MAX_BUFS];
 static u32 s_buf_count, s_buf_free[ENG_MAX_BUFS], s_buf_free_count; static u8 s_buf_retired[ENG_MAX_BUFS];
-static EngStage s_stage[ENG_STAGE_POOL]; static int s_stage_cur = -1;
-static u32 s_stage_used, s_stage_want = ENG_STAGE_START;
+static EngStage s_stage[ENG_STAGE_POOL];
+static int s_chain[ENG_STAGE_POOL]; static u32 s_chain_n;   /* the chunks of the submit being built */
 static EngSubmit s_sub[ENG_MAX_SUBMITS];
 static u32 s_submit_seq;
 static u32 s_vs_cb_seq = ~0u, s_vs_cb_off, s_vs_cb_bytes;
@@ -615,6 +622,137 @@ static ID3D12Resource* make_texture(DXGI_FORMAT fmt, u32 w, u32 h, u32 mips, u32
     return r;
 }
 
+/* ---- memory blocks ----------------------------------------------------------
+ * A committed resource is a heap of its own, and the driver's allocation
+ * behind each one is what a level's first frame waited on: several hundred
+ * textures and as many vertex buffers at 0.3 to 3 ms apiece. Both now come
+ * out of blocks made a few at a time, sub-allocated first fit with a sorted
+ * free list (as the memory blocks of rsx_vulkan_engine.c). */
+typedef struct { u64 off, size; } MemRange;
+typedef struct { MemRange* fr; u32 nfr, frcap, live; } MemList;   /* a block's free ranges, and how many it has out */
+
+static int mem_room(MemList* m)
+{
+    if (m->nfr < m->frcap) return 1;
+    const u32 cap = m->frcap ? m->frcap * 2 : 16;
+    MemRange* fr = (MemRange*)realloc(m->fr, cap * sizeof(MemRange));
+    if (!fr) return 0;
+    m->fr = fr; m->frcap = cap;
+    return 1;
+}
+
+static int mem_take(MemList* m, u64 size, u64 align, u64* out)
+{
+    for (u32 i = 0; i < m->nfr; i++) {
+        const u64 start = (m->fr[i].off + align - 1) & ~(align - 1);
+        const u64 end = m->fr[i].off + m->fr[i].size;
+        if (start + size > end) continue;
+        const u64 lead = start - m->fr[i].off, tail = end - (start + size);
+        if (lead && tail) {   /* split in two */
+            if (!mem_room(m)) return 0;
+            memmove(&m->fr[i + 2], &m->fr[i + 1], (m->nfr - i - 1) * sizeof(MemRange));
+            m->fr[i].size = lead;
+            m->fr[i + 1].off = start + size; m->fr[i + 1].size = tail;
+            m->nfr++;
+        } else if (lead) { m->fr[i].size = lead; }
+        else if (tail) { m->fr[i].off = start + size; m->fr[i].size = tail; }
+        else { memmove(&m->fr[i], &m->fr[i + 1], (m->nfr - i - 1) * sizeof(MemRange)); m->nfr--; }
+        *out = start;
+        m->live++;
+        return 1;
+    }
+    return 0;
+}
+
+static void mem_give(MemList* m, u64 off, u64 size)
+{
+    u32 i = 0;
+    while (i < m->nfr && m->fr[i].off < off) i++;
+    if (m->live) m->live--;
+    if (!mem_room(m)) return;   /* the range is lost to its block, no more */
+    memmove(&m->fr[i + 1], &m->fr[i], (m->nfr - i) * sizeof(MemRange));
+    m->fr[i].off = off; m->fr[i].size = size; m->nfr++;
+    if (i + 1 < m->nfr && m->fr[i].off + m->fr[i].size == m->fr[i + 1].off) {
+        m->fr[i].size += m->fr[i + 1].size;
+        memmove(&m->fr[i + 1], &m->fr[i + 2], (m->nfr - i - 2) * sizeof(MemRange)); m->nfr--;
+    }
+    if (i > 0 && m->fr[i - 1].off + m->fr[i - 1].size == m->fr[i].off) {
+        m->fr[i - 1].size += m->fr[i].size;
+        memmove(&m->fr[i], &m->fr[i + 1], (m->nfr - i - 1) * sizeof(MemRange)); m->nfr--;
+    }
+}
+
+/* A new block: all of it free. */
+static void mem_fresh(MemList* m, u64 size)
+{
+    m->nfr = 0; m->live = 0;
+    mem_give(m, 0, size);
+}
+
+/* ---- texture heaps ----------------------------------------------------------
+ * A texture is placed in a 64 MB heap: placing one in a heap that exists
+ * takes some tens of microseconds. One over half a heap, or that the device
+ * will not place, is committed as before. RSX_TEX_HEAPS=0 commits them all.
+ *
+ * A placed texture holds what its range held before until it is written;
+ * every texture here has all its levels uploaded before a draw reads it. */
+#define TEX_HEAP_BYTES ((u64)64 << 20)
+#define TEX_HEAPS      256
+typedef struct { ID3D12Heap* heap; MemList m; } TexHeap;
+static TexHeap s_theap[TEX_HEAPS]; static u32 s_ntheap;
+int g_eng_tex_heaps = 1;
+
+/* The texture, placed; NULL when it is to be committed instead. */
+static ID3D12Resource* make_placed_texture(DXGI_FORMAT fmt, u32 w, u32 h, u32 mips, u32 faces,
+                                           D3D12_RESOURCE_STATES st, u32* heap, u64* off, u64* size)
+{
+    *heap = 0;
+    if (!g_eng_tex_heaps) return NULL;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = w; td.Height = h; td.DepthOrArraySize = (UINT16)(faces ? faces : 1);
+    td.MipLevels = (UINT16)(mips ? mips : 1); td.Format = fmt; td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_RESOURCE_ALLOCATION_INFO ai = {0};
+    CALL(s_dev, GetResourceAllocationInfo, &ai, 0, 1, &td);
+    if (!ai.SizeInBytes || ai.SizeInBytes > TEX_HEAP_BYTES / 2 || !ai.Alignment) return NULL;
+    u32 i; u64 o = 0;
+    for (i = 0; i < s_ntheap; i++)
+        if (s_theap[i].heap && mem_take(&s_theap[i].m, ai.SizeInBytes, ai.Alignment, &o)) break;
+    if (i == s_ntheap) {
+        for (i = 0; i < s_ntheap; i++) if (!s_theap[i].heap) break;
+        if (i == TEX_HEAPS) return NULL;
+        TexHeap* t = &s_theap[i];
+        D3D12_HEAP_DESC hd = {0};
+        hd.SizeInBytes = TEX_HEAP_BYTES; hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES;
+        if (FAILED(CALL(s_dev, CreateHeap, &hd, &IID_ID3D12Heap, (void**)&t->heap))) { t->heap = NULL; return NULL; }
+        if (i == s_ntheap) s_ntheap++;
+        mem_fresh(&t->m, TEX_HEAP_BYTES);
+        if (!mem_take(&t->m, ai.SizeInBytes, ai.Alignment, &o)) return NULL;
+    }
+    ID3D12Resource* r = NULL;
+    if (FAILED(CALL(s_dev, CreatePlacedResource, s_theap[i].heap, o, &td, st, NULL,
+                    &IID_ID3D12Resource, (void**)&r))) {
+        mem_give(&s_theap[i].m, o, ai.SizeInBytes);
+        return NULL;
+    }
+    *heap = i + 1; *off = o; *size = ai.SizeInBytes;
+    return r;
+}
+
+/* A placed texture's range goes back to its heap, once the texture itself is
+ * released. One empty heap is kept for the next textures; a second is let go. */
+static void theap_done(u32 heap, u64 off, u64 size)
+{
+    if (!heap) return;
+    TexHeap* t = &s_theap[heap - 1];
+    mem_give(&t->m, off, size);
+    if (t->m.live) return;
+    for (u32 i = 0; i < s_ntheap; i++)
+        if (&s_theap[i] != t && s_theap[i].heap && !s_theap[i].m.live) { RELEASE(t->heap); t->m.nfr = 0; break; }
+}
+
 /* Bounded fence wait: a device removal leaves the fence unsignaled forever,
  * and an INFINITE wait here would freeze the whole emulation (see
  * rsx_d3d12_backend.c's wait_for_gpu). */
@@ -735,6 +873,7 @@ static void eng_collect_retired(void)
         }
         RELEASE(o->res);
         RELEASE(o->ms);
+        theap_done(o->heap, o->heap_off, o->heap_size);
         memset(o, 0, sizeof *o);
         s_obj_free[s_obj_free_count++] = h - 1;
     }
@@ -777,77 +916,128 @@ static void eng_write_srv(u32 handle, ID3D12Resource* res, DXGI_FORMAT fmt, u32 
     CALL(s_dev, CreateShaderResourceView, res, &sd, obj_srv(handle));
 }
 
-/* ---- staging --------------------------------------------------------------- */
+/* ---- staging ---------------------------------------------------------------
+ * What a submit's records read -- constants, vertices without a buffer of
+ * their own, texture rows -- is staged in UPLOAD-heap chunks, chained as they
+ * fill; a record holds offsets into the chain. Nothing staged is ever read
+ * back: the memory is write-combined, and one arena grown by copying it into
+ * a larger one took 0.4 to 0.9 s over the 110 MB a level's first frame
+ * stages (and left every arena of the pool that size afterwards). */
 
 static void eng_submit(u32 present_surface, int wait);
 
-static int eng_stage_pick(void)
+static void eng_stage_free(EngStage* s)
 {
-    /* A free arena at least as large as the largest a submit grew to. */
-    int best = -1;
+    if (s->res) { CALL(s->res, Unmap, 0, NULL); RELEASE(s->res); }
+    memset(s, 0, sizeof *s);
+}
+
+/* A free chunk of `need` bytes or more: the smallest there is, else a new
+ * one, in an empty slot or in place of the smallest free one. -1 when every
+ * chunk is in use. */
+static int eng_stage_pick(u32 need)
+{
+    int best = -1, empty = -1, least = -1;
     for (int i = 0; i < ENG_STAGE_POOL; i++) {
         EngStage* s = &s_stage[i];
-        if (s->in_use && fence_done(s->fence)) s->in_use = 0;
+        if (s->in_use == 1 && fence_done(s->fence)) s->in_use = 0;
         if (s->in_use) continue;
-        if (s->res && s->cap >= s_stage_want && (best < 0 || s->cap < s_stage[best].cap)) best = i;
+        if (!s->res) { if (empty < 0) empty = i; }
+        else if (s->cap >= need) { if (best < 0 || s->cap < s_stage[best].cap) best = i; }
+        else if (least < 0 || s->cap < s_stage[least].cap) least = i;
     }
     if (best >= 0) return best;
-    for (int i = 0; i < ENG_STAGE_POOL; i++) if (!s_stage[i].in_use && !s_stage[i].res) { best = i; break; }
-    if (best < 0) {   /* every slot is in use or too small: replace the smallest free one */
-        for (int i = 0; i < ENG_STAGE_POOL; i++)
-            if (!s_stage[i].in_use && (best < 0 || s_stage[i].cap < s_stage[best].cap)) best = i;
-        if (best < 0) return -1;
-        if (s_stage[best].res) { CALL(s_stage[best].res, Unmap, 0, NULL); RELEASE(s_stage[best].res); }
-        s_stage[best].mapped = NULL; s_stage[best].cap = 0;
+    if (empty < 0) {
+        if (least < 0) return -1;
+        eng_stage_free(&s_stage[least]);
+        empty = least;
     }
-    EngStage* s = &s_stage[best];
-    s->res = make_buffer(D3D12_HEAP_TYPE_UPLOAD, s_stage_want, D3D12_RESOURCE_STATE_GENERIC_READ);
+    u32 cap = ENG_STAGE_CHUNK;
+    while (cap < need) cap *= 2u;
+    EngStage* s = &s_stage[empty];
+    s->res = make_buffer(D3D12_HEAP_TYPE_UPLOAD, cap, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!s->res) return -1;
     D3D12_RANGE nr = {0, 0};
     if (FAILED(CALL(s->res, Map, 0, &nr, (void**)&s->mapped))) { RELEASE(s->res); return -1; }
-    s->cap = s_stage_want;
-    return best;
+    s->va = CALL0(s->res, GetGPUVirtualAddress);
+    s->cap = cap;
+    return empty;
 }
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
-    const u32 start = (s_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
-    if ((u64)start + bytes > ENG_STAGE_MAX) {
-        /* Submit and wait rather than drop the rest of the frame. */
-        eng_submit(0, 1);
-        return eng_stage_reserve(bytes, out_off);
+    if (bytes > ENG_STAGE_MAX) return 0;
+    for (int tries = 0; tries < 2; tries++) {
+        EngStage* s = s_chain_n ? &s_stage[s_chain[s_chain_n - 1]] : NULL;
+        const u32 start = s ? (s->used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u) : 0;
+        if (s && (u64)start + bytes <= s->cap) {
+            *out_off = s->base + start;
+            s->used = start + bytes;
+            return 1;
+        }
+        /* The chain's next chunk. */
+        const u32 base = s ? s->base + s->cap : 0;
+        int i = -1;
+        if ((u64)base + bytes <= ENG_STAGE_MAX && s_chain_n < ENG_STAGE_POOL) i = eng_stage_pick(bytes);
+        if (i < 0) {
+            /* More than a submit stages, or every chunk in flight: submit
+             * and wait rather than drop the rest of the frame. */
+            if (!s_rec_count) return 0;
+            eng_submit(0, 1);
+            continue;
+        }
+        s = &s_stage[i];
+        s->base = base; s->used = bytes; s->in_use = 2;
+        s_chain[s_chain_n++] = i;
+        *out_off = base;
+        return 1;
     }
-    if (s_stage_cur < 0) {
-        s_stage_cur = eng_stage_pick();
-        if (s_stage_cur < 0) return 0;
-        s_stage_used = 0;
-    }
-    EngStage* s = &s_stage[s_stage_cur];
-    if (start + bytes > s->cap) {
-        /* Grow: nothing has been submitted from this arena, so the staged
-         * bytes move over and the old buffer is let go. */
-        u32 cap = s->cap ? s->cap : ENG_STAGE_START;
-        while (start + bytes > cap) cap *= 2u;
-        ID3D12Resource* n = make_buffer(D3D12_HEAP_TYPE_UPLOAD, cap, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!n) return 0;
-        u8* nm = NULL; D3D12_RANGE nr = {0, 0};
-        if (FAILED(CALL(n, Map, 0, &nr, (void**)&nm))) { RELEASE(n); return 0; }
-        if (s_stage_used) memcpy(nm, s->mapped, s_stage_used);
-        CALL(s->res, Unmap, 0, NULL); RELEASE(s->res);
-        s->res = n; s->mapped = nm; s->cap = cap;
-        if (cap > s_stage_want) s_stage_want = cap;
-    }
-    *out_off = start;
-    s_stage_used = start + bytes;
-    return 1;
+    return 0;
+}
+
+/* Where to write a reservation just made: it is in the chain's last chunk. */
+static u8* eng_stage_ptr(u32 off)
+{
+    const EngStage* s = &s_stage[s_chain[s_chain_n - 1]];
+    return s->mapped + (off - s->base);
 }
 
 static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 {
     if (!bytes) { *out_off = 0; return 1; }
     if (!eng_stage_reserve(bytes, out_off)) return 0;
-    memcpy(s_stage[s_stage_cur].mapped + *out_off, src, bytes);
+    memcpy(eng_stage_ptr(*out_off), src, bytes);
     return 1;
+}
+
+/* The chunk a record's offset is in. */
+static const EngStage* eng_stage_at(u32 off)
+{
+    for (u32 k = s_chain_n; k-- > 0;) {
+        const EngStage* s = &s_stage[s_chain[k]];
+        if (off >= s->base) return s;
+    }
+    return NULL;
+}
+
+/* The chain is the submit's: its chunks are free again when that is done. */
+static void eng_stage_submitted(u64 fence)
+{
+    for (u32 k = 0; k < s_chain_n; k++) {
+        EngStage* s = &s_stage[s_chain[k]];
+        s->fence = fence; s->seq = s_submit_seq; s->in_use = fence ? 1 : 0;
+    }
+    s_chain_n = 0;
+    /* A load leaves more chunks than a frame of play stages, and larger
+     * ones: what no submit has used for a while is let go, one a submit. */
+    u32 have = 0; int old = -1;
+    for (int i = 0; i < ENG_STAGE_POOL; i++) {
+        const EngStage* s = &s_stage[i];
+        if (!s->res) continue;
+        have++;
+        if (!s->in_use && s_submit_seq - s->seq > ENG_STAGE_IDLE && (old < 0 || s->cap > s_stage[old].cap)) old = i;
+    }
+    if (old >= 0 && (have > ENG_STAGE_KEEP || s_stage[old].cap > ENG_STAGE_CHUNK)) eng_stage_free(&s_stage[old]);
 }
 
 /* ---- buffers the engine keeps across frames (vertex cache) ------------------ */
@@ -867,6 +1057,55 @@ static u32 s_buf_cap[ENG_MAX_BUFS];
 static u32 buf_class(u32 bytes) { u32 c = 65536u; while (c < bytes) c <<= 1; return c; }
 int g_eng_buf_pool = 1;   /* RSX_BUF_POOL=0 turns the pool off; a host may switch it in a run */
 
+/* Better than a buffer each, pooled or not: a buffer is a range of a 32 MB
+ * UPLOAD-heap page that stays mapped, so making one is the copy and no call
+ * into the driver at all. (A level's first frame stores some hundreds: 150
+ * to 370 ms of committed buffers, measured in a replay of one.) Only an
+ * entry over half a page still gets a buffer of its own, and the pool above.
+ * RSX_VB_PAGES=0: a buffer each, as before. */
+#define VB_PAGE_BYTES ((u32)32 << 20)
+#define VB_PAGES      64
+typedef struct { ID3D12Resource* res; u8* mapped; D3D12_GPU_VIRTUAL_ADDRESS va; MemList m; } VbPage;
+static VbPage s_vpage[VB_PAGES];
+static u32 s_buf_page[ENG_MAX_BUFS];   /* the page + 1 a buffer is a range of, else 0 */
+static u32 s_buf_off[ENG_MAX_BUFS];    /* and where in it; s_buf_cap is the range's size */
+int g_eng_vb_pages = 1;
+
+static u32 vb_page_take(u32 size, u32* off)
+{
+    u64 o = 0;
+    int empty = -1;
+    for (u32 i = 0; i < VB_PAGES; i++) {
+        if (!s_vpage[i].res) { if (empty < 0) empty = (int)i; continue; }
+        if (mem_take(&s_vpage[i].m, size, 256, &o)) { *off = (u32)o; return i + 1; }
+    }
+    if (empty < 0) return 0;
+    VbPage* pg = &s_vpage[empty];
+    pg->res = make_buffer(D3D12_HEAP_TYPE_UPLOAD, VB_PAGE_BYTES, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!pg->res) return 0;
+    D3D12_RANGE nr = {0, 0};
+    if (FAILED(CALL(pg->res, Map, 0, &nr, (void**)&pg->mapped))) { RELEASE(pg->res); return 0; }
+    pg->va = CALL0(pg->res, GetGPUVirtualAddress);
+    mem_fresh(&pg->m, VB_PAGE_BYTES);
+    if (!mem_take(&pg->m, size, 256, &o)) return 0;
+    *off = (u32)o;
+    return (u32)empty + 1;
+}
+
+/* One empty page is kept for the next buffers; a second is let go. */
+static void vb_page_done(u32 page, u32 off, u32 size)
+{
+    VbPage* pg = &s_vpage[page - 1];
+    mem_give(&pg->m, off, size);
+    if (pg->m.live) return;
+    for (u32 i = 0; i < VB_PAGES; i++)
+        if (&s_vpage[i] != pg && s_vpage[i].res && !s_vpage[i].m.live) {
+            CALL(pg->res, Unmap, 0, NULL); RELEASE(pg->res);
+            pg->mapped = NULL; pg->m.nfr = 0;
+            break;
+        }
+}
+
 static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
 {
     (void)user;
@@ -875,8 +1114,20 @@ static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
     if (s_buf_free_count) slot = s_buf_free[s_buf_free_count - 1];
     else if (s_buf_count < ENG_MAX_BUFS) slot = s_buf_count;
     else return 0;
-    /* D3D12 cannot read the engine's memory in place; it is copied into an
-     * upload-heap buffer and, ownership being ours, freed here. */
+    /* D3D12 cannot read the engine's memory in place; it is copied into
+     * upload-heap memory and, ownership being ours, freed here. */
+    const u32 size = (bytes + 4095u) & ~4095u;
+    u32 off = 0;
+    const u32 page = g_eng_vb_pages && size <= VB_PAGE_BYTES / 2 ? vb_page_take(size, &off) : 0;
+    if (page) {
+        memcpy(s_vpage[page - 1].mapped + off, data, bytes);
+        _aligned_free(data);
+        s_stat_buf++;
+        if (s_buf_free_count) s_buf_free_count--; else s_buf_count++;
+        s_buf[slot] = s_vpage[page - 1].res; s_buf_bytes[slot] = bytes; s_buf_retired[slot] = 0;
+        s_buf_page[slot] = page; s_buf_off[slot] = off; s_buf_cap[slot] = size;
+        return slot + 1;
+    }
     const u32 cap = buf_class(bytes);
     ID3D12Resource* b = NULL;
     for (u32 i = 0; i < s_buf_pool_n; i++) {
@@ -897,6 +1148,7 @@ static u32 eng_buffer_wrap(void* user, void* data, u32 bytes)
     s_stat_buf++;
     if (s_buf_free_count) s_buf_free_count--; else s_buf_count++;
     s_buf[slot] = b; s_buf_bytes[slot] = bytes; s_buf_retired[slot] = 0;
+    s_buf_page[slot] = 0; s_buf_off[slot] = 0;
     return slot + 1;
 }
 
@@ -907,7 +1159,10 @@ static void eng_collect_retired_buffers(void)
     for (u32 i = 0; i < s_buf_count; i++) {
         if (!s_buf_retired[i] || !fence_done(s_buf_retired_fence[i])) continue;
         s_buf_retired[i] = 0;
-        if (g_eng_buf_pool && s_buf_pool_n < ENG_BUF_POOL && s_buf_pool_bytes + s_buf_cap[i] <= ENG_BUF_POOL_BYTES) {
+        if (s_buf_page[i]) {
+            vb_page_done(s_buf_page[i], s_buf_off[i], s_buf_cap[i]);
+            s_buf[i] = NULL; s_buf_page[i] = 0;
+        } else if (g_eng_buf_pool && s_buf_pool_n < ENG_BUF_POOL && s_buf_pool_bytes + s_buf_cap[i] <= ENG_BUF_POOL_BYTES) {
             s_buf_pool[s_buf_pool_n].res = s_buf[i]; s_buf_pool[s_buf_pool_n].cap = s_buf_cap[i];
             s_buf_pool_n++; s_buf_pool_bytes += s_buf_cap[i];
             s_buf[i] = NULL;
@@ -1349,6 +1604,8 @@ static void eng_shutdown(void* user)
     if (s_queue && s_fence) fence_wait(fence_signal());
     for (u32 i = 0; i < s_obj_count; i++) { RELEASE(s_obj[i].res); memset(&s_obj[i], 0, sizeof s_obj[i]); }
     s_obj_count = s_obj_free_count = s_retired_count = 0;
+    for (u32 i = 0; i < s_ntheap; i++) { RELEASE(s_theap[i].heap); free(s_theap[i].m.fr); memset(&s_theap[i], 0, sizeof s_theap[i]); }
+    s_ntheap = 0;
     for (u32 i = 0; i < s_pipe_count; i++) {
         RELEASE(s_pipe[i].vs); RELEASE(s_pipe[i].ps);
         for (int k = 0; k < 3; k++) RELEASE(s_pipe[i].pso[k]);
@@ -1356,15 +1613,17 @@ static void eng_shutdown(void* user)
     s_pipe_count = 0;
     for (u32 i = 0; i < s_blob_count; i++) RELEASE(s_blob[i].blob);
     s_blob_count = s_samp_count = s_view_count = s_rec_count = 0;
-    for (u32 i = 0; i < s_buf_count; i++) RELEASE(s_buf[i]);
+    for (u32 i = 0; i < s_buf_count; i++) { if (s_buf_page[i]) s_buf[i] = NULL; else RELEASE(s_buf[i]); }
+    memset(s_buf_page, 0, sizeof s_buf_page);
+    for (u32 i = 0; i < VB_PAGES; i++) {
+        if (s_vpage[i].res) { CALL(s_vpage[i].res, Unmap, 0, NULL); RELEASE(s_vpage[i].res); }
+        free(s_vpage[i].m.fr); memset(&s_vpage[i], 0, sizeof s_vpage[i]);
+    }
     for (u32 i = 0; i < s_buf_pool_n; i++) RELEASE(s_buf_pool[i].res);
     s_buf_pool_n = 0; s_buf_pool_bytes = 0;
     s_buf_count = s_buf_free_count = 0; memset(s_buf_retired, 0, sizeof s_buf_retired);
-    for (int i = 0; i < ENG_STAGE_POOL; i++) {
-        if (s_stage[i].res) { CALL(s_stage[i].res, Unmap, 0, NULL); RELEASE(s_stage[i].res); }
-        memset(&s_stage[i], 0, sizeof s_stage[i]);
-    }
-    s_stage_cur = -1; s_stage_used = 0;
+    for (int i = 0; i < ENG_STAGE_POOL; i++) eng_stage_free(&s_stage[i]);
+    s_chain_n = 0;
     for (int i = 0; i < ENG_MAX_SUBMITS; i++) { free(s_sub[i].q_vis); free(s_sub[i].reports); memset(&s_sub[i], 0, sizeof s_sub[i]); }
     s_vs_cb_seq = ~0u; s_vis_npending = 0; s_fallback_n = 0;
     for (u32 i = 0; i < s_snap_pool_n; i++) RELEASE(s_snap_pool[i].res);
@@ -1380,10 +1639,14 @@ static u32 eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
     (void)user;
     if (!s_dev || !w || !h) return 0;
     const DXGI_FORMAT df = eng_dxgi(fmt);
-    ID3D12Resource* t = make_texture(df, w, h, mips, faces, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+    u32 heap = 0; u64 heap_off = 0, heap_size = 0;
+    ID3D12Resource* t = make_placed_texture(df, w, h, mips, faces, D3D12_RESOURCE_STATE_COPY_DEST, &heap, &heap_off, &heap_size);
+    if (!t) t = make_texture(df, w, h, mips, faces, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, NULL);
     s_stat_tex++;
     const u32 handle = eng_obj_add(t, OBJ_TEXTURE, df, w, h, mips, faces, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (handle) eng_write_srv(handle, t, df, mips ? mips : 1, faces, eng_mapping(remap, rsx_fmt));
+    if (!handle) { if (t) theap_done(heap, heap_off, heap_size); return 0; }   /* eng_obj_add released it */
+    s_obj[handle - 1].heap = heap; s_obj[handle - 1].heap_off = heap_off; s_obj[handle - 1].heap_size = heap_size;
+    eng_write_srv(handle, t, df, mips ? mips : 1, faces, eng_mapping(remap, rsx_fmt));
     return handle;
 }
 
@@ -1395,7 +1658,7 @@ static void eng_upload_rows(u32 handle, u32 sub, u32 w, u32 h, const void* src, 
     u32 off;
     if (!eng_stage_reserve(pitch * rows, &off)) return;
     /* The reserve may have submitted, so the pointer is taken after it. */
-    u8* dst = s_stage[s_stage_cur].mapped + off;
+    u8* dst = eng_stage_ptr(off);
     if (pitch == row_bytes) memcpy(dst, src, (size_t)row_bytes * rows);
     else for (u32 y = 0; y < rows; y++) memcpy(dst + (size_t)y * pitch, (const u8*)src + (size_t)y * row_bytes, row_bytes);
     EngRecord* r = &s_rec[s_rec_count++];
@@ -2377,16 +2640,48 @@ static void eng_vp_sc(const EngRecord* r, int scaled, u32 tw, u32 th, D3D12_VIEW
 
 static ID3D12PipelineState* eng_pso_for(u32 pipeline, int cls, int unscaled);   /* below */
 
-static void eng_encode_upload(const EngRecord* r, ID3D12Resource* stage)
+/* Where a draw's vertices and indices are: in a buffer of their own or
+ * staged. vleft: the bytes from its first vertex to the end of what holds
+ * them. */
+static int eng_draw_buffers(const EngRecord* r, D3D12_GPU_VIRTUAL_ADDRESS* vb, D3D12_GPU_VIRTUAL_ADDRESS* ib, u32* vleft)
+{
+    if (r->vbuf) {
+        const u32 b = r->vbuf - 1;
+        if (!s_buf[b]) return 0;
+        const D3D12_GPU_VIRTUAL_ADDRESS va = s_buf_page[b] ? s_vpage[s_buf_page[b] - 1].va + s_buf_off[b]
+                                                           : CALL0(s_buf[b], GetGPUVirtualAddress);
+        const u32 bytes = s_buf_bytes[b];
+        *vb = va + r->vb_off; *ib = va + r->ib_off;
+        *vleft = r->vb_off < bytes ? bytes - r->vb_off : 0;
+        return 1;
+    }
+    const EngStage* s = eng_stage_at(r->vb_off);
+    const EngStage* si = r->index_count ? eng_stage_at(r->ib_off) : s;
+    if (!s || !si) return 0;
+    const u32 lo = r->vb_off - s->base;
+    *vb = s->va + lo; *ib = si->va + (r->ib_off - si->base);
+    *vleft = lo < s->used ? s->used - lo : 0;
+    return 1;
+}
+
+/* A draw's staged constants, or the zeroes where it staged none. */
+static D3D12_GPU_VIRTUAL_ADDRESS eng_cb_va(u32 off, u32 bytes)
+{
+    const EngStage* s = bytes ? eng_stage_at(off) : NULL;
+    return s ? s->va + (off - s->base) : CALL0(s_zero_cb, GetGPUVirtualAddress);
+}
+
+static void eng_encode_upload(const EngRecord* r)
 {
     EngObj* o = eng_owner(r->depth);
+    const EngStage* stage = eng_stage_at(r->up_off);
     if (!o || !stage) return;
     res_transition(o->res, &o->state, D3D12_RESOURCE_STATE_COPY_DEST);
     bar_flush();
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = o->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = r->up_sub;
-    src.pResource = stage; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = r->up_off;
+    src.pResource = stage->res; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = r->up_off - stage->base;
     src.PlacedFootprint.Footprint.Format = o->fmt;
     u32 w = r->up_w, h = r->up_h;
     if (o->fmt == DXGI_FORMAT_BC1_UNORM || o->fmt == DXGI_FORMAT_BC2_UNORM || o->fmt == DXGI_FORMAT_BC3_UNORM) {
@@ -2658,7 +2953,7 @@ static void eng_ms_apply(int want)
     fprintf(stderr, "[RSX d3d12] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
 }
 
-static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
+static void eng_encode_draw(const EngRecord* r)
 {
     /* Attachments: target A's size rules, as the Metal engine. */
     D3D12_CPU_DESCRIPTOR_HANDLE rtv[RSX_BE_MAX_COLOR_TARGETS];
@@ -2764,20 +3059,18 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
     CALL(s_list, RSSetScissorRects, 1, &sc);
     CALL(s_list, OMSetStencilRef, r->stencil_ref);
 
-    ID3D12Resource* vres = r->vbuf ? s_buf[r->vbuf - 1] : stage;
-    if (!vres) return;
-    const D3D12_GPU_VIRTUAL_ADDRESS vva = r->vbuf ? CALL0(vres, GetGPUVirtualAddress) : stage_va;
-    const u32 vbytes = r->vbuf ? s_buf_bytes[r->vbuf - 1] : s_stage_used;
-    D3D12_VERTEX_BUFFER_VIEW vbv = { vva + r->vb_off, r->vb_off < vbytes ? vbytes - r->vb_off : 0, r->stride };
+    D3D12_GPU_VIRTUAL_ADDRESS vb_va, ib_va; u32 vleft;
+    if (!eng_draw_buffers(r, &vb_va, &ib_va, &vleft)) return;
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vb_va, vleft, r->stride };
     if (vbv.SizeInBytes > (u64)r->vertex_count * r->stride && !r->index_count) vbv.SizeInBytes = r->vertex_count * r->stride;
     CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
     if (r->index_count) {
-        D3D12_INDEX_BUFFER_VIEW ibv = { vva + r->ib_off, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
+        D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
         CALL(s_list, IASetIndexBuffer, &ibv);
     }
     const D3D12_GPU_VIRTUAL_ADDRESS zero_va = CALL0(s_zero_cb, GetGPUVirtualAddress);
-    CALL(s_list, SetGraphicsRootConstantBufferView, 0, r->vs_cb_bytes ? stage_va + r->vs_cb_off : zero_va);
-    CALL(s_list, SetGraphicsRootConstantBufferView, 4, r->ps_cb_bytes ? stage_va + r->ps_cb_off : zero_va);
+    CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
+    CALL(s_list, SetGraphicsRootConstantBufferView, 4, eng_cb_va(r->ps_cb_off, r->ps_cb_bytes));
 
     D3D12_GPU_DESCRIPTOR_HANDLE st;
     if (s_srv_last_valid && memcmp(s_srv_last_src, srv, sizeof srv) == 0) st = s_srv_last_gpu;
@@ -2795,9 +3088,9 @@ static void eng_encode_draw(const EngRecord* r, ID3D12Resource* stage, D3D12_GPU
             CALL(s_list, RSSetViewports, 1, &vp); CALL(s_list, RSSetScissorRects, 1, &sc);
             CALL(s_list, OMSetStencilRef, r->stencil_ref);
             CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
-            if (r->index_count) { D3D12_INDEX_BUFFER_VIEW ibv = { vva + r->ib_off, r->index_count * 4u, DXGI_FORMAT_R32_UINT }; CALL(s_list, IASetIndexBuffer, &ibv); }
-            CALL(s_list, SetGraphicsRootConstantBufferView, 0, r->vs_cb_bytes ? stage_va + r->vs_cb_off : zero_va);
-            CALL(s_list, SetGraphicsRootConstantBufferView, 4, r->ps_cb_bytes ? stage_va + r->ps_cb_off : zero_va);
+            if (r->index_count) { D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT }; CALL(s_list, IASetIndexBuffer, &ibv); }
+            CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
+            CALL(s_list, SetGraphicsRootConstantBufferView, 4, eng_cb_va(r->ps_cb_off, r->ps_cb_bytes));
         }
     }
     D3D12_GPU_DESCRIPTOR_HANDLE vt = st; vt.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_srv_step;
@@ -2951,7 +3244,7 @@ static ID3D12PipelineState* eng_copy_pso(u32 pipeline, int cls, DXGI_FORMAT fmt,
 }
 
 /* Draw r's geometry into snapshot S with the copy shader reading target T. */
-static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
+static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S)
 {
     EngObj* t = eng_owner(T); EngObj* sn = eng_owner(S);
     if (!t || !sn || !sn->has_rtv) return 0;
@@ -2961,8 +3254,8 @@ static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource
     const int ms = t->ms && t->ms_dirty;
     ID3D12PipelineState* pso = eng_copy_pso(r->pipeline, topo_class(r->topology), sn->fmt, ms);
     if (!pso) return 0;
-    ID3D12Resource* vres = r->vbuf ? s_buf[r->vbuf - 1] : stage;
-    if (!vres) return 0;
+    D3D12_GPU_VIRTUAL_ADDRESS vb_va, ib_va; u32 vleft;
+    if (!eng_draw_buffers(r, &vb_va, &ib_va, &vleft)) return 0;
     /* Tables first: a full descriptor ring flushes the list and rebinds. */
     D3D12_CPU_DESCRIPTOR_HANDLE srv[ENG_SRV_TABLE];
     for (u32 u = 0; u < ENG_SRV_TABLE; u++) srv[u] = obj_srv(0);
@@ -2992,17 +3285,15 @@ static int eng_encode_copy_draw(const EngRecord* r, u32 T, u32 S, ID3D12Resource
     eng_vp_sc(r, eng_obj_scaled(T), t->w, t->h, &vp, &sc);
     CALL(s_list, RSSetViewports, 1, &vp);
     CALL(s_list, RSSetScissorRects, 1, &sc);
-    const D3D12_GPU_VIRTUAL_ADDRESS vva = r->vbuf ? CALL0(vres, GetGPUVirtualAddress) : stage_va;
-    const u32 vbytes = r->vbuf ? s_buf_bytes[r->vbuf - 1] : s_stage_used;
-    D3D12_VERTEX_BUFFER_VIEW vbv = { vva + r->vb_off, r->vb_off < vbytes ? vbytes - r->vb_off : 0, r->stride };
+    D3D12_VERTEX_BUFFER_VIEW vbv = { vb_va, vleft, r->stride };
     if (vbv.SizeInBytes > (u64)r->vertex_count * r->stride && !r->index_count) vbv.SizeInBytes = r->vertex_count * r->stride;
     CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
     if (r->index_count) {
-        D3D12_INDEX_BUFFER_VIEW ibv = { vva + r->ib_off, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
+        D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
         CALL(s_list, IASetIndexBuffer, &ibv);
     }
     const D3D12_GPU_VIRTUAL_ADDRESS zero_va = CALL0(s_zero_cb, GetGPUVirtualAddress);
-    CALL(s_list, SetGraphicsRootConstantBufferView, 0, r->vs_cb_bytes ? stage_va + r->vs_cb_off : zero_va);
+    CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
     CALL(s_list, SetGraphicsRootConstantBufferView, 4, zero_va);
     D3D12_GPU_DESCRIPTOR_HANDLE vt = st; vt.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_srv_step;
     D3D12_GPU_DESCRIPTOR_HANDLE vsm = sm; vsm.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_smp_step;
@@ -3052,7 +3343,7 @@ static void eng_pass_mark(const EngRecord* r, u64* cur_key)
     if (kind == 0 && *n) s_pass[s_slot][*n - 1].draws++;
 }
 
-static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS stage_va)
+static void eng_encode_records(void)
 {
     u64 pass_key = ~0ull;
     /* g_rsx_snap_incr: -1 until read from RSX_SNAP_INCR; the host A/B (DOD3_AB=snapincr) flips it. */
@@ -3093,7 +3384,7 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
             if (incr && ready && k < nsy && sy[k].valid && sy[k].snap == S && sobj && sobj->has_rtv) {
                 done = 1;
                 for (u32 j = 0; j < sy[k].n; j++)
-                    if (!eng_encode_copy_draw(&s_rec[sy[k].idx[j]], T, S, stage, stage_va)) { done = 0; break; }
+                    if (!eng_encode_copy_draw(&s_rec[sy[k].idx[j]], T, S)) { done = 0; break; }
             }
             if (done) {
                 s_snap_incr_n++;
@@ -3146,12 +3437,12 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
         }
         switch (r->kind) {
         case ENG_REC_DRAW:
-            eng_encode_draw(r, stage, stage_va);
+            eng_encode_draw(r);
             break;
         case ENG_REC_UPLOAD: {
             EngObj* o = eng_owner(r->depth);
             if (o && o->ms) { if (o->ms_dirty) eng_ms_resolve((u32)(o - s_obj) + 1); o->ms_stale = 1; }
-            eng_encode_upload(r, stage);
+            eng_encode_upload(r);
             break; }
         case ENG_REC_CLEAR_COLOR: {
             EngObj* o = eng_owner(r->rt[0]);
@@ -3233,8 +3524,6 @@ static void eng_encode_records(ID3D12Resource* stage, D3D12_GPU_VIRTUAL_ADDRESS 
 }
 
 /* ---- submit ---------------------------------------------------------------- */
-
-static ID3D12Resource* s_cur_stage_res; static D3D12_GPU_VIRTUAL_ADDRESS s_cur_stage_va;
 
 /* Close and execute the open list; signal its fence. Rings and queries of
  * the list are the caller's to account for. */
@@ -3503,7 +3792,7 @@ static u32 eng_aa_target(u32 w, u32 h)
 static void eng_submit(u32 present_surface, int wait)
 {
     if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
-    if (!s_ready) { s_rec_count = 0; s_stage_used = 0; s_stage_cur = -1; s_vis_npending = 0; return; }
+    if (!s_ready) { s_rec_count = 0; eng_stage_submitted(0); s_vis_npending = 0; return; }
     if (s_fs_restore && present_surface) eng_fullscreen_restore();
     if (!s_rec_count && !present_surface) return;
     eng_poll_submits();
@@ -3512,9 +3801,7 @@ static void eng_submit(u32 present_surface, int wait)
     fence_wait(s_alloc_fence[s_slot]);
     eng_list_begin();
 
-    ID3D12Resource* stage = s_stage_cur >= 0 ? s_stage[s_stage_cur].res : NULL;
-    const D3D12_GPU_VIRTUAL_ADDRESS stage_va = stage ? CALL0(stage, GetGPUVirtualAddress) : 0;
-    eng_encode_records(stage, stage_va);
+    eng_encode_records();
 
     u32 bbi = 0; int windowed = 0;
     if (present_surface) {
@@ -3577,9 +3864,8 @@ static void eng_submit(u32 present_surface, int wait)
     s_submit_kind = wait;
     eng_submit_list(&f);
     s_submit_kind = 0;
-    sub->fence = f; sub->live = 1; sub->stage = s_stage_cur;
-    if (s_stage_cur >= 0) { s_stage[s_stage_cur].fence = f; s_stage[s_stage_cur].in_use = 1; }
-    s_stage_cur = -1; s_stage_used = 0;
+    sub->fence = f; sub->live = 1;
+    eng_stage_submitted(f);
     s_rec_count = 0;
     s_submit_seq++;
 
@@ -3844,6 +4130,8 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
     s_vsync = eng_read_vsync();
     eng_read_scale();
     { const char* e = getenv("RSX_BUF_POOL"); if (e && *e == '0') g_eng_buf_pool = 0; }
+    { const char* e = getenv("RSX_TEX_HEAPS"); if (e && *e == '0') g_eng_tex_heaps = 0; }
+    { const char* e = getenv("RSX_VB_PAGES"); if (e && *e == '0') g_eng_vb_pages = 0; }
     /* Per-monitor DPI awareness, before any window exists: without it a
      * 4K display at 125% scaling reports 3072x1728, the borderless window
      * covers that and Windows stretches it, and a 1280x720 window is drawn

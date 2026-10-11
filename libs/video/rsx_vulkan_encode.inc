@@ -329,7 +329,7 @@ static void eng_ms_apply(int want)
     fprintf(stderr, "[RSX vulkan] MSAA %s\n", s_ms_n > 1 ? (s_ms_n == 2 ? "x2" : s_ms_n == 4 ? "x4" : "x8") : "off");
 }
 
-static void eng_encode_draw(const EngRecord* r, EngStage* stage)
+static void eng_encode_draw(const EngRecord* r)
 {
     /* Attachments: target A's size rules, as the D3D12 backend. */
     u32 nrt = 0, tw = 0, th = 0;
@@ -393,9 +393,10 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
     }
     for (u32 u = 0; u < 16; u++) d.fs_smp[u] = r->samp[u] >= 0 ? s_samp[r->samp[u]].smp : s_point_sampler;
     for (u32 u = 0; u < 4; u++) d.vs_smp[u] = r->vsamp[u] >= 0 ? s_samp[r->vsamp[u]].smp : s_point_sampler;
-    const VkBuffer sbuf = stage ? stage->buf : VK_NULL_HANDLE;
-    d.vs_buf = (r->vs_cb_bytes && sbuf) ? sbuf : s_zero_buf;
-    d.fs_buf = (r->ps_cb_bytes && sbuf) ? sbuf : s_zero_buf;
+    const EngStage* vs_st = r->vs_cb_bytes ? eng_stage_at(r->vs_cb_off) : NULL;
+    const EngStage* fs_st = r->ps_cb_bytes ? eng_stage_at(r->ps_cb_off) : NULL;
+    d.vs_buf = vs_st ? vs_st->buf : s_zero_buf;
+    d.fs_buf = fs_st ? fs_st->buf : s_zero_buf;
 
     /* Layouts: anything to change ends the pass. */
     int same = s_in_render && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_tw == tw && s_cur_th == th && s_cur_ms == ms;
@@ -435,17 +436,25 @@ static void eng_encode_draw(const EngRecord* r, EngStage* stage)
 
     const VkDescriptorSet set = eng_set(&d);
     if (!set) return;
-    const u32 dyn[2] = { d.vs_buf == sbuf ? r->vs_cb_off : 0u, d.fs_buf == sbuf ? r->ps_cb_off : 0u };
+    const u32 dyn[2] = { vs_st ? r->vs_cb_off - vs_st->base : 0u, fs_st ? r->ps_cb_off - fs_st->base : 0u };
     vkCmdBindDescriptorSets(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl, 0, 1, &set, 2, dyn);
 
-    const VkBuffer vbuf = r->vbuf ? s_buf[r->vbuf - 1] : sbuf;
+    /* Vertices and indices: in a buffer of their own, or staged. */
+    VkBuffer vbuf, ibuf; VkDeviceSize voff, ioff;
+    if (r->vbuf) { vbuf = ibuf = s_buf[r->vbuf - 1]; voff = r->vb_off; ioff = r->ib_off; }
+    else {
+        const EngStage* vst = eng_stage_at(r->vb_off);
+        const EngStage* ist = r->index_count ? eng_stage_at(r->ib_off) : vst;
+        if (!vst || !ist) return;
+        vbuf = vst->buf; voff = r->vb_off - vst->base;
+        ibuf = ist->buf; ioff = r->ib_off - ist->base;
+    }
     if (!vbuf) return;
-    const VkDeviceSize voff = r->vb_off;
     vkCmdBindVertexBuffers(s_cmd, 0, 1, &vbuf, &voff);
     const int query = r->vis && s_q_used < ENG_QUERIES_PER_SLOT;
     if (query) vkCmdBeginQuery(s_cmd, s_qpool[s_slot], s_q_used, s_query_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     if (r->index_count) {
-        vkCmdBindIndexBuffer(s_cmd, vbuf, r->ib_off, VK_INDEX_TYPE_UINT32);
+        vkCmdBindIndexBuffer(s_cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(s_cmd, r->index_count, 1, 0, 0, 0);
     } else {
         vkCmdDraw(s_cmd, r->vertex_count, 1, 0, 0);
@@ -538,7 +547,7 @@ static void eng_encode_depth_resolve(const EngRecord* r)
     render_end();
 }
 
-static void eng_encode_records(EngStage* stage)
+static void eng_encode_records(void)
 {
     s_in_render = 0; s_cur_pso = VK_NULL_HANDLE; s_cur_set = VK_NULL_HANDLE; s_cur_set_key = 0;
     s_cur_topo = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
@@ -563,17 +572,18 @@ static void eng_encode_records(EngStage* stage)
         const EngRecord* r = &s_rec[i];
         switch (r->kind) {
         case ENG_REC_DRAW:
-            eng_encode_draw(r, stage);
+            eng_encode_draw(r);
             break;
         case ENG_REC_UPLOAD: {
             EngObj* o = eng_owner(r->depth);
             if (o && o->ms_img) o->ms_stale = 1;
+            const EngStage* stage = eng_stage_at(r->up_off);
             if (!o || !stage || !stage->buf) break;
             render_end();
             obj_layout(o, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             bar_flush();
             VkBufferImageCopy c = {0};
-            c.bufferOffset = r->up_off; c.bufferRowLength = r->up_row_texels; c.bufferImageHeight = r->up_rows_texels;
+            c.bufferOffset = r->up_off - stage->base; c.bufferRowLength = r->up_row_texels; c.bufferImageHeight = r->up_rows_texels;
             c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             c.imageSubresource.mipLevel = r->up_mip; c.imageSubresource.baseArrayLayer = r->up_layer;
             c.imageSubresource.layerCount = 1;
@@ -710,7 +720,7 @@ static void eng_dump_frame(u32 surface);
 static void eng_submit(u32 present_surface, int wait)
 {
     if (!s_walker_tid) s_walker_tid = GetCurrentThreadId();
-    if (!s_ready) { s_rec_count = 0; s_stage_used = 0; s_stage_cur = -1; s_vis_npending = 0; return; }
+    if (!s_ready) { s_rec_count = 0; eng_stage_submitted(0); s_vis_npending = 0; return; }
     if (!s_rec_count && !present_surface) return;
     eng_poll_submits();
 
@@ -726,8 +736,7 @@ static void eng_submit(u32 present_surface, int wait)
     vkCmdResetQueryPool(s_cmd, s_qpool[s_slot], 0, ENG_QUERIES_PER_SLOT);
     s_q_used = 0;
 
-    EngStage* stage = s_stage_cur >= 0 ? &s_stage[s_stage_cur] : NULL;
-    eng_encode_records(stage);
+    eng_encode_records();
 
     /* Query results into the slot's readback buffer. */
     if (s_q_used) {
@@ -815,9 +824,8 @@ static void eng_submit(u32 present_surface, int wait)
         if (sr == VK_ERROR_DEVICE_LOST) s_ready = 0;
     }
     s_slot_fence[s_slot] = f;
-    sub->fence = f; sub->live = 1; sub->stage = s_stage_cur;
-    if (s_stage_cur >= 0) { s_stage[s_stage_cur].fence = f; s_stage[s_stage_cur].in_use = 1; }
-    s_stage_cur = -1; s_stage_used = 0;
+    sub->fence = f; sub->live = 1;
+    eng_stage_submitted(f);
     s_rec_count = 0;
     s_submit_seq++;
 
@@ -1417,7 +1425,7 @@ static void eng_shutdown(void* user)
     for (u32 i = 0; i < s_buf_pool_n; i++) { vkDestroyBuffer(s_dev, s_buf_pool[i].buf, NULL); mem_free(&s_buf_pool[i].mem); }
     s_buf_pool_n = 0; s_buf_count = s_buf_free_count = 0;
     for (int i = 0; i < ENG_STAGE_POOL; i++) eng_stage_free(&s_stage[i]);
-    s_stage_cur = -1; s_stage_used = 0;
+    s_chain_n = 0;
     for (int i = 0; i < ENG_MAX_SUBMITS; i++) { free(s_sub[i].q_vis); free(s_sub[i].reports); memset(&s_sub[i], 0, sizeof s_sub[i]); }
     s_vs_cb_seq = ~0u; s_vis_npending = 0; s_fallback_n = 0;
     s_active = 0;

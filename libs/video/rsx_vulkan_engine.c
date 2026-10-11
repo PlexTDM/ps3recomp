@@ -11,8 +11,8 @@
  *   - bind_* calls accumulate into s_pending; draw/clear/snapshot/upload
  *     calls append an EngRecord. Nothing touches a command buffer until a
  *     submit.
- *   - Vertices, indices, constants and texture rows go into one host-visible
- *     arena per submit (the "stage").
+ *   - Vertices, indices, constants and texture rows go into host-visible
+ *     chunks, chained as a submit fills them (the "stage").
  *   - A submit records one command buffer on one of ENG_FRAMES slots. Draws
  *     into the same targets share a dynamic-rendering instance; anything that
  *     needs a layout change or a transfer ends it first. Barriers are
@@ -63,7 +63,7 @@
 #define ENG_MAX_BUFS      16384
 #define ENG_ALIGN         256u
 #define ENG_STAGE_MAX     (384u << 20)
-#define ENG_STAGE_START   (16u << 20)
+#define ENG_STAGE_CHUNK   (16u << 20)
 #define ENG_UBO_RANGE     16384u      /* both constant blocks; the stage keeps this much slack */
 #define ENG_FRAMES        4
 #define ENG_INFLIGHT      2
@@ -72,7 +72,9 @@
 #define ENG_VIS_SLOTS     16384u
 #define ENG_MAX_REPORTS   4096
 #define ENG_MAX_SUBMITS   16
-#define ENG_STAGE_POOL    8
+#define ENG_STAGE_POOL    64
+#define ENG_STAGE_KEEP    8           /* chunks kept however long they go unused */
+#define ENG_STAGE_IDLE    600u        /* submits a chunk beyond those is kept unused */
 #define ENG_DEPTH_FMT     VK_FORMAT_D32_SFLOAT_S8_UINT
 
 /* ---- the loader ------------------------------------------------------------ */
@@ -237,14 +239,15 @@ typedef struct {
 typedef struct {
     VkBuffer buf; MemAlloc mem; u8* mapped;
     u32 cap;
-    u64 fence;
-    int in_use;
+    u32 base, used;   /* in a chain: where it starts in the records' offsets, and its fill */
+    u64 fence;        /* the submit that last used it */
+    u32 seq;          /* and that submit's number */
+    int in_use;       /* 1: handed to a submit that may still be running; 2: in the chain being built */
 } EngStage;
 
 typedef struct { u32 slot, index; } EngVisReport;
 typedef struct {
     u64 fence;
-    int stage;
     u32 q_slot, q_count;
     u32* q_vis;
     EngVisReport* reports; u32 n_reports;
@@ -304,8 +307,8 @@ static EngRecord s_pending;
 static VkBuffer s_buf[ENG_MAX_BUFS]; static MemAlloc s_buf_mem[ENG_MAX_BUFS]; static u32 s_buf_bytes[ENG_MAX_BUFS], s_buf_cap[ENG_MAX_BUFS];
 static u32 s_buf_count, s_buf_free[ENG_MAX_BUFS], s_buf_free_count; static u8 s_buf_retired[ENG_MAX_BUFS];
 static u64 s_buf_retired_fence[ENG_MAX_BUFS];
-static EngStage s_stage[ENG_STAGE_POOL]; static int s_stage_cur = -1;
-static u32 s_stage_used, s_stage_want = ENG_STAGE_START;
+static EngStage s_stage[ENG_STAGE_POOL];
+static int s_chain[ENG_STAGE_POOL]; static u32 s_chain_n;   /* the chunks of the submit being built */
 static EngSubmit s_sub[ENG_MAX_SUBMITS];
 static u32 s_submit_seq;
 static u32 s_vs_cb_seq = ~0u, s_vs_cb_off, s_vs_cb_bytes;
@@ -782,7 +785,13 @@ static void eng_obj_release(void* user, u32 handle)
     }
 }
 
-/* ---- staging ------------------------------------------------------------------- */
+/* ---- staging -------------------------------------------------------------------
+ * What a submit's records read -- constants, vertices without a buffer of
+ * their own, texture rows -- is staged in host-visible chunks, chained as
+ * they fill; a record holds offsets into the chain. Nothing staged is ever
+ * read back: the memory is write-combined on the drivers that matter, and
+ * one arena grown by copying it into a larger one took 0.15 to 0.3 s and
+ * more over what a level's first frame stages. */
 
 static void eng_submit(u32 present_surface, int wait);
 
@@ -801,59 +810,109 @@ static void eng_stage_free(EngStage* s)
 {
     if (s->buf) vkDestroyBuffer(s_dev, s->buf, NULL);
     mem_free(&s->mem);
-    s->buf = VK_NULL_HANDLE; s->mapped = NULL; s->cap = 0;
+    memset(s, 0, sizeof *s);
 }
 
-static int eng_stage_pick(void)
+/* A free chunk of `need` bytes or more: the smallest there is, else a new
+ * one, in an empty slot or in place of the smallest free one. -1 when every
+ * chunk is in use. */
+static int eng_stage_pick(u32 need)
 {
-    int best = -1;
+    int best = -1, empty = -1, least = -1;
     for (int i = 0; i < ENG_STAGE_POOL; i++) {
         EngStage* s = &s_stage[i];
-        if (s->in_use && fence_done(s->fence)) s->in_use = 0;
+        if (s->in_use == 1 && fence_done(s->fence)) s->in_use = 0;
         if (s->in_use) continue;
-        if (s->buf && s->cap >= s_stage_want && (best < 0 || s->cap < s_stage[best].cap)) best = i;
+        if (!s->buf) { if (empty < 0) empty = i; }
+        else if (s->cap >= need) { if (best < 0 || s->cap < s_stage[best].cap) best = i; }
+        else if (least < 0 || s->cap < s_stage[least].cap) least = i;
     }
     if (best >= 0) return best;
-    for (int i = 0; i < ENG_STAGE_POOL; i++) if (!s_stage[i].in_use && !s_stage[i].buf) { best = i; break; }
-    if (best < 0) {
-        for (int i = 0; i < ENG_STAGE_POOL; i++)
-            if (!s_stage[i].in_use && (best < 0 || s_stage[i].cap < s_stage[best].cap)) best = i;
-        if (best < 0) return -1;
-        eng_stage_free(&s_stage[best]);
+    if (empty < 0) {
+        if (least < 0) return -1;
+        eng_stage_free(&s_stage[least]);
+        empty = least;
     }
-    return eng_stage_make(&s_stage[best], s_stage_want) ? best : -1;
+    u32 cap = ENG_STAGE_CHUNK;
+    while (cap < need) cap *= 2u;
+    if (!eng_stage_make(&s_stage[empty], cap)) { eng_stage_free(&s_stage[empty]); return -1; }
+    return empty;
 }
 
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
-    const u32 start = (s_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
-    if ((u64)start + bytes > ENG_STAGE_MAX) { eng_submit(0, 1); return eng_stage_reserve(bytes, out_off); }
-    if (s_stage_cur < 0) {
-        s_stage_cur = eng_stage_pick();
-        if (s_stage_cur < 0) return 0;
-        s_stage_used = 0;
+    if (bytes > ENG_STAGE_MAX) return 0;
+    for (int tries = 0; tries < 2; tries++) {
+        EngStage* s = s_chain_n ? &s_stage[s_chain[s_chain_n - 1]] : NULL;
+        const u32 start = s ? (s->used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u) : 0;
+        if (s && (u64)start + bytes <= s->cap) {
+            *out_off = s->base + start;
+            s->used = start + bytes;
+            return 1;
+        }
+        /* The chain's next chunk. */
+        const u32 base = s ? s->base + s->cap : 0;
+        int i = -1;
+        if ((u64)base + bytes <= ENG_STAGE_MAX && s_chain_n < ENG_STAGE_POOL) i = eng_stage_pick(bytes);
+        if (i < 0) {
+            /* More than a submit stages, or every chunk in flight: submit
+             * and wait rather than drop the rest of the frame. */
+            if (!s_rec_count) return 0;
+            eng_submit(0, 1);
+            continue;
+        }
+        s = &s_stage[i];
+        s->base = base; s->used = bytes; s->in_use = 2;
+        s_chain[s_chain_n++] = i;
+        *out_off = base;
+        return 1;
     }
-    EngStage* s = &s_stage[s_stage_cur];
-    if (start + bytes > s->cap) {
-        u32 cap = s->cap ? s->cap : ENG_STAGE_START;
-        while (start + bytes > cap) cap *= 2u;
-        EngStage n; memset(&n, 0, sizeof n);
-        if (!eng_stage_make(&n, cap)) return 0;
-        if (s_stage_used) memcpy(n.mapped, s->mapped, s_stage_used);
-        eng_stage_free(s);
-        s->buf = n.buf; s->mem = n.mem; s->mapped = n.mapped; s->cap = n.cap;
-        if (cap > s_stage_want) s_stage_want = cap;
-    }
-    *out_off = start;
-    s_stage_used = start + bytes;
-    return 1;
+    return 0;
 }
+
+/* Where to write a reservation just made: it is in the chain's last chunk. */
+static u8* eng_stage_ptr(u32 off)
+{
+    const EngStage* s = &s_stage[s_chain[s_chain_n - 1]];
+    return s->mapped + (off - s->base);
+}
+
 static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
 {
     if (!bytes) { *out_off = 0; return 1; }
     if (!eng_stage_reserve(bytes, out_off)) return 0;
-    memcpy(s_stage[s_stage_cur].mapped + *out_off, src, bytes);
+    memcpy(eng_stage_ptr(*out_off), src, bytes);
     return 1;
+}
+
+/* The chunk a record's offset is in. */
+static const EngStage* eng_stage_at(u32 off)
+{
+    for (u32 k = s_chain_n; k-- > 0;) {
+        const EngStage* s = &s_stage[s_chain[k]];
+        if (off >= s->base) return s;
+    }
+    return NULL;
+}
+
+/* The chain is the submit's: its chunks are free again when that is done. */
+static void eng_stage_submitted(u64 fence)
+{
+    for (u32 k = 0; k < s_chain_n; k++) {
+        EngStage* s = &s_stage[s_chain[k]];
+        s->fence = fence; s->seq = s_submit_seq; s->in_use = fence ? 1 : 0;
+    }
+    s_chain_n = 0;
+    /* A load leaves more chunks than a frame of play stages, and larger
+     * ones: what no submit has used for a while is let go, one a submit. */
+    u32 have = 0; int old = -1;
+    for (int i = 0; i < ENG_STAGE_POOL; i++) {
+        const EngStage* s = &s_stage[i];
+        if (!s->buf) continue;
+        have++;
+        if (!s->in_use && s_submit_seq - s->seq > ENG_STAGE_IDLE && (old < 0 || s->cap > s_stage[old].cap)) old = i;
+    }
+    if (old >= 0 && (have > ENG_STAGE_KEEP || s_stage[old].cap > ENG_STAGE_CHUNK)) eng_stage_free(&s_stage[old]);
 }
 
 /* ---- buffers the engine keeps (vertex cache) -------------------------------------- */
@@ -1284,7 +1343,7 @@ static void eng_upload_rows(u32 handle, u32 layer, u32 mip, u32 w, u32 h, const 
     const u32 pitch = row_units * bpp;
     u32 off;
     if (!eng_stage_reserve(pitch * rows, &off)) return;
-    u8* dst = s_stage[s_stage_cur].mapped + off;
+    u8* dst = eng_stage_ptr(off);
     if (pitch == row_bytes) memcpy(dst, src, (size_t)row_bytes * rows);
     else for (u32 y = 0; y < rows; y++) memcpy(dst + (size_t)y * pitch, (const u8*)src + (size_t)y * row_bytes, row_bytes);
     EngRecord* r = &s_rec[s_rec_count++];
