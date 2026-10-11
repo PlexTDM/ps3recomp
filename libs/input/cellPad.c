@@ -305,6 +305,16 @@ static int pad_sdl_start(void)
      * XInput slots by itself. */
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 #endif
+#if defined(SDL_HINT_NO_SIGNAL_HANDLERS) && !defined(PS3RECOMP_RSX_VULKAN)
+    /* SDL's events subsystem, which the pad brings up with it, takes SIGINT
+     * and SIGTERM for itself and turns each into an SDL_QUIT event. Nothing
+     * here reads SDL's events -- the window is not SDL's -- so the process
+     * then ignored Ctrl-C and `kill` alike, and only SIGKILL ended it. The
+     * signals are left as the system has them. (Not under the Linux Vulkan
+     * backend: its window is SDL's and its pump acts on that event.) The
+     * audio backend says the same, as either may start SDL first. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#endif
     if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0 &&
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
         printf("[cellPad] SDL_InitSubSystem(GAMECONTROLLER) failed: %s\n", SDL_GetError());

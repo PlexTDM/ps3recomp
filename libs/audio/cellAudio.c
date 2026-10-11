@@ -182,6 +182,12 @@ static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 static int audio_backend_init(void)
 {
     if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+#if defined(SDL_HINT_NO_SIGNAL_HANDLERS) && !defined(PS3RECOMP_RSX_VULKAN)
+        /* SDL would take SIGINT and SIGTERM and nothing would act on them:
+         * see pad_sdl_start in libs/input/cellPad.c. Whichever of the two
+         * starts SDL first has to say so. */
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+#endif
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
             printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
             return -1;
