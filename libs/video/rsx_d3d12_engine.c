@@ -714,6 +714,10 @@ static u32 eng_obj_add(ID3D12Resource* res, EngObjKind kind, DXGI_FORMAT fmt, u3
 static u32 s_retired[ENG_MAX_OBJECTS]; static u32 s_retired_count;
 static u64 s_retired_fence[ENG_MAX_OBJECTS];
 
+/* The submit an object or buffer released now may still be drawn by: the
+ * last one made, or -- with records waiting that may name it -- the next. */
+static u64 eng_retire_fence(void) { return s_fence_value + (s_rec_count ? 1 : 0); }
+
 static void eng_collect_retired(void)
 {
     u32 k = 0;
@@ -752,7 +756,7 @@ static void eng_obj_release(void* user, u32 handle)
         }
     if (s_retired_count < ENG_MAX_OBJECTS) {
         s_retired[s_retired_count] = handle;
-        s_retired_fence[s_retired_count] = s_fence_value;   /* the last signalled submit */
+        s_retired_fence[s_retired_count] = eng_retire_fence();
         s_retired_count++;
     }
 }
@@ -918,7 +922,7 @@ static void eng_buffer_release(void* user, u32 h)
     (void)user;
     if (!h || h > s_buf_count || !s_buf[h - 1] || s_buf_retired[h - 1]) return;
     s_buf_retired[h - 1] = 1;
-    s_buf_retired_fence[h - 1] = s_fence_value;
+    s_buf_retired_fence[h - 1] = eng_retire_fence();
 }
 
 /* ---- window ---------------------------------------------------------------- */
