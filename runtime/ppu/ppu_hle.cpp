@@ -397,6 +397,24 @@ extern "C" void ppu_waitprof_report(double window_s)
                 e.tid, tn ? tn : "?", call, e.site, ms_per_s, (unsigned long long)e.n,
                 (double)e.ns / 1e3 / (double)e.n);
     }
+    /* PPU_WAITPROF=2: the most frequent calls as well. A send or a signal is
+     * quick and never makes the list above, yet who sends how often is what
+     * says which thread answers a wait. */
+    static int calls = -1;
+    if (calls < 0) { const char* e = getenv("PPU_WAITPROF"); calls = e && atoi(e) >= 2; }
+    if (!calls) return;
+    std::sort(v.begin(), v.end(), [](const WaitProfEntry& a, const WaitProfEntry& b) { return a.n > b.n; });
+    for (size_t i = 0; i < v.size() && i < 160; i++) {
+        const WaitProfEntry& e = v[i];
+        if ((double)e.n / window_s < 20.0) break;
+        unsigned t2 = 0, cia = 0; const char* tn = "?";
+        if (e.tid >= 1) ppu_prof_snapshot((int)e.tid - 1, &t2, &cia, &tn);
+        char sc[48];
+        const char* call = e.name;
+        if (!call) { const char* n = wp_syscall_name(e.sc); if (n) call = n; else { snprintf(sc, sizeof sc, "syscall %u", e.sc); call = sc; } }
+        fprintf(stderr, "[waitprof] calls: tid %2u %-24.24s %-28.28s site %08X  %7.0f calls/s  %8.1f us avg\n",
+                e.tid, tn ? tn : "?", call, e.site, (double)e.n / window_s, (double)e.ns / 1e3 / (double)e.n);
+    }
 }
 
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)

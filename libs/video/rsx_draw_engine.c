@@ -845,7 +845,8 @@ static int eng_staging_reserve(u32 bytes)
 /* What the walker did in the current frame, for the stutter line in
  * eng_present (DOD3_STUTTER_MS). */
 static struct { u32 tex; u64 tex_bytes; u32 vc_store; u64 vc_bytes; u32 pipes; double pipe_ms;
-                u32 vc_evicts; double vc_evict_ms; u32 vc_evicted; u32 draws; double draw_ms; u32 tex_skipped; } s_fstat;
+                u32 vc_evicts; double vc_evict_ms; u32 vc_evicted; u32 draws; double draw_ms; u32 tex_skipped;
+                double tex_ms, tex_create_ms, tex_decode_ms, tex_stage_ms, vc_wrap_ms; } s_fstat;
 static double eng_now_ms(void)
 {
     struct timespec ts; timespec_get(&ts, TIME_UTC);
@@ -954,8 +955,10 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                   fprintf(stderr, "[tex-up] saved %s mean=%lu\n", path, sum / ((unsigned long)w * h)); }
           } } }
 
+    const double t_create = eng_now_ms();
     const u32 handle = g.be->texture_create(g.be->user, eng_texfmt(lv[0].tl.fmt),
                                             w, h, nlv, faces, remap, fmt);
+    s_fstat.tex_create_ms += eng_now_ms() - t_create;
     if (!handle) return 0;
 
     for (u32 f = 0; f < faces; f++) {
@@ -966,13 +969,17 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 g.be->texture_release(g.be->user, handle);
                 return 0;
             }
+            const double t_d0 = eng_now_ms();
             rsx_texture_decode(g.tex_staging, tl->dst_row_bytes,
                                face + lv[m].offset, lv[m].w, lv[m].h, tl,
                                rsx_texture_argb_is_rgba());
+            const double t_d1 = eng_now_ms();
             g.be->texture_upload(g.be->user, handle, f, m, lv[m].w, lv[m].h,
                                  g.tex_staging, tl->dst_row_bytes, tl->rows);
+            s_fstat.tex_decode_ms += t_d1 - t_d0; s_fstat.tex_stage_ms += eng_now_ms() - t_d1;
         }
     }
+    s_fstat.tex_ms += eng_now_ms() - t_create;
     return handle;
 }
 
@@ -2262,7 +2269,9 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
 #endif
             memcpy(mem, verts, vb);
             if (ib) memcpy((u8*)mem + ib_off, indices, ib);
-            buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
+            { const double t_wrap = eng_now_ms();
+              buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
+              s_fstat.vc_wrap_ms += eng_now_ms() - t_wrap; }
             if (buf) { v = (u8*)mem; x = ib ? (u32*)((u8*)mem + ib_off) : NULL; }
 #ifdef _WIN32
             else _aligned_free(mem);
@@ -3546,11 +3555,13 @@ static void eng_present(u32 buffer_id)
                  * D3D12 backend adds them up; 0 elsewhere). */
                 if (hl > 0.0 && ft > hl)
                     fprintf(stderr, "[hitch] frame %u: %.1f ms (walker blocked on the GPU %.1f ms of it; "
-                            "%u textures uploaded %llu KB, %u vertex conversions %llu KB, %u pipelines built %.1f ms, "
+                            "%u textures uploaded %llu KB in %.1f ms (%.1f creating them, %.1f decoding, %.1f staging), "
+                            "%u vertex conversions %llu KB (%.1f ms into buffers), %u pipelines built %.1f ms, "
                             "%u draws %.1f ms, pipeline states %.1f ms)\n",
                             g.frames, ft, g_rsx_frame_gpu_wait_ms,
-                            s_fstat.tex, (unsigned long long)(s_fstat.tex_bytes >> 10),
-                            s_fstat.vc_store, (unsigned long long)(s_fstat.vc_bytes >> 10),
+                            s_fstat.tex, (unsigned long long)(s_fstat.tex_bytes >> 10), s_fstat.tex_ms, s_fstat.tex_create_ms,
+                            s_fstat.tex_decode_ms, s_fstat.tex_stage_ms,
+                            s_fstat.vc_store, (unsigned long long)(s_fstat.vc_bytes >> 10), s_fstat.vc_wrap_ms,
                             s_fstat.pipes, s_fstat.pipe_ms, s_fstat.draws, s_fstat.draw_ms, g_rsx_frame_pso_ms);
                 g_rsx_frame_gpu_wait_ms = 0.0; g_rsx_frame_pso_ms = 0.0;
                 /* The stutter report resets these per frame; without it, here. */

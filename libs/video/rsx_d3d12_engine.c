@@ -1434,6 +1434,40 @@ static int eng_swapchain_create(IDXGIFactory4* factory)
     return 0;
 }
 
+/* D3D12_DBG=1: the debug layer, and its errors and warnings on stderr at
+ * each present (without this they reach an attached debugger only): the
+ * first three of each kind, so that one repeated every frame does not bury
+ * the rest. */
+static ID3D12InfoQueue* s_infoq;
+static int eng_debug_fresh(int id)
+{
+    static struct { int id; unsigned n; } seen[64];
+    for (int i = 0; i < 64; i++) {
+        if (seen[i].n && seen[i].id != id) continue;
+        seen[i].id = id;
+        if (seen[i].n >= 3) return 0;
+        seen[i].n++;
+        return 1;
+    }
+    return 0;
+}
+static void eng_debug_drain(void)
+{
+    if (!s_infoq) return;
+    const UINT64 n = CALL0(s_infoq, GetNumStoredMessages);
+    for (UINT64 i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        CALL(s_infoq, GetMessage, i, NULL, &len);
+        D3D12_MESSAGE* m = len ? (D3D12_MESSAGE*)malloc(len) : NULL;
+        if (m && SUCCEEDED(CALL(s_infoq, GetMessage, i, m, &len)) && m->Severity <= D3D12_MESSAGE_SEVERITY_WARNING &&
+            eng_debug_fresh((int)m->ID)) {
+            fprintf(stderr, "[d3d12 debug] %s\n", m->pDescription);
+        }
+        free(m);
+    }
+    if (n) CALL0(s_infoq, ClearStoredMessages);
+}
+
 static int eng_init_device(u32 width, u32 height)
 {
     HRESULT hr;
@@ -1468,6 +1502,7 @@ static int eng_init_device(u32 width, u32 height)
     if (!s_dev && FAILED(D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void**)&s_dev))) {
         RELEASE(factory); return -1;
     }
+    if (getenv("D3D12_DBG") && FAILED(CALL(s_dev, QueryInterface, &IID_ID3D12InfoQueue, (void**)&s_infoq))) s_infoq = NULL;
     D3D12_COMMAND_QUEUE_DESC qd = {0}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(CALL(s_dev, CreateCommandQueue, &qd, &IID_ID3D12CommandQueue, (void**)&s_queue))) { RELEASE(factory); return -1; }
 
@@ -4043,6 +4078,7 @@ static void eng_dump_frame(u32 surface)
 static void eng_present(void* user, u32 surface)
 {
     (void)user;
+    eng_debug_drain();
     { static int on = -1; static unsigned n = 0;
       if (on < 0) on = getenv("RSX_OBJ_STATS") ? 1 : 0;
       if (on && (++n % 600) == 0) {
