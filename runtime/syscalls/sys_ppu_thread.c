@@ -360,11 +360,7 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     ppu_thread_info* t = (ppu_thread_info*)p;
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
     if (!in_range) { s_prof_main_pc = lr; return; }
-    { static int _n = 0; if (_n++ < 0)
-        fprintf(stderr, "[prof-stamp] ctx=%p base=%p in_range=%d lr=0x%X\n",
-                vctx, (void*)g_ppu_threads, in_range, lr); }
-    if (in_range)
-        t->prof_pc = lr;
+    t->prof_pc = lr;
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)
