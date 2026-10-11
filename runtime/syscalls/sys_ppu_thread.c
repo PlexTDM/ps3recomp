@@ -78,14 +78,53 @@ static void table_unlock(void)
 #endif
 }
 
-/* Find a free slot. Returns index or -1. Must be called under lock. */
+/* Find a free slot. Returns index or -1. Must be called under lock.
+ * PPU_THREAD_SLOTS=<n> uses the first n only: a title's thread turnover
+ * against a table it would fill in minutes if slots were not given back. */
 static int find_free_slot(void)
 {
-    for (int i = 0; i < PPU_THREAD_MAX; i++) {
+    static int slots = 0;
+    if (!slots) {
+        const char* e = getenv("PPU_THREAD_SLOTS");
+        slots = e ? atoi(e) : 0;
+        if (slots < 1 || slots > PPU_THREAD_MAX) slots = PPU_THREAD_MAX;
+    }
+    for (int i = 0; i < slots; i++) {
         if (g_ppu_threads[i].state == PPU_THREAD_STATE_FREE)
             return i;
     }
     return -1;
+}
+
+/* The guest stacks of threads that have ended, for the next thread that asks
+ * for one of the same size. vm_stack_allocate only moves forward through its
+ * 256 MB, and a title that starts threads for every level and movie (seven
+ * megabytes of them in a quarter of an hour of Drakengard 3) would come to
+ * the end of it in a long session. Under the table lock. */
+#define PPU_STACK_POOL 128
+static struct { uint32_t addr, size; } s_stack_pool[PPU_STACK_POOL];
+static int s_stack_pool_n;
+
+static uint32_t stack_take(uint32_t size)
+{
+    for (int i = 0; i < s_stack_pool_n; i++) {
+        if (s_stack_pool[i].size != size) continue;
+        const uint32_t addr = s_stack_pool[i].addr;
+        s_stack_pool[i] = s_stack_pool[--s_stack_pool_n];
+        memset(vm_to_host(addr), 0, size);   /* as a new one is */
+        return addr;
+    }
+    return vm_stack_allocate(&g_vm_stack_alloc, size);
+}
+
+/* Once the thread is out of its guest code for good. */
+static void stack_give(ppu_thread_info* t)
+{
+    if (!t->stack_addr || s_stack_pool_n >= PPU_STACK_POOL) return;
+    s_stack_pool[s_stack_pool_n].addr = t->stack_addr;
+    s_stack_pool[s_stack_pool_n].size = t->stack_size;
+    s_stack_pool_n++;
+    t->stack_addr = 0;
 }
 
 /* Find thread by ID. The ID is the index + 1 (0 is invalid). */
@@ -207,21 +246,34 @@ static void* ppu_host_thread_proc(void* param)
                 (unsigned long long)info->ctx.thread_id);
     }
 
-    /* Mark as finished */
+    /* Mark as finished -- where that is still this code's to do. A thread
+     * that ended in sys_ppu_thread_exit was stamped FINISHED there, with the
+     * status it gave, and has signalled its joiner; stamping it again here
+     * is what used to lose the slot. On Windows the joiner did not wait for
+     * this epilogue: it freed the slot, and the line that stood here then
+     * wrote FINISHED over FREE, for good. Every joined thread cost one of
+     * the PPU_THREAD_MAX slots, and a title that makes a pair of threads
+     * for each level and each movie (Drakengard 3's PhysX and Bink threads)
+     * had none left after a quarter of an hour: sys_ppu_thread_create
+     * failed, and the game waited on a thread that was never started. */
     table_lock();
-    info->exit_status = (int64_t)info->ctx.gpr[3];
-
+#ifdef _WIN32
+    HANDLE done = info->finish_event;     /* read before the slot can be anyone else's */
+#endif
     if (info->state == PPU_THREAD_STATE_DETACHED) {
         /* Detached threads self-clean */
+        stack_give(info);
         info->state = PPU_THREAD_STATE_FREE;
-    } else {
+    } else if (info->state == PPU_THREAD_STATE_RUNNING) {
+        /* It returned from its entry. */
+        info->exit_status = (int64_t)info->ctx.gpr[3];
         info->state = PPU_THREAD_STATE_FINISHED;
     }
     table_unlock();
 
     /* Signal anyone waiting for join */
 #ifdef _WIN32
-    SetEvent(info->finish_event);
+    if (done) SetEvent(done);
     return 0;
 #else
     pthread_mutex_lock(&info->finish_mutex);
@@ -370,7 +422,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t arg          = LV2_ARG_U64(ctx, 2);
     int32_t  priority     = LV2_ARG_S32(ctx, 3);
     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
+    uint64_t flags        = LV2_ARG_U64(ctx, 5);
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
 
     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
@@ -381,6 +433,14 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     int slot = find_free_slot();
     if (slot < 0) {
         table_unlock();
+        { int used = 0, zombies = 0;
+          for (int i = 0; i < PPU_THREAD_MAX; i++) {
+              used += g_ppu_threads[i].state != PPU_THREAD_STATE_FREE;
+              zombies += g_ppu_threads[i].state == PPU_THREAD_STATE_FINISHED;
+          }
+          fprintf(stderr, "[SYS] sys_ppu_thread_create: no thread slot is free -- EAGAIN (entry=0x%08llX; %d of %d in use, "
+                          "%d of them ended and waiting for a join)\n",
+                  (unsigned long long)entry, used, PPU_THREAD_MAX, zombies); }
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
@@ -388,7 +448,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     memset(t, 0, sizeof(*t));
 
     /* Allocate guest stack */
-    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
+    uint32_t stack_addr = stack_take(stack_size);
     if (stack_addr == 0) {
         table_unlock();
         return (int64_t)(int32_t)CELL_ENOMEM;
@@ -405,9 +465,15 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t thread_id = (uint64_t)(slot + 1);
     t->ctx.thread_id = thread_id;
 
-    t->state      = PPU_THREAD_STATE_RUNNING;
+    /* A thread made without SYS_PPU_THREAD_CREATE_JOINABLE (bit 0 of flags)
+     * cannot be joined and gives back what it holds when it ends: that is
+     * the rule on the console. Every thread used to be made joinable here,
+     * and one that nobody joins then kept its slot for the rest of the run:
+     * Drakengard 3 makes its SaveData, LoadData, DLCCheck and PreLoadMovie
+     * threads that way, one more slot gone with every save and every movie. */
+    t->joinable   = (flags & 1u) != 0;
+    t->state      = t->joinable ? PPU_THREAD_STATE_RUNNING : PPU_THREAD_STATE_DETACHED;
     t->priority   = priority;
-    t->joinable   = 1;
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
@@ -446,9 +512,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
+    fprintf(stderr, "[SYS] sys_ppu_thread_create tid=%llu name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d flags=0x%llX\n",
             (unsigned long long)thread_id, t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
+            stack_size, priority, (unsigned long long)flags);
     /* YDKJ: dump the worker arg-object: func_000750A8 (thread body) does
      * this=[arg+0x8], vtable=[arg+0xC], method=[vtable+0]. If this(+0x8) is null
      * the worker dispatches its job on a null object -> construction never runs. */
@@ -487,6 +553,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
                                   _initflag, (unsigned*)&t->host_tid);
     if (t->host_thread == NULL) {
+        stack_give(t);
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
         table_unlock();
@@ -532,6 +599,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         }
     }
     if (rc != 0) {
+        stack_give(t);
         t->state = PPU_THREAD_STATE_FREE;
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
@@ -556,12 +624,20 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
             (unsigned long long)tid, (unsigned long long)status);
 
+    /* Whether this call unwinds to the thread procedure (below). */
+    static int allow = -1;
+    if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
+    const int unwind = allow && s_exit_armed;
+
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (t) {
         t->exit_status = (int64_t)status;
         if (t->state == PPU_THREAD_STATE_DETACHED) {
-            t->state = PPU_THREAD_STATE_FREE;
+            /* The thread procedure's epilogue frees the slot once the thread
+             * is out of it; freed here, another thread could be given the
+             * slot while this one is still on its way there. */
+            if (!unwind) t->state = PPU_THREAD_STATE_FREE;
         } else {
             t->state = PPU_THREAD_STATE_FINISHED;
         }
@@ -579,11 +655,7 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
 
     /* Hardware never returns from this. Unwind to the thread proc so the guest
      * cannot keep running past its own exit. */
-    {
-        static int allow = -1;
-        if (allow < 0) allow = getenv("PS3_NO_THREAD_EXIT_UNWIND") ? 0 : 1;
-        if (allow && s_exit_armed) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
-    }
+    if (unwind) { s_exit_armed = 0; longjmp(s_exit_jmp, 1); }
     return CELL_OK;
 }
 
@@ -644,6 +716,16 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 
     /* Clean up */
 #ifdef _WIN32
+    /* The thread signalled from inside sys_ppu_thread_exit and is still on
+     * its way out through the thread procedure, which takes the table lock
+     * and reads this slot. Wait for the host thread itself, with the lock
+     * released, as the pthread_join below does. (Not for ever: a thread
+     * whose exit did not unwind would never end, and the epilogue no longer
+     * needs the slot left alone to get its state right.) */
+    const int out = WaitForSingleObject(t->host_thread, 10000) == WAIT_OBJECT_0;
+    if (!out)
+        fprintf(stderr, "[SYS] sys_ppu_thread_join(tid=%llu): the host thread has not ended 10 s after it signalled\n",
+                (unsigned long long)tid);
     table_lock();
     CloseHandle(t->host_thread);
     CloseHandle(t->finish_event);
@@ -670,7 +752,9 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     table_lock();
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
+    const int out = 1;
 #endif
+    if (out) stack_give(t);   /* a thread still in its guest code keeps its stack */
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
 
@@ -696,8 +780,18 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
     if (t->state == PPU_THREAD_STATE_FINISHED) {
         /* Already finished, free it */
 #ifdef _WIN32
+        if (WaitForSingleObject(t->host_thread, 0) != WAIT_OBJECT_0) {
+            /* Not out of the thread procedure yet: its epilogue frees the slot. */
+            t->state = PPU_THREAD_STATE_DETACHED;
+            t->joinable = 0;
+            table_unlock();
+            return CELL_OK;
+        }
         CloseHandle(t->host_thread);
         CloseHandle(t->finish_event);
+        t->host_thread = NULL;
+        t->finish_event = NULL;
+        stack_give(t);
 #else
         pthread_detach(t->host_thread);
         pthread_mutex_destroy(&t->finish_mutex);

@@ -932,7 +932,7 @@ static int run_thread_check(void)
     ctx.gpr[5] = 0;            /* arg */
     ctx.gpr[6] = 1000;         /* priority */
     ctx.gpr[7] = 0x10000;      /* guest stack size */
-    ctx.gpr[8] = 0;            /* flags */
+    ctx.gpr[8] = 1;            /* flags: joinable (it is joined below) */
     ctx.gpr[9] = 0;            /* name */
     int64_t crc = sys_ppu_thread_create(&ctx);
     if (crc != 0) {

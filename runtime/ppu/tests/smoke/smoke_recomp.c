@@ -190,6 +190,8 @@ static atomic_uint   g_mark_n;
  * busy host and the strict marker order below is not the scaffold's to
  * guarantee. The body waits on it before it marks anything. */
 static atomic_uint   g_create_marked;
+/* The threads of the churn (see _start) that have run. */
+static atomic_uint   g_churn_ran;
 
 /* Failures the guest found while running. Reported by smoke_verify, which is
  * the only thing that reads them. */
@@ -418,6 +420,15 @@ static void smoke_verify(void)
  * -----------------------------------------------------------------------*/
 void func_00010100(ppu_context* ctx)
 {
+    /* One of the churn's threads (see _start): out again at once, with its
+     * argument as its status. */
+    if ((uint32_t)ctx->gpr[3] != SMOKE_THREAD_ARG) {
+        const uint64_t status = ctx->gpr[3];
+        atomic_fetch_add(&g_churn_ran, 1u);
+        ctx->gpr[11] = SC_PPU_THREAD_EXIT;
+        ctx->gpr[3]  = status;
+        lv2_syscall(ctx);   /* does not return */
+    }
     g_body_host_tid = (unsigned long)GetCurrentThreadId();
     g_body_arg      = (uint32_t)ctx->gpr[3];
     /* Let the creator mark first (see g_create_marked); a sleep through the
@@ -491,7 +502,7 @@ void func_00010000(ppu_context* ctx)
     ctx->gpr[5]  = SMOKE_THREAD_ARG;      /* the new thread's r3 */
     ctx->gpr[6]  = 1000;                  /* priority            */
     ctx->gpr[7]  = 0x10000;               /* stack size          */
-    ctx->gpr[8]  = 0;                     /* flags               */
+    ctx->gpr[8]  = 1;                     /* flags: joinable     */
     ctx->gpr[9]  = SMOKE_THREAD_NAME;
     lv2_syscall(ctx);
     smoke_check((int32_t)ctx->gpr[3] == 0, "sys_ppu_thread_create failed");
@@ -508,6 +519,51 @@ void func_00010000(ppu_context* ctx)
     smoke_check((int64_t)vm_read64(SMOKE_SC_EXITSTAT) == SMOKE_THREAD_STATUS,
                 "sys_ppu_thread_join handed back the wrong exit status");
     smoke_mark(ctx, SMOKE_STEP_THREAD_JOIN);
+
+    /* Thread slots come back. A title makes threads all through its run -- a
+     * pair for every level, a few for every movie and every save -- and the
+     * table has PPU_THREAD_MAX (64) slots: 300 here, one at a time, half of
+     * them joined and half made without the joinable flag, which nobody can
+     * join and which must give their slot back by themselves. (Both kinds
+     * once kept theirs: a port stopped dead a quarter of an hour in, at the
+     * sixty-fourth thread.) */
+    for (uint32_t i = 0; i < 300; i++) {
+        const int joinable = (i & 1u) == 0;
+        const uint32_t ran = atomic_load(&g_churn_ran);
+        ctx->gpr[11] = SC_PPU_THREAD_CREATE;
+        ctx->gpr[3]  = SMOKE_SC_TID;
+        ctx->gpr[4]  = SMOKE_OPD_THREAD;
+        ctx->gpr[5]  = 0x7000u + i;           /* not SMOKE_THREAD_ARG: a churn thread */
+        ctx->gpr[6]  = 1000;
+        ctx->gpr[7]  = 0x10000;
+        ctx->gpr[8]  = joinable ? 1 : 0;
+        ctx->gpr[9]  = SMOKE_THREAD_NAME;
+        lv2_syscall(ctx);
+        if ((int32_t)ctx->gpr[3] != 0) {
+            smoke_check(0, "a thread could not be made in the churn: a slot was not given back");
+            break;
+        }
+        if (joinable) {
+            ctx->gpr[11] = SC_PPU_THREAD_JOIN;
+            ctx->gpr[3]  = vm_read64(SMOKE_SC_TID);
+            ctx->gpr[4]  = SMOKE_SC_EXITSTAT;
+            lv2_syscall(ctx);
+            smoke_check((int32_t)ctx->gpr[3] == 0, "a churn thread could not be joined");
+            smoke_check((uint64_t)vm_read64(SMOKE_SC_EXITSTAT) == 0x7000u + i,
+                        "a churn thread's join handed back the wrong exit status");
+        } else {
+            /* Nobody can join it: wait for it to have run, and a moment more
+             * for it to be out, so that the slots in use stay few. */
+            for (int w = 0; w < 20000 && atomic_load(&g_churn_ran) == ran; w++) smoke_usleep(ctx, 100);
+            smoke_usleep(ctx, 500);
+            ctx->gpr[11] = SC_PPU_THREAD_JOIN;
+            ctx->gpr[3]  = vm_read64(SMOKE_SC_TID);
+            ctx->gpr[4]  = SMOKE_SC_EXITSTAT;
+            lv2_syscall(ctx);
+            smoke_check((int32_t)ctx->gpr[3] != 0, "a thread made without the joinable flag was joined");
+        }
+    }
+    smoke_check(atomic_load(&g_churn_ran) == 300u || atomic_load(&g_fail_n) != 0, "not every churn thread ran");
 
     /* Give the flip a display buffer to land on, then take the control
      * register's guest address: put and get live there, and writing put is how
