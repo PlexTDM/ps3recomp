@@ -89,7 +89,9 @@ def declaration(lines, i, var):
 
 
 def audit_file(path, fix):
-    text = open(path, errors="surrogateescape").read()
+    # newline="": the file's own line endings, read and written back as they are (text mode would turn
+    # every \n into \r\n on Windows, and a CRLF file into an LF one elsewhere)
+    text = open(path, errors="surrogateescape", newline="").read()
     lines = text.split("\n")
     rewritten, reports = 0, []
 
@@ -187,7 +189,7 @@ def audit_file(path, fix):
                                             lines[j].strip()))
 
     if fix and rewritten:
-        open(path, "w", errors="surrogateescape").write("\n".join(lines))
+        open(path, "w", errors="surrogateescape", newline="").write("\n".join(lines))
     return rewritten, reports
 
 
