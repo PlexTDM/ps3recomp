@@ -256,6 +256,22 @@ static void* ppu_host_thread_proc(void* param)
      * for each level and each movie (Drakengard 3's PhysX and Bink threads)
      * had none left after a quarter of an hour: sys_ppu_thread_create
      * failed, and the game waited on a thread that was never started. */
+    /* PPU_THREAD_END_STALL_US=<n>, for a test: that long between the end of
+     * the guest code and this epilogue. A thread that ended in
+     * sys_ppu_thread_exit has told its joiner it is finished by now and has
+     * yet to come through here; the stall makes that moment long enough to
+     * act in (the turnover check of runtime/host/host_posix.c detaches the
+     * thread in it and makes another). */
+    { static int stall = -1;
+      if (stall < 0) { const char* e = getenv("PPU_THREAD_END_STALL_US"); stall = e ? atoi(e) : 0; }
+      if (stall > 0) {
+#ifdef _WIN32
+          Sleep((DWORD)((stall + 999) / 1000));
+#else
+          struct timespec ts = { stall / 1000000, (long)(stall % 1000000) * 1000L };
+          nanosleep(&ts, NULL);
+#endif
+      } }
     table_lock();
 #ifdef _WIN32
     HANDLE done = info->finish_event;     /* read before the slot can be anyone else's */
@@ -269,17 +285,26 @@ static void* ppu_host_thread_proc(void* param)
         info->exit_status = (int64_t)info->ctx.gpr[3];
         info->state = PPU_THREAD_STATE_FINISHED;
     }
+    /* From here this thread does not use the slot again. A slot it has just
+     * freed can be another thread's the moment the lock is released, so
+     * whatever a joiner needs is done now, under the lock (the same order as
+     * sys_ppu_thread_exit takes the two; the joiner holds only the second). */
+    if (info->state != PPU_THREAD_STATE_FREE) {
+#ifndef _WIN32
+        pthread_mutex_lock(&info->finish_mutex);
+        info->finished = 1;
+        pthread_cond_signal(&info->finish_cond);
+        pthread_mutex_unlock(&info->finish_mutex);
+#endif
+        info->proc_out = 1;
+    }
     table_unlock();
 
-    /* Signal anyone waiting for join */
 #ifdef _WIN32
+    /* Signal anyone waiting for join */
     if (done) SetEvent(done);
     return 0;
 #else
-    pthread_mutex_lock(&info->finish_mutex);
-    info->finished = 1;
-    pthread_cond_signal(&info->finish_cond);
-    pthread_mutex_unlock(&info->finish_mutex);
     return NULL;
 #endif
 }
@@ -606,6 +631,16 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         table_unlock();
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
+    /* Nobody will join a thread made without the joinable flag, so nobody
+     * would ever reap its host thread: a dead pthread keeps its stack mapped
+     * (all 256 MB of the reservation with glibc, the top of it on Darwin)
+     * until it is joined or detached. Detached now, it goes when it ends.
+     * The table lock is held, so the thread cannot have given the slot back
+     * yet. */
+    if (!t->joinable) {
+        pthread_detach(t->host_thread);
+        t->host_detached = 1;
+    }
 #endif
 
     table_unlock();
@@ -793,16 +828,34 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         t->finish_event = NULL;
         stack_give(t);
 #else
-        pthread_detach(t->host_thread);
+        if (!t->host_detached) {
+            pthread_detach(t->host_thread);
+            t->host_detached = 1;
+        }
+        if (!t->proc_out) {
+            /* It ended in sys_ppu_thread_exit and is still on its way out
+             * through the thread procedure, which will look at this slot:
+             * freed now, the slot could be another thread's by then, and the
+             * epilogue would end that one. Left DETACHED, the epilogue frees
+             * it (as the Windows branch does on a zero wait). */
+            t->state = PPU_THREAD_STATE_DETACHED;
+            t->joinable = 0;
+            table_unlock();
+            return CELL_OK;
+        }
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
+        stack_give(t);
 #endif
         t->state = PPU_THREAD_STATE_FREE;
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;
 #ifndef _WIN32
-        pthread_detach(t->host_thread);
+        if (!t->host_detached) {
+            pthread_detach(t->host_thread);
+            t->host_detached = 1;
+        }
 #endif
     }
 

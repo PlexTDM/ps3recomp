@@ -71,6 +71,7 @@
 
 #include <ps3emu/guest_call.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -909,6 +910,173 @@ static void thread_probe_entry(ppu_context* ctx)
     g_thread_ran = 1;
 }
 
+/* ---- thread turnover -------------------------------------------------------
+ * A title makes and ends threads all the time: a pair for every level and
+ * movie, one for every save. Each has to give its slot back (there are 64),
+ * whichever way it ended and whoever let go of it:
+ *
+ *   - made without the joinable flag: nobody joins it, it frees itself;
+ *   - made joinable and detached while it runs: the same from then on;
+ *   - made joinable, ended, and detached afterwards -- by returning from its
+ *     entry, or by sys_ppu_thread_exit, in which case it is still unwinding
+ *     to the thread procedure when the detach arrives and must not have its
+ *     slot handed to another thread under it.
+ *
+ * Several hundred of each, then: every one ran, the table is back where it
+ * was, their guest stacks were used again rather than new ones cut for each,
+ * and a thread can still be made and joined.
+ *
+ * The last case is a race a few microseconds wide, which a test does not hit
+ * by waiting for it (this one passed ten times in ten on code that had the
+ * fault). PPU_THREAD_END_STALL_US holds every ending thread for a moment
+ * between its guest code and the thread procedure's epilogue, so the detach
+ * and the next thread's creation always land in it. */
+static int g_churn_ran;   /* entries reached (atomic) */
+
+#define CHURN_WITNESS 0x10000u   /* in the argument: a witness (below) */
+/* The status a witness ends with: not its argument, which is what r3 holds
+ * while it runs and so what a thread marked finished in its place reports. */
+#define CHURN_WITNESS_STATUS(arg) ((uint64_t)(arg) ^ 0x5A5A00000000ull)
+
+static void thread_churn_entry(ppu_context* ctx)
+{
+    __atomic_add_fetch(&g_churn_ran, 1, __ATOMIC_RELAXED);
+    if (ctx->gpr[3] & CHURN_WITNESS) {
+        /* Still running when the thread detached just before it comes
+         * through its epilogue; then it ends with a status of its own. */
+        const struct timespec ts = { 0, 5000000 };
+        nanosleep(&ts, NULL);
+        ctx->gpr[3] = CHURN_WITNESS_STATUS(ctx->gpr[3]);
+        sys_ppu_thread_exit(ctx);
+    }
+    if (ctx->gpr[3] & 1) {          /* odd arguments end by the syscall, as a title's threads do */
+        ctx->gpr[3] = 0;
+        sys_ppu_thread_exit(ctx);   /* unwinds to the thread procedure: no return */
+    }
+}
+
+static int churn_slots_used(void)
+{
+    int n = 0;
+    for (int i = 0; i < PPU_THREAD_MAX; i++) n += g_ppu_threads[i].state != PPU_THREAD_STATE_FREE;
+    return n;
+}
+
+static void churn_nap(void)
+{
+    const struct timespec ts = { 0, 200000 };   /* 0.2 ms */
+    nanosleep(&ts, NULL);
+}
+
+/* 0 and the new thread's id; nonzero if it could not be made. */
+static int churn_create(ppu_context* ctx, u32 tid_out, uint64_t arg, int joinable, uint64_t* tid)
+{
+    for (int i = 0; i < 25000 && churn_slots_used() > PPU_THREAD_MAX - 16; i++) churn_nap();   /* room first */
+    ctx->gpr[3] = tid_out;
+    ctx->gpr[4] = 0x10000;
+    ctx->gpr[5] = arg;
+    ctx->gpr[6] = 1000;
+    ctx->gpr[7] = 0x10000;
+    ctx->gpr[8] = joinable ? 1 : 0;
+    ctx->gpr[9] = 0;
+    if (sys_ppu_thread_create(ctx) != 0) return 1;
+    const uint8_t* p = vm_base + tid_out;
+    *tid = 0;
+    for (int i = 0; i < 8; i++) *tid = (*tid << 8) | p[i];
+    return 0;
+}
+
+static int run_thread_churn(ppu_context* ctx, u32 tid_out)
+{
+    enum { NOT_JOINABLE = 200, DETACHED_LATER = 300 };
+    const int base = churn_slots_used();
+    const uint32_t stacks_before = g_vm_stack_alloc.next_addr;
+    int made = 0, witnesses = 0;
+    uint64_t tid = 0;
+    g_ppu_thread_entry_trampoline = thread_churn_entry;
+    g_churn_ran = 0;
+
+    for (int i = 0; i < NOT_JOINABLE; i++, made++)
+        if (churn_create(ctx, tid_out, (uint64_t)i, 0, &tid)) {
+            fprintf(stderr, "[host] turnover: thread %d (not joinable) could not be made\n", made);
+            return 1;
+        }
+    for (int i = 0; i < DETACHED_LATER; i++, made++) {
+        if (churn_create(ctx, tid_out, (uint64_t)i, 1, &tid)) {
+            fprintf(stderr, "[host] turnover: thread %d (joinable) could not be made\n", made);
+            return 1;
+        }
+        if (i % 3) {   /* two in three: once it has ended, and then at once */
+            const ppu_thread_info* t = &g_ppu_threads[tid - 1];
+            for (int k = 0; k < 20000000 && t->state != PPU_THREAD_STATE_FINISHED; k++) {
+                if ((k & 0xFFFF) == 0xFFFF) churn_nap();
+            }
+        }
+        ctx->gpr[3] = tid;
+        const int64_t rc = sys_ppu_thread_detach(ctx);
+        if (rc != 0) {
+            fprintf(stderr, "[host] turnover: sys_ppu_thread_detach(tid=%llu) failed: 0x%llX\n",
+                    (unsigned long long)tid, (unsigned long long)rc);
+            return 1;
+        }
+        if ((i % 3) && (i & 1)) {
+            /* That thread ended in sys_ppu_thread_exit and is still short of
+             * its epilogue. A witness made now must not be given its slot:
+             * the epilogue would take the witness for itself, mark it
+             * finished, and the join below would come back early with a
+             * status the witness never gave. */
+            const uint64_t warg = CHURN_WITNESS | (uint64_t)i, want = CHURN_WITNESS_STATUS(warg);
+            uint64_t wtid = 0;
+            if (churn_create(ctx, tid_out, warg, 1, &wtid)) {
+                fprintf(stderr, "[host] turnover: witness %d could not be made\n", i);
+                return 1;
+            }
+            made++; witnesses++;
+            const u32 status_out = tid_out;   /* the id has been read: the same 8 bytes will do */
+            ctx->gpr[3] = wtid;
+            ctx->gpr[4] = status_out;
+            if (sys_ppu_thread_join(ctx) != 0) {
+                fprintf(stderr, "[host] turnover: witness %d (tid=%llu) could not be joined\n", i, (unsigned long long)wtid);
+                return 1;
+            }
+            uint64_t got = 0;
+            for (int b = 0; b < 8; b++) got = (got << 8) | vm_base[status_out + b];
+            if (got != want) {
+                printf("[host] thread turnover: witness %d joined with status 0x%llX, not its own 0x%llX: "
+                       "its slot was another thread's to end FAILED\n",
+                       i, (unsigned long long)got, (unsigned long long)want);
+                return 1;
+            }
+        }
+    }
+
+    /* They end on their own time. */
+    for (int i = 0; i < 50000; i++) {
+        if (__atomic_load_n(&g_churn_ran, __ATOMIC_RELAXED) == made && churn_slots_used() == base) break;
+        churn_nap();
+    }
+    const int ran = __atomic_load_n(&g_churn_ran, __ATOMIC_RELAXED), used = churn_slots_used();
+    printf("[host] thread turnover: %d made (%d not joinable, %d detached after or while they ran, %d witnesses "
+           "joined with their own status), %d ran, %d slots in use against %d before %s\n",
+           made, NOT_JOINABLE, DETACHED_LATER, witnesses, ran, used, base, ran == made && used == base ? "OK" : "FAILED");
+    if (ran != made || used != base) return 1;
+
+    /* At most a table's worth of stacks at once, so no more than that cut
+     * new: the rest were ended threads' stacks, taken again. */
+    const uint32_t cut = g_vm_stack_alloc.next_addr - stacks_before;
+    const uint32_t most = (uint32_t)PPU_THREAD_MAX * (0x10000u + 0x10000u);   /* a stack and, at most, a 64 KB guard page */
+    printf("[host] thread turnover: %u KB of guest stack cut new for %d threads (a full table's worth is %u KB) %s\n",
+           cut >> 10, made, most >> 10, cut <= most ? "OK" : "FAILED");
+    if (cut > most) return 1;
+
+    /* And the table still works. */
+    if (churn_create(ctx, tid_out, 0, 1, &tid)) { fprintf(stderr, "[host] turnover: no thread after it\n"); return 1; }
+    ctx->gpr[3] = tid;
+    ctx->gpr[4] = 0;
+    if (sys_ppu_thread_join(ctx) != 0) { fprintf(stderr, "[host] turnover: the thread after it could not be joined\n"); return 1; }
+    return churn_slots_used() == base ? 0 : 1;
+}
+
 /* A guest thread is worth starting only if its host stack can hold a deep
  * recompiled call chain. 64 MB is well under the 256 MB reserved and well
  * over any default, so it separates "the reservation was applied" from "the
@@ -918,6 +1086,7 @@ static void thread_probe_entry(ppu_context* ctx)
 static int run_thread_check(void)
 {
     printf("[host] --threads: guest PPU thread host stack\n");
+    setenv("PPU_THREAD_END_STALL_US", "1500", 0);   /* see the turnover check; read at the first thread's end */
     vm_stack_alloc_init(&g_vm_stack_alloc);
     g_ppu_thread_entry_trampoline = thread_probe_entry;
     ppu_thread_register_main();
@@ -958,6 +1127,7 @@ static int run_thread_check(void)
         fprintf(stderr, "[host] the guest thread never ran\n");
         return 1;
     }
+    if (run_thread_churn(&ctx, tid_out) != 0) return 7;
     if (g_reported_stack == 0) {
         printf("[host] host stack size not queryable here -- thread ran, size unchecked\n");
         return 0;
@@ -1104,10 +1274,21 @@ int main(int argc, char** argv)
         else if (strcmp(argv[i], "--draw") == 0)   do_draw = 1;
         /* --threads: no graphics at all, just the lv2 thread path. */
         else if (strcmp(argv[i], "--threads") == 0) {
-            vm_base = host_vm_alloc();
-            if (!vm_base) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
+            /* Guest stacks are at VM_STACK_BASE, far above what the other
+             * checks' VM holds, and a thread's stack is real memory: a reused
+             * one is zeroed for its next thread. One lazily committed mapping
+             * that reaches past the stacks the turnover check can have. */
+            const size_t bytes = (size_t)VM_STACK_BASE + (64u << 20);
+            void* m = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON
+#ifdef MAP_NORESERVE
+                           | MAP_NORESERVE
+#endif
+                           , -1, 0);
+            if (m == MAP_FAILED) { fprintf(stderr, "[host] guest VM alloc failed\n"); return 1; }
+            vm_base = (uint8_t*)m;
+            ppu_vm_size = VM_SIZE;
             int trc = run_thread_check();
-            free(vm_base);
+            munmap(m, bytes);
             return trc;
         }
         /* --audio-pad: no graphics either, just the SDL2 backends. */

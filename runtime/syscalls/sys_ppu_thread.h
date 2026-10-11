@@ -52,12 +52,15 @@ typedef struct ppu_thread_info {
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    int          proc_out;     /* the host thread is past its last use of this slot
+                                * (set by the thread procedure, under the table lock) */
 
 #ifdef _WIN32
     HANDLE       host_thread;
     DWORD        host_tid;
 #else
     pthread_t    host_thread;
+    int          host_detached;   /* pthread_detach has been called on it: once only */
 #endif
 
     /* For join synchronization */
