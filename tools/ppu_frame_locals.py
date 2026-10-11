@@ -17,8 +17,10 @@ What is promoted, per function:
     whose only reads are the epilogue restores (the lifter already restores
     r14-r31 from its `_cs_` snapshots; f14-f31 and LR get the same);
   * spill slots: an offset every access of which is a literal `r1 + off` of
-    one width, written before it is read, and that no callee or other thread
-    can reach (below).
+    one width, written before it is read on every path, read by the function
+    itself (a slot it only writes is written for someone else: an outgoing
+    stack argument, a field of a struct it then passes by pointer), and that
+    no callee or other thread can reach (below).
 
 A function is left alone when its frame is not its own to reason about: a
 tail entry (its `_cs_` snapshots read a parent's slots), a body that
@@ -28,12 +30,13 @@ one that copies or indexes r1 in a way this tool does not follow.
 
 The callee rules: a callee may write our frame only in the parameter area
 (0x30..0x6F, where it homes its register arguments) and through a pointer we
-gave it. So with calls, slots in that area are not promoted, red-zone slots
-(negative offsets) are not either, and a slot at or above an address we
-passed (`addi rN, r1, K` reaching a call) is promoted only if every write to
-it comes after the last call and the function has no backward branch. A
-pointer stored to memory (another thread may follow it) keeps everything at
-or above its offset in memory for good.
+gave it, and may read anything that pointer reaches. So with calls, slots in
+that area are not promoted, red-zone slots (negative offsets) are not either,
+and at or above an address we passed (`addi rN, r1, K` reaching a call) a
+slot stays in memory if it is written before such a call, and a read of it
+after one counts as unwritten (the callee may have written it; the dataflow
+treats the call as a kill). A pointer stored to memory (another thread may
+follow it) keeps everything at or above its offset in memory for good.
 
 The transformation keeps every guest-visible value the same except the
 frame's own words, which no correct program reads from outside.
@@ -46,7 +49,7 @@ RE_ALIAS_ADDI = re.compile(r"^r(\d+) = r1 \+ \(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d
 RE_ALIAS_ADDIC = re.compile(r"^\{ uint64_t _a = r1; uint64_t _r = _a \+ \(uint64_t\)\(int64_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\); r(\d+) = _r; xer = ")
 RE_ALIAS_ADDC = re.compile(r"^\{ uint64_t result = r1 \+ r(\d+); xer = .*; r(\d+) = result; \}$")
 RE_CONST = re.compile(r"^r(\d+) = \(int64_t\)\(int32_t\)\((-?0x[0-9A-Fa-f]+|-?\d+)\);$")
-RE_ALIAS_COPY = re.compile(r"^r(\d+) = r(\d+)(?: \| 0x0)?;$")
+RE_ALIAS_COPY = re.compile(r"^r(\d+) = (?:r(\d+)(?: \| 0x0)?|ppc_rldicl\(r(\d+), 0, 32\)|\(int64_t\)\(int32_t\)r(\d+)|r(\d+) \| r);$")
 RE_ASSIGN = re.compile(r"^r(\d+) = ")
 RE_CALL = re.compile(r"\bfunc_[0-9A-Fa-f]+\(ctx\)|ps3_indirect_call\(ctx\)|ps3_hle_call\(|lv2_syscall\(ctx\)")
 RE_LABEL = re.compile(r"^loc_([0-9A-Fa-f]+):")
@@ -78,6 +81,8 @@ def slot_name(off, width):
 
 
 DEBUG = os.environ.get("PFL_DEBUG")
+VERIFY = False     # --verify: see main()
+FUNC = ""          # the function being rewritten, for --verify's log
 
 
 def promote(body, has_inner, is_fragment, stats):
@@ -133,6 +138,8 @@ def promote(body, has_inner, is_fragment, stats):
     consts = {}           # rN -> K from `li rN, K`, for `addc rM, r1, rN`
     for i, l in enumerate(body):
         m = RE_ALIAS_ADDI.match(l) or None
+        if m and m.group(1) == "1":
+            m = None                                   # the frame pop: addi r1, r1, N
         if m:
             alias[int(m.group(1))] = int(m.group(2), 0); continue
         m = RE_ALIAS_ADDIC.match(l)
@@ -150,8 +157,8 @@ def promote(body, has_inner, is_fragment, stats):
             consts.pop(int(RE_ASSIGN.match(l).group(1)), None)
         m = RE_ALIAS_COPY.match(l)
         if m:
-            d, s = int(m.group(1)), int(m.group(2))
-            if s in alias: alias[d] = alias[s]
+            d = int(m.group(1)); src = int(next(g for g in m.groups()[1:] if g))
+            if src in alias: alias[d] = alias[src]
             else: alias.pop(d, None)
             continue
         # a pointer used as a base of a guest access, or stored, or given to a call
@@ -197,9 +204,17 @@ def promote(body, has_inner, is_fragment, stats):
         if m: gsave[(int(m.group(1), 0), 8)] = int(m.group(2))
     grest = {int(m.group(1)) for l in body for m in [RE_GREST.match(l)] if m}
     fsave, fload = {}, {}
+    first_def_f = {}      # fN -> first line that assigns it (after the locals line)
     for i, l in enumerate(body):
+        if i <= locals_idx: continue
+        for mm in re.finditer(r"(?:^|[;{] )f(\d+) = |memcpy\(&f(\d+),", l):
+            nreg = int(mm.group(1) or mm.group(2))
+            first_def_f.setdefault(nreg, i)
         m = RE_FSAVE.match(l)
-        if m: fsave.setdefault((int(m.group(2), 0), 8), []).append(int(m.group(1)))
+        if m:
+            nreg = int(m.group(1))
+            if first_def_f.get(nreg, 1 << 30) >= i:     # the entry value: a callee-save, not a spill
+                fsave.setdefault((int(m.group(2), 0), 8), []).append(nreg)
         m = RE_FLOAD.match(l)
         if m: fload.setdefault((int(m.group(1), 0), 8), []).append(int(m.group(2)))
     lr_reg = None
@@ -234,12 +249,18 @@ def promote(body, has_inner, is_fragment, stats):
     cs_slots = {k for k, r in gsave.items() if r in grest} | {k for k, regs in fsave.items() if len(regs) == 1 and k in fload}
     if lr_slot: cs_slots.add(lr_slot)
     kill_at = [0] * n
+    # A slot at or above a pointer a callee holds, written before that call,
+    # is the callee's to read: it stays in memory (a stack object's fields
+    # set up before the method call on it).
+    callee_reads = set()
     for i in calls:
-        live = [e for e, idx in escapes_call.items() if idx <= i]
+        live = [e for e, idx in escapes_call.items() if idx <= i or not all_forward]
         if live:
             kmin = min(live)
             for k, j in slot_ids.items():
-                if k[0] >= kmin and k not in cs_slots: kill_at[i] |= 1 << j
+                if k[0] >= kmin and k not in cs_slots:
+                    kill_at[i] |= 1 << j
+                    if any(w and (idx < i or not all_forward) for idx, w in acc[k]): callee_reads.add(k)
     succ = [[] for _ in range(n)]
     for i, l in enumerate(body):
         targets = [labels[m.group(1)] for m in RE_GOTO.finditer(l) if m.group(1) in labels]
@@ -275,6 +296,11 @@ def promote(body, has_inner, is_fragment, stats):
         reads = [i for i, w in uses if not w]
         if not writes or (unsafe >> slot_ids[k]) & 1:
             continue                                   # a read some path reaches unwritten
+        if not reads and k not in gsave and k not in fsave and k != lr_slot:
+            continue                                   # written for someone else to read: an outgoing
+                                                       # stack argument, a field of a struct passed on
+        if k in callee_reads:
+            continue
         if k in gsave and len(writes) == 1 and not reads and gsave[k] in grest:
             rewrite[k] = ("save_g", gsave[k]); continue
         if k in fsave and len(fsave[k]) == 1 and len(writes) == 1 and k in fload \
@@ -323,25 +349,44 @@ def promote(body, has_inner, is_fragment, stats):
             continue
         m = RE_GSAVE.match(l)
         if m and (int(m.group(1), 0), 8) in rewrite and rewrite[(int(m.group(1), 0), 8)][0] == "save_g":
+            if VERIFY: out.append(l)
             continue
         m = RE_FSAVE.match(l)
         if m and (int(m.group(2), 0), 8) in rewrite and rewrite[(int(m.group(2), 0), 8)][0] == "save_f":
+            if VERIFY: out.append(l)
             continue
         m = RE_FLOAD.match(l)
         if m and (int(m.group(1), 0), 8) in rewrite and rewrite[(int(m.group(1), 0), 8)][0] == "save_f":
-            out.append(f"f{m.group(2)} = fs_{m.group(2)};"); continue
+            if VERIFY:
+                out.append(f"{{ uint64_t tmp = vm_read64(r1 + {m.group(1)}); uint64_t snap; memcpy(&snap, &fs_{m.group(2)}, 8); "
+                           f"fl_verify64(\"{FUNC}\", {m.group(1)}, snap, tmp); memcpy(&f{m.group(2)}, &tmp, 8); }}")
+            else:
+                out.append(f"f{m.group(2)} = fs_{m.group(2)};")
+            continue
         if lr_slot in rewrite and rewrite[lr_slot][0] == "save_lr":
             m = RE_LRSAVE.match(l)
-            if m and int(m.group(1), 0) == lr_slot[0]: continue
+            if m and int(m.group(1), 0) == lr_slot[0]:
+                if VERIFY: out.append(l)
+                continue
             m = RE_LRLOAD.match(l)
             if m and int(m.group(2), 0) == lr_slot[0]:
-                out.append(f"r{m.group(1)} = lr_entry;"); continue
+                if VERIFY:
+                    out.append(f"r{m.group(1)} = vm_read64(r1 + {m.group(2)}); fl_verify64(\"{FUNC}\", {m.group(2)}, lr_entry, r{m.group(1)});")
+                else:
+                    out.append(f"r{m.group(1)} = lr_entry;")
+                continue
         # spills: textual substitution of the access expressions
         def sub(m):
             k = (int(m.group(3), 0), int(m.group(2)) // 8)
             if k not in rewrite or rewrite[k][0] != "spill": return m.group(0)
             name = slot_name(*k)
-            if m.group(1) == "read": return name + (m.group(5) or "")
+            w = k[1] * 8
+            if m.group(1) == "read":
+                if VERIFY:
+                    return f"fl_verify{w}(\"{FUNC}\", {m.group(3)}, {name}, vm_read{w}(r1 + {m.group(3)}))" + (m.group(5) or "")
+                return name + (m.group(5) or "")
+            if VERIFY:
+                return f"{name} = ({'uint32_t' if k[1] == 4 else 'uint64_t'})({m.group(4)}); vm_write{w}(r1 + {m.group(3)}, {name});"
             return f"{name} = ({'uint32_t' if k[1] == 4 else 'uint64_t'})({m.group(4)});"
         out.append(RE_ACCESS.sub(sub, l))
     stats.done += 1
@@ -356,27 +401,49 @@ def main():
     ap.add_argument("src"); ap.add_argument("dst")
     ap.add_argument("--functions", required=True, help="the lifter's functions.json (start/end per function)")
     ap.add_argument("--only", help="rewrite only this function (a test)")
+    ap.add_argument("--verify", action="store_true",
+                    help="a diagnostic build: promoted slots are kept in memory too, every promoted read "
+                         "compares the local with memory and logs a mismatch ([fl-verify] lines, the "
+                         "first 60 sites per unit), and memory's value is what the function uses")
     a = ap.parse_args()
+    global VERIFY
+    VERIFY = a.verify
     files = sorted(glob.glob(os.path.join(a.src, "ppu_recomp_*.cpp")))
     ranges = {int(f["start"], 0): int(f["end"], 0) for f in json.load(open(a.functions))}
     starts = set()
+    spans = {}             # start -> the highest address a body names (labels, return addresses)
     fragments = set()      # functions a trampoline continues into: they run in a parent's frame
+    shared = set()         # bodies that read a parent's frame at entry: tail entries, fragments
     re_tramp = re.compile(r"g_trampoline_fn = \(void\(\*\)\(void\*\)\)(func_[0-9A-Fa-f]+);")
+    re_addr = re.compile(r"\b(?:loc_|ctx->lr = 0x)([0-9A-Fa-f]{8})")
     for p in files:
+        cur = None
         with open(p, encoding="utf-8", errors="replace") as f:
             for l in f:
                 m = RE_HDR.match(l)
-                if m: starts.add(int(m.group(1)[5:], 16))
+                if m:
+                    cur = int(m.group(1)[5:], 16); starts.add(cur); spans.setdefault(cur, cur)
+                    continue
                 for m in re_tramp.finditer(l): fragments.add(m.group(1))
+                if cur is not None:
+                    if l.strip().startswith("uint64_t _cs_") and "vm_read64" in l: shared.add(cur)
+                    for m in re_addr.finditer(l):
+                        addr = int(m.group(1), 16)
+                        if cur <= addr < cur + 0x40000 and addr > spans[cur]: spans[cur] = addr
+    for name in fragments:
+        shared.add(int(name[5:], 16))
     starts = sorted(starts)
 
     def has_inner(start):
-        end = ranges.get(start)
-        if end is None:
-            i = bisect.bisect_right(starts, start)
-            end = starts[i] if i < len(starts) else start + 4
+        # A function's extent is the larger of its list entry and what its
+        # own body names: the lifter extends functions past the list (a
+        # merged fragment), and a function the list lacks would otherwise
+        # end exactly where the tail entry inside it starts. And whatever the
+        # extent says, the function right before a body that runs in a
+        # parent's frame is that parent: lifted functions tile the code.
+        end = max(ranges.get(start, 0), spans.get(start, start) + 4)
         i = bisect.bisect_right(starts, start)
-        return i < len(starts) and starts[i] < end
+        return i < len(starts) and (starts[i] < end or starts[i] in shared)
 
     os.makedirs(a.dst, exist_ok=True)
     stats = Stats()
@@ -395,12 +462,29 @@ def main():
             start = int(m.group(1)[5:], 16)
             if a.only and m.group(1) != a.only:
                 out.extend(lines[i:j + 1]); i = j + 1; continue
+            global FUNC
+            FUNC = m.group(1)
             new = promote(body, has_inner(start), m.group(1) in fragments, stats)
             out.append(lines[i])
             for l in new:
                 out.append(l if l.endswith(":") else "        " + l)
             out.append("}")
             i = j + 1
+        if a.verify:
+            first = next(i for i, l in enumerate(out) if RE_HDR.match(l))
+            helpers = [
+                "/* ppu_frame_locals.py --verify: a promoted read's local against memory, the first mismatches logged. */",
+                "static inline uint32_t fl_verify32(const char* fn, uint32_t off, uint32_t local, uint32_t mem) {",
+                "    static int shown = 0;",
+                '    if (local != mem && shown < 60) { shown++; fprintf(stderr, "[fl-verify] %s +0x%X: local %08X memory %08X\\n", fn, off, local, mem); }',
+                "    return mem; }",
+                "static inline uint64_t fl_verify64(const char* fn, uint32_t off, uint64_t local, uint64_t mem) {",
+                "    static int shown = 0;",
+                '    if (local != mem && shown < 60) { shown++; fprintf(stderr, "[fl-verify] %s +0x%X: local %016llX memory %016llX\\n", fn, off, (unsigned long long)local, (unsigned long long)mem); }',
+                "    return mem; }",
+                "",
+            ]
+            out = out[:first] + helpers + out[first:]
         with open(os.path.join(a.dst, os.path.basename(p)), "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(out))
     for extra in ("ppu_recomp.h", "ppu_hle_nids.cpp"):
