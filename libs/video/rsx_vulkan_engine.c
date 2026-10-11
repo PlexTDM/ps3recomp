@@ -51,6 +51,7 @@
 #include "rsx_texture_layout.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_vulkan_engine.h"
+#include "rsx_host_mouse.h"
 #include "rsx_present_passes.h"
 
 #define ENG_MAX_OBJECTS   4096
@@ -910,6 +911,10 @@ static void eng_collect_retired_buffers(void)
 
 static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* The mouse, for a port played with it (rsx_host_mouse.h); and Escape,
+     * which closes the window unless such a port wants the key. */
+    { intptr_t r = 0;
+      if (rsx_host_mouse_message(hwnd, msg, (uintptr_t)wp, (intptr_t)lp, &r)) return (LRESULT)r; }
     switch (msg) {
     case WM_CLOSE:   s_window_closed = 1; DestroyWindow(hwnd); return 0;
     case WM_DESTROY: PostQuitMessage(0); return 0;

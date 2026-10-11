@@ -53,6 +53,7 @@
 #include "rsx_draw_engine.h"
 #include "rsx_texture_layout.h"
 #include "rsx_d3d12_engine.h"
+#include "rsx_host_mouse.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -924,6 +925,10 @@ static void eng_buffer_release(void* user, u32 h)
 
 static LRESULT CALLBACK eng_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    /* The mouse, for a port played with it (rsx_host_mouse.h); and Escape,
+     * which closes the window unless such a port wants the key. */
+    { intptr_t r = 0;
+      if (rsx_host_mouse_message(hwnd, msg, (uintptr_t)wp, (intptr_t)lp, &r)) return (LRESULT)r; }
     switch (msg) {
     case WM_CLOSE:   s_window_closed = 1; DestroyWindow(hwnd); return 0;
     case WM_ACTIVATEAPP:
@@ -3854,6 +3859,7 @@ int rsx_d3d12_engine_init(u32 width, u32 height, const char* title)
 
     if (!s_headless) {
         s_hwnd = eng_create_window(s_win_w, s_win_h, title);
+        if (s_hwnd) rsx_host_mouse_attach(s_hwnd);
         if (!s_hwnd) { fprintf(stderr, "[RSX d3d12] window creation failed\n"); rsx_draw_engine_set_backend(NULL); return -1; }
     }
     if (eng_init_device(s_win_w, s_win_h) != 0) {

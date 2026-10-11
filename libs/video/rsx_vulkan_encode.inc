@@ -1499,6 +1499,7 @@ int rsx_vulkan_engine_init(u32 width, u32 height, const char* title)
     if (!rsx_draw_engine_enabled()) { rsx_draw_engine_set_backend(NULL); return -1; }
     if (!s_headless) {
         s_hwnd = eng_create_window(s_win_w, s_win_h, title);
+        if (s_hwnd) rsx_host_mouse_attach(s_hwnd);
         if (!s_hwnd) { fprintf(stderr, "[RSX vulkan] window creation failed\n"); rsx_draw_engine_set_backend(NULL); return -1; }
     }
     if (eng_init_device() != 0) {
