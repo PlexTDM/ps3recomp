@@ -455,7 +455,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
     if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-        static int _tn = 0; if (_tn++ < 3)
+        static int _tn = 0; if (_tn < 3 && ++_tn)
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
@@ -508,7 +508,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                       s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_ha && nid == (uint32_t)s_ha) {
         static int _n = 0;
-        if (_n++ < 6)
+        if (_n < 6 && ++_n)
           fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
                           "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
                   nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
@@ -587,20 +587,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if (nid == 0x5EF96465u) {
                             const char* ce = getenv("YDKJ_CRI_EVFLAG");
                             uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
-                            static int _cd=0; if(getenv("SPURS_TRACE") && _cd++<4) fprintf(stderr,
+                            static int _cd=0; if(getenv("SPURS_TRACE") && (_cd < 4 && ++_cd)) fprintf(stderr,
                                 "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
                                 (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
                             /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
                              * variant behind this NID; the cri flag is a unique address so match any. */
                             if ((uint32_t)ctx->gpr[3] == crif || (uint32_t)ctx->gpr[4] == crif ||
                                 (uint32_t)ctx->gpr[5] == crif) {
-                                static int _c=0; if(_c++<2) fprintf(stderr,
+                                static int _c=0; if (_c < 2 && ++_c) fprintf(stderr,
                                     "[FORCE-HLE] cri eventflag 0x%08X -> REAL libsre (stamps +0xC=0xFF)\n", crif);
                                 break;   /* keep opd (libsre); do NOT force HLE */
                             }
                         }
                         static int _n = 0;
-                        if (_n++ < 8)
+                        if (_n < 8 && ++_n)
                             fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
                         opd = 0;   /* fall through to the HLE handler below */
                         break;
@@ -665,7 +665,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x87630976u && getenv("YDKJ_FORCEATTR")) {
                 extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
                 if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
-                    static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
+                    static int _f=0; if (_f < 4 && ++_f) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
             }
             /* YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own
              * init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly
@@ -682,7 +682,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 if (getenv("YDKJ_GUESTINIT_CRI") && _ts!=0x40131000u) { /* skip audio */ }
                 else if (vm_base[desc+0xC]!=0xFF) {
                     uint32_t iopd = prx_resolve_export(0x22AAB31Du);
-                    static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
+                    static int _g=0; if(_g <= 6 && _g++ < 6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
                     if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398, 0, 0, 0, 0);
                         if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
@@ -693,7 +693,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x1D46FEDFu && getenv("SPURS_TRACE")) {
                 extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
                 #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
-                static int _a=0; if(_a++<2) fprintf(stderr,
+                static int _a=0; if (_a < 2 && ++_a) fprintf(stderr,
                     "[CRI_ATTR] task-add r3(taskset)=0x%08X r4=0x%08X r5(attr)=0x%08X r6(elf)=0x%08X\n"
                     "           attr[0..0x1C]= %08X %08X %08X %08X %08X %08X %08X %08X  (attr[0] must be 1)\n",
                     (uint32_t)ctx->gpr[3],a4,a5,(uint32_t)ctx->gpr[6],
@@ -759,7 +759,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         uint32_t want = (_ed && _ed[0] == (char)49) ? 1u : 3u;
                         static int _ei = 0;
                         if (iopd) {
-                            if (_ei++ < 6) {
+                            if (_ei <= 6 && _ei++ < 6) {
                                 fprintf(stderr, "[EVFLAG] eager _cellSpursEventFlagInitialize"
                                                 " flag=0x%08X spurs=0x%08X taskset=0x%08X dir=%u\n",
                                         ef, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, want);
@@ -770,14 +770,14 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                                 fprintf(stderr, "[EVFLAG] after init: +0C=%02X +0D=%02X +0E=%02X\n",
                                         vm_base[ef+0xC], vm_base[ef+0xD], vm_base[ef+0xE]);
                                 fflush(stderr); }
-                        } else if (_ei++ < 2) {
+                        } else if (_ei <= 2 && _ei++ < 2) {
                             fprintf(stderr, "[EVFLAG] 0x5EF96465 not resolvable via the PRX registry\n");
                         }
                     }
                     if (_ed && dir != 1 && dir != 3) {
                         vm_base[ef + 0xE] = (uint8_t)((_ed[0] == (char)49) ? 1 : 3);
                         static int _es = 0;
-                        if (_es++ < 4) {
+                        if (_es < 4 && ++_es) {
                             fprintf(stderr, "[EVFLAG] stamped +0E=%u on 0x%08X\n",
                                     vm_base[ef+0xE], ef);
                             fflush(stderr); }
@@ -822,7 +822,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if (nid==0x87630976u && _cap_ts==0x40131000u && (uint32_t)ctx->gpr[3]==0x8041090Fu
                   && getenv("YDKJ_CRI_CREATE_OK")) {
                   ctx->gpr[3]=0; static int _co=0;
-                  if(_co++<2) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
+                  if (_co < 2 && ++_co) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
               }
               extern uint64_t vm_read64(uint64_t a);
               if (st && nid==0x87630976u && _cap_ts) {
@@ -888,7 +888,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
         if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-            static int _tn = 0; if (_tn++ < 3)
+            static int _tn = 0; if (_tn < 3 && ++_tn)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
@@ -903,7 +903,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
          * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
         if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
-          if(_sdi){ static int _once=0; if(_once++<2){
+          if(_sdi){ static int _once=0; if (_once < 2 && ++_once){
             uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
             uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
             for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
@@ -919,7 +919,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
             return;
           } } }
-        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(_sd++<3){
+        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if (_sd < 3 && ++_sd){
             extern uint32_t vm_read32(uint64_t);
             uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
             uint32_t r7c=r7?vm_read32(r7):0, r8c=r8?vm_read32(r8):0;
@@ -949,7 +949,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
-        static int _g=0; if (_g++ < 8)
+        static int _g=0; if (_g < 8 && ++_g)
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
                     e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
@@ -967,7 +967,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
-          static int _n=0; if(_n++<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
+          static int _n=0; if (_n < 40 && ++_n) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }
 }
 

@@ -841,7 +841,7 @@ static void spu_async_run(spu_async_job* j)
 #endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
-        { static int _n = 0; if (_n++ < 24)
+        { static int _n = 0; if (_n < 24 && ++_n)
             fprintf(stderr, "[persist-ls] taskset=0x%08X task=%u image=%d %s\n",
                     j->taskset_ea, j->taskid, j->image_id,
                     ts_slot->loaded ? "REUSE (state retained)" : "first load"); fflush(stderr); }
@@ -1706,7 +1706,7 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    { static int _n = 0; if (_n++ < 24)
+    { static int _n = 0; if (_n < 24 && ++_n)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
     /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
@@ -1745,7 +1745,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     static _Thread_local unsigned long long s_wait_exit_ms;
     { extern unsigned long long ps3_ms_now(void);
       unsigned long long _now = ps3_ms_now();
-      static int _n = 0; if (ps3_log_verbose() && (_n++ < 200 || (_n % 500) == 0))
+      static unsigned _n = 0; if (ps3_log_verbose() && (_n++ < 200 || (_n % 500) == 0))
         fprintf(stderr, "[spu_workload] WAIT_SIGNAL#%d enter task=%u taskset=0x%08X ran=%llums\n",
                 _n, taskId, taskset_ea,
                 s_wait_exit_ms ? (_now - s_wait_exit_ms) : 0ull); }
@@ -1776,7 +1776,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
                     }
                 }
             }
-            { static int _a = 0; if (_a++ < 8)
+            { static int _a = 0; if (_a < 8 && ++_a)
                 fprintf(stderr, "[sync-ack] lanes advanced to tickets (sync=0x%08X)\n", b); }
         }
     }
@@ -1824,7 +1824,7 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
 #endif
-    if (drained) { static int _d = 0; if (_d++ < 24)
+    if (drained) { static int _d = 0; if (_d < 24 && ++_d)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
     spu_serial_acquire();       /* resume: re-take the serial lock */
@@ -1914,7 +1914,7 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
             "[spu_workload] dispatch HIT (async) fp=0x%016llX args=0x%08X image=%d (#%lu)\n",
             (unsigned long long)fp, args_ea, image_id, _rl); }
     if (args_ea) { extern uint8_t* vm_base; const uint8_t* c = vm_base + args_ea;
-        static int _d=0; if (_d++ < 1) {
+        static int _d=0; if (_d < 1 && ++_d) {
             /* Dump a larger window of the task context buffer + scan for any word
              * that looks like the LS[0xBEC0] target (i.e. a small LS-range value),
              * to see if the kernel-restored LS data lives here (real game data). */

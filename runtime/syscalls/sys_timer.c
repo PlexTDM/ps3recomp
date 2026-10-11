@@ -170,11 +170,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     /* A single sleep longer than a second is almost always a computed delay
      * gone wrong (a negative interval, a timebase in the wrong units) -- and a
      * thread asleep for an hour looks exactly like a hang. Say so. */
-    if (usec > 1000000ull) { static int n = 0; if (n++ < 32)
+    if (usec > 1000000ull) { static int n = 0; if (n < 32 && ++n)
         fprintf(stderr, "[timer] LONG usleep(%llu us = %.1f s) lr=0x%08llX tid=%u\n",
                 (unsigned long long)usec, usec / 1e6, (unsigned long long)ctx->lr, (unsigned)ctx->thread_id); }
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (n++ < 60)
+      static int n=0; if (n < 60 && ++n)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
@@ -241,7 +241,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
-        if (_n++ < 8) {
+        if (_n < 8 && ++_n) {
           /* Dump the words at EVERY plausible object register, not just r29.
            * Which register holds the object is per-title -- r29 was right for
            * the title this was written for and is a spin COUNTER in Guitar

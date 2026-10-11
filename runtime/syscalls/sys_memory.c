@@ -91,7 +91,7 @@ static void sys_mem_release(uint32_t addr, uint32_t size)
     }
     if (s_free_n < SYS_MEM_FREE_MAX) { s_free[s_free_n].addr = addr; s_free[s_free_n].size = size; s_free_n++; }
     else { s_free_bytes -= size;
-           static int _n = 0; if (_n++ < 4) fprintf(stderr, "[sys_memory] free list full, 0x%X bytes at 0x%08X not recycled\n", size, addr); }
+           static int _n = 0; if (_n < 4 && ++_n) fprintf(stderr, "[sys_memory] free list full, 0x%X bytes at 0x%08X not recycled\n", size, addr); }
 }
 
 /* Guest threads are real host threads; serialize the bump allocator. */
@@ -161,7 +161,7 @@ int64_t sys_memory_allocate(ppu_context* ctx)
               a->active = 1; a->addr = r; a->size = size; a->container_id = 0; a->page_size = alignment;
               bump_unlock();
               memset(vm_to_host(r), 0, size);
-              { static long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
+              { static unsigned long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
                   fprintf(stderr, "[sys_memory] allocate -> 0x%08X (reused; live=%u MB, free %u MB in %d blocks)\n",
                           r, s_total_allocated >> 20, s_free_bytes >> 20, s_free_n); }
               if (addr_out != 0) write_be32(addr_out, r);
@@ -270,14 +270,14 @@ int64_t sys_memory_free(ppu_context* ctx)
             g_sys_mem_allocs[i].active = 0;
             sys_mem_release(addr, size);
             bump_unlock();
-            { static long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
+            { static unsigned long _n = 0; if (_n++ < 40 || (_n % 200) == 0)
                 fprintf(stderr, "[sys_memory] free(0x%08X) size=0x%X (live=%u MB, free %u MB in %d blocks)\n",
                         addr, size, s_total_allocated >> 20, s_free_bytes >> 20, s_free_n); }
             return CELL_OK;
         }
     }
     bump_unlock();
-    { static int _n = 0; if (_n++ < 8) fprintf(stderr, "[sys_memory] free(0x%08X): not an allocation -> EINVAL\n", addr); }
+    { static int _n = 0; if (_n < 8 && ++_n) fprintf(stderr, "[sys_memory] free(0x%08X): not an allocation -> EINVAL\n", addr); }
 
     return (int64_t)(int32_t)CELL_EINVAL;
 }
@@ -565,7 +565,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     if (addr_out != 0)
         write_be32(addr_out, addr);
 
-    { static int n = 0; if (n++ < 4)
+    { static int n = 0; if (n < 4 && ++n)
         fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
                 size, addr); }
 

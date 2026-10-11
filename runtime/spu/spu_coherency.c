@@ -158,7 +158,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t c = (uintptr_t)s_coh_ctxs[i];
         if (c >= lo && c < hi) {
             static int _n = 0;
-            if (_n++ < 16)
+            if (_n < 16 && ++_n)
                 fprintf(stderr, "[spu-coh] leaked ctx %p (img=%d) dropped at thread exit\n",
                         (void*)c, s_coh_ctxs[i]->image_id);
             s_coh_ctxs[i] = NULL;

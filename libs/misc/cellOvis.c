@@ -17,14 +17,14 @@
 s32 cellOvisGetOverlayTableSize(u32 elf_ea)
 {
     static int n = 0;
-    if (n++ < 4) printf("[cellOvis] GetOverlayTableSize(elf=0x%08X) -> 0\n", elf_ea);
+    if (n < 4 && ++n) printf("[cellOvis] GetOverlayTableSize(elf=0x%08X) -> 0\n", elf_ea);
     return 0;
 }
 
 s32 cellOvisInitializeOverlayTable(u32 ea_ovly_table, u32 elf_ea)
 {
     static int n = 0;
-    if (n++ < 4) printf("[cellOvis] InitializeOverlayTable(table=0x%08X, elf=0x%08X)\n",
+    if (n < 4 && ++n) printf("[cellOvis] InitializeOverlayTable(table=0x%08X, elf=0x%08X)\n",
                         ea_ovly_table, elf_ea);
     return CELL_OK;
 }

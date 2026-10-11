@@ -485,7 +485,7 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
 
     if (first && init_opd && g_ps3_guest_caller) {
         static int n = 0;
-        if (n++ < 8)
+        if (n < 8 && ++n)
             printf("[sysPrxForUser] sys_ppu_thread_once: running init 0x%08X"
                    " (ctrl 0x%08X)\n", init_opd, once_ctrl_ea);
         g_ps3_guest_caller(init_opd, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -894,7 +894,7 @@ static u32 yz_heap_alloc(u32 size, u32 align)
     u32 user = (raw + 16 + align - 1) & ~(align - 1);
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if (n < 400 && ++n)
           fprintf(stderr, "[heap] alloc size=%u align=%u -> 0x%08X (raw 0x%08X, bin %u)%c",
                   size, align, user, raw, b, 10); } }
     vm_write32(user - 4,  user - raw);
@@ -913,7 +913,7 @@ static void yz_heap_free(u32 user)
     u32 raw = user - off;
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if (n < 400 && ++n)
           fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
     vm_write32(user - 12, 0);                            /* poison: catch double free */
     slot_lock();

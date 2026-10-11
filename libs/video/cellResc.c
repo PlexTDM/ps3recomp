@@ -204,7 +204,7 @@ s32 cellRescSetConvertAndFlip(s32 index)
     s_last_flip_time++;
 
     { static int n = 0;
-      if (n++ < 4)
+      if (n < 4 && ++n)
           printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
                  index, nbuf); }
 

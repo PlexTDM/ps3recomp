@@ -425,16 +425,16 @@ static void cellFsRead(ppu_context* ctx)
       if (wfd >= 0 && fd == wfd)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
-    if (getenv("PS3_FSLOG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
+    if (getenv("PS3_FSLOG")) { static int _fd=0; if (_fd < 20 && ++_fd) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
 #ifdef _WIN32
-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
+    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if (_b < 2 && ++_b){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
      * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
+    { static uint64_t tot=0; static unsigned _n=0;   /* unsigned: it also paces the summary below, so it counts on, and wraps to 0 */
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
@@ -445,7 +445,7 @@ static void cellFsRead(ppu_context* ctx)
                 (unsigned long long)tot, first_for_fd?"  <= FIRST READ ON THIS FD":"");
       if (getenv("FS_READ_PATH") && fd>=0 && fd<64 && g_fd_path[fd][0])
           fprintf(stderr, "        from %s\n", g_fd_path[fd]);
-      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %d reads:",_n);
+      if ((_n % 2000)==0) { fprintf(stderr,"[fs] read summary after %u reads:",_n);
           for (int i=0;i<64;i++) if (cnt_fd[i]) fprintf(stderr," fd%d=%ux/%lluB",i,cnt_fd[i],(unsigned long long)per_fd[i]);
           fprintf(stderr,"\n"); } }
     if (getenv("PS3_FSLOG_TOC") && nbytes >= 50000) {  /* data.toc read -> who parses it? */
@@ -619,7 +619,7 @@ static void cellFsFstat(ppu_context* ctx)
               fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if(_n++<12) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if (_n < 12 && ++_n) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
     ctx->gpr[3] = CELL_OK;
 }
 

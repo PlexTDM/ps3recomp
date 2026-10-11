@@ -397,7 +397,7 @@ static void spurs_ef_set_locked(uint32_t ea, u16 bits)
                 spu_taskset_latch_wake(taskset_ea);
             }
             static int _n = 0;
-            if (woke && _n++ < 12)
+            if (woke && (_n < 12 && ++_n))
                 fprintf(stderr, "[cellSpurs] EventFlagSet 0x%08X woke %d parked "
                                 "task(s) on taskset 0x%08X (no wait slot)\n",
                         ea, woke, taskset_ea);
@@ -1089,7 +1089,7 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                      * that starts at once reads it too early. */
                     { static int s_ad = -1; if (s_ad < 0) s_ad = getenv("SPURS_TASK_ARGDUMP") ? 1 : 0;
                       static int s_n = 0;
-                      if (s_ad && s_n++ < 64) {
+                      if (s_ad && (s_n < 64 && ++s_n)) {
                           uint32_t a[4]; for (int k = 0; k < 4; k++) a[k] = vm_read32((uint32_t)(uintptr_t)argument_ea + k * 4);
                           fprintf(stderr, "[task-args] taskset=0x%08X task=%u arg={%08X %08X %08X %08X}\n", taskset_ea, i, a[0], a[1], a[2], a[3]);
                           for (int k = 0; k < 3; k++) {
@@ -1211,7 +1211,7 @@ s32 cellSpursCreateTaskWithAttribute(CellSpursTaskset* taskset,
      * (a no-context task may not block -- SPU task-lib waits then fail with
      * ERROR_STAT). Learn the real field offsets from the bytes. */
     { uint32_t aea = (uint32_t)(uintptr_t)attr;
-      static int _n = 0; if (_n++ < 6) {
+      static int _n = 0; if (_n < 6 && ++_n) {
         fprintf(stderr, "[cellSpurs] CreateTaskWithAttr attr=0x%08X raw:", aea);
         for (int o = 0; o < 0x40; o += 4) fprintf(stderr, " %08X", vm_read32(aea + o));
         fprintf(stderr, "\n"); } }
@@ -1473,7 +1473,7 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
                 CreateThread(NULL, 1u << 18, pm_write_watch, NULL, 0, NULL);
             }
         }
-        _n++;
+        if (_n <= 3) _n++;
     }
 
     /* Forward the BE-decoded values (priority as guest EA of the 8-byte table). */
@@ -1845,7 +1845,7 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
         else if (_n == 32)
             printf("[cellSpurs] ReadyCountStore further logs suppressed\n");
-        _n++;
+        if (_n <= 32) _n++;
     }
     return CELL_OK;
 }
@@ -1989,7 +1989,7 @@ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits)
     if (!sync)
         return CELL_SPURS_TASK_ERROR_STAT;
 
-    { static int _n=0; if (_n++ < 40 || (_n%1000)==0)
+    { static unsigned _n=0; if (_n++ < 40 || (_n%1000)==0)
         fprintf(stderr, "[cellSpurs] EventFlagSet#%d flagEA=0x%08X bits=0x%04X "
                 "events=0x%04X used=0x%04X pend=0x%04X mode=0x%04X\n",
                 _n, ea, (unsigned)bits,
@@ -2114,7 +2114,7 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
-    { static int _n = 0; if (_n++ < 40)
+    { static int _n = 0; if (_n < 40 && ++_n)
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
@@ -2379,7 +2379,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
         } else if (_n == 3) {
             printf("[cellSpurs] CreateJobChainWA raw dumps suppressed from here\n");
         }
-        _n++;
+        if (_n <= 3) _n++;
     }
     printf("[cellSpurs] CreateJobChainWithAttribute(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u name=\"%s\")\n",
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
@@ -2412,7 +2412,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
     if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     static int _n = 0;
-    if (_n++ < 3) {
+    if (_n < 3 && ++_n) {
         printf("[cellSpurs] CreateJobChain(jc=0x%08X entry=0x%08X sizeDesc=%u maxGrab=%u "
                "maxCont=%u autoReq=%u)\n",
                (u32)jc_ea, (u32)entry_ea, sizeJobDescriptor, maxGrabbedJob,
@@ -2466,11 +2466,11 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
           }
           printf("\n");
       }
-      _n++; }
+      if (_n <= 8) _n++; }
 
     if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
         static int _b = 0;
-        if (_b++ < 4)
+        if (_b < 4 && ++_b)
             printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",
                    idx, ea_bin, size_bin);
         return;
@@ -2583,7 +2583,7 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
       s_jobguards[i].count = remaining;
       vm_write32(ea, remaining); }
     { static int _n = 0;
-      if (_n++ < 8)
+      if (_n < 8 && ++_n)
           printf("[cellSpurs] JobGuardNotify(0x%08X) -> %u remaining\n",
                  ea, s_jobguards[i].count); }
     return CELL_OK;
@@ -2726,7 +2726,7 @@ static void jc_signal_done(u32 jc_ea, int job_index)
                                                 ? spurs_event_data3_probe()
                                                 : (answers_a_count ? mbox : 0));
         static int n = 0;
-        if (n++ < 8)
+        if (n < 8 && ++n)
             printf("[cellSpurs] chain 0x%08X job %d done -> event queue %u "
                    "(data2=%llu rc=%d)\n",
                    jc_ea, job_index, s_spurs_event_queue[i],
@@ -2774,7 +2774,7 @@ static void jc_execute(int slot)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
-                { static int _n = 0; if (_n++ < 8)
+                { static int _n = 0; if (_n < 8 && ++_n)
                     printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X (resumes there)\n", jc_ea, jobs, pc); }
                 s_jobchains[slot].resume_pc = pc;             /* halted: the next Run re-fetches this slot */
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
@@ -2939,7 +2939,7 @@ static void jc_execute_async(int slot)
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                             /* END */
                 jc_async_barrier(&run);
-                { static int _n = 0; if (_n++ < 4)
+                { static int _n = 0; if (_n < 4 && ++_n)
                     printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X (async, resumes there)\n", jc_ea, jobs, pc); }
                 s_jobchains[slot].resume_pc = pc;
                 if (jobs) jc_signal_done(jc_ea, jobs - 1);
@@ -3176,7 +3176,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
         } else {
             InterlockedExchange(&s_jobchains[i].rerun, 1);
             static int n = 0;
-            if (n++ < 8) printf("[cellSpurs] %s(jc=0x%08X) while a walk is in progress -- queued a re-walk\n",
+            if (n < 8 && ++n) printf("[cellSpurs] %s(jc=0x%08X) while a walk is in progress -- queued a re-walk\n",
                                 who, (u32)jc_ea);
         }
         return CELL_OK;
@@ -3206,7 +3206,7 @@ s32 cellSpursRunJobChain(u64 jc_ea)
 s32 cellSpursShutdownJobChain(u64 jc_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] ShutdownJobChain(jc=0x%08X)\n", (u32)jc_ea);
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea == (u32)jc_ea) {
             s_jobchains[i].running = 0;   /* stop the walker; Join can now succeed */
@@ -3221,7 +3221,7 @@ s32 cellSpursShutdownJobChain(u64 jc_ea)
 s32 cellSpursJoinJobChain(u64 jc_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] JoinJobChain(jc=0x%08X)\n", (u32)jc_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] JoinJobChain(jc=0x%08X)\n", (u32)jc_ea);
     /* Run/Kick walk the chain on a host thread, so Join has to wait for it.
      * Returning at once told the title its jobs were done while they were
      * still running. The Simpsons Arcade Game runs and joins a chain every
@@ -3246,7 +3246,7 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
 s32 cellSpursJobChainGetError(u64 jc_ea, u64 cause_out_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] JobChainGetError(jc=0x%08X)\n", (u32)jc_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] JobChainGetError(jc=0x%08X)\n", (u32)jc_ea);
     if (cause_out_ea) vm_write32((u32)cause_out_ea, 0);
     return CELL_OK;
 }
@@ -3309,7 +3309,7 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
 
     static int _n = 0;
-    if (_n++ < 8)
+    if (_n < 8 && ++_n)
         printf("[cellSpurs] _QueueInitialize(taskset=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)taskset_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
     return CELL_OK;
@@ -3318,7 +3318,7 @@ s32 _cellSpursQueueInitialize(u64 spurs_ea, u64 taskset_ea, u64 queue_ea,
 s32 cellSpursQueueClear(u64 queue_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] QueueClear(q=0x%08X)\n", (u32)queue_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] QueueClear(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
 
@@ -3349,7 +3349,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
                    (u32)queue_ea, (u32)data_ea, isBlocking);
         else if (_n == 8)
             printf("[cellSpurs] QueuePushBody further logs suppressed\n");
-        _n++;
+        if (_n <= 8) _n++;
         return CELL_OK;
     }
 
@@ -3423,7 +3423,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
         spu_taskset_signal_task(tsp, (uint32_t)woke);
     }
 
-    if (_n++ < 16)
+    if (_n < 16 && ++_n)
         printf("[cellSpurs] QueuePush#%d q=0x%08X slot=%u (cur=%u->%u) buf=0x%08X+0x%X "
                "size=%u depth=%u waiters=%u woke=%d sync=%d/%d tail=%d->%d taskset=0x%08X\n",
                _n, q, slot, cur, nxt, buf, slot * sz, sz, dep, waiters, woke, sync, nsync, tail, ntail, tsp);
@@ -3437,7 +3437,7 @@ s32 cellSpursQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
 s32 cellSpursRequestIdleSpu(u64 spurs_ea)
 {
     static int _n = 0;
-    if (_n++ < 4) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
+    if (_n < 4 && ++_n) printf("[cellSpurs] RequestIdleSpu(spurs=0x%08X)\n", (u32)spurs_ea);
     return CELL_OK;
 }
 
@@ -3445,7 +3445,7 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
 {
     struct SpursInst* si = spurs_inst_find((u32)spurs_ea);
     static int _n = 0;
-    if (_n++ < 4) printf("[cellSpurs] GetInfo(spurs=0x%08X info=0x%08X)\n", (u32)spurs_ea, (u32)info_ea);
+    if (_n < 4 && ++_n) printf("[cellSpurs] GetInfo(spurs=0x%08X info=0x%08X)\n", (u32)spurs_ea, (u32)info_ea);
     if (info_ea) {
         vm_write32((u32)info_ea, si ? si->nspus : 1);   /* nSpus */
         for (int o = 4; o < 0x28; o += 4) vm_write32((u32)info_ea + o, 0);
@@ -3456,7 +3456,7 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
 s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
 {
     static int _n = 0;
-    if (_n++ < 4)
+    if (_n < 4 && ++_n)
         printf("[cellSpurs] SetExceptionEventHandler(spurs=0x%08X handler=0x%08X)\n",
                (u32)spurs_ea, (u32)handler_ea);
     return CELL_OK;
@@ -3465,7 +3465,7 @@ s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
 s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] GetWorkloadInfo(wid=%u info=0x%08X)\n", wid, (u32)info_ea);
 
     if (!spurs_ea || !info_ea)
         return CELL_SPURS_CORE_ERROR_NULL_POINTER;
@@ -3503,14 +3503,14 @@ s32 cellSpursGetWorkloadInfo(u64 spurs_ea, u32 wid, u64 info_ea)
 s32 cellSpursShutdownWorkload(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
+    if (_n < 8 && ++_n) printf("[cellSpurs] ShutdownWorkload(wid=%u)\n", wid);
     return CELL_OK;
 }
 
 s32 cellSpursWaitForWorkloadShutdown(u64 spurs_ea, u32 wid)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
+    if (_n < 8 && ++_n) printf("[cellSpurs] WaitForWorkloadShutdown(wid=%u)\n", wid);
     return CELL_OK;
 }
 
@@ -3601,7 +3601,7 @@ s32 cellSpursTaskGetReadOnlyAreaPattern(u64 pattern_ea, u64 elf_ea)
     vm_write64((uint32_t)pattern_ea + 8, word[1]);
 
     static int _n = 0;
-    if (_n++ < 8)
+    if (_n < 8 && ++_n)
         printf("[cellSpurs] TaskGetReadOnlyAreaPattern(elf=0x%08X) -> %016llX %016llX\n",
                (u32)elf_ea, (unsigned long long)word[0], (unsigned long long)word[1]);
     return CELL_OK;
@@ -3628,7 +3628,7 @@ s32 cellSpursTaskGetContextSaveAreaSize(u64 size_out_ea, u64 pattern_ea)
     vm_write32((uint32_t)size_out_ea, size);
 
     static int _n = 0;
-    if (_n++ < 8)
+    if (_n < 8 && ++_n)
         printf("[cellSpurs] TaskGetContextSaveAreaSize(ls=%016llX %016llX, %u blocks) -> %u (0x%X)\n",
                (unsigned long long)hi, (unsigned long long)lo, blocks, size, size);
     return CELL_OK;
@@ -3641,7 +3641,7 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32
 {
     if (!attr) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
+    if (_n < 8 && ++_n) printf("[cellSpurs] TasksetAttributeSetTasksetSize(size=%u)\n", size);
     return CELL_OK;
 }
 
@@ -3651,7 +3651,7 @@ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32
 s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] QueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] QueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
 
@@ -3717,7 +3717,7 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     memset(vm_base + (uint32_t)buffer_ea, 0, (size_t)size * depth);
 
     static int _n = 0;
-    if (_n++ < 8)
+    if (_n < 8 && ++_n)
         printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
     return CELL_OK;
@@ -3726,6 +3726,6 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
 {
     static int _n = 0;
-    if (_n++ < 8) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+    if (_n < 8 && ++_n) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }

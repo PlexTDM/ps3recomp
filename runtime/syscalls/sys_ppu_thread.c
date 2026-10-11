@@ -597,7 +597,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
 {
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
+    { static int n=0; if (n < 30 && ++n) fprintf(stderr,"[WAIT] ppu_thread_join(tid=%llu)\n", (unsigned long long)tid); }
 
     table_lock();
     ppu_thread_info* t = find_thread(tid);

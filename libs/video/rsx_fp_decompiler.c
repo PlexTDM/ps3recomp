@@ -1389,7 +1389,7 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
     }
     { static int dbg = -1;
       if (dbg < 0) { const char* e = getenv("FP_KDBG"); dbg = e ? atoi(e) : 0; }
-      if (dbg) { static int m = 0; if (m++ < 3) {
+      if (dbg) { static int m = 0; if (m < 3 && ++m) {
         fprintf(stderr, "[FPK] %d consts%c", n, 10);
         for (int _q = 0; _q < n; _q++)
             fprintf(stderr, "   k[%2d] = (%g %g %g %g)%c", _q, out[_q*4+0],

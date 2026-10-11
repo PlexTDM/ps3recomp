@@ -93,7 +93,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
               memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
               if (strstr(tmp, pat)) {
                   static int _n = 0;
-                  if (_n++ < 4) {
+                  if (_n < 4 && ++_n) {
                       uint32_t sp = (uint32_t)ctx->gpr[1];
                       fprintf(stderr, "[TTY_BT] \"%.70s\" tid=%llu cia=0x%08X lr=0x%08X chain:",
                               tmp, (unsigned long long)ctx->thread_id,
@@ -117,7 +117,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             char tmp[256]; uint32_t n = len < 255 ? len : 255;
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "NULL pointer") || strstr(tmp, "E2004090") || strstr(tmp, "CRICRS")) {
-                static int _cb = 0; if (_cb++ < 4) {
+                static int _cb = 0; if (_cb < 4 && ++_cb) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "[CRIBT] \"%.60s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -141,7 +141,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
             memcpy(tmp, vm_base + buf_ea, n); tmp[n] = 0;
             if (strstr(tmp, "ASSERT") || strstr(tmp, "Tuner") || strstr(tmp, "usertrace") ||
                 strstr(tmp, "libspurs")) {
-                static int _ab = 0; if (_ab++ < 4) {
+                static int _ab = 0; if (_ab < 4 && ++_ab) {
                     uint32_t sp = (uint32_t)ctx->gpr[1];
                     fprintf(stderr, "\n[ASSERTBT] \"%.70s\" cia=0x%08X lr=0x%08X chain:", tmp,
                             (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -168,7 +168,7 @@ static int64_t sys_tty_write(ppu_context* ctx)
                 strstr(ptmp, "out of memory on request")) {
                 extern void ppu_log_host_chain(const char*);
                 static int _pn = 0;
-                if (_pn++ < 3) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
+                if (_pn < 3 && ++_pn) { fprintf(stderr, "[POOLTRACE] %.90s\n", ptmp); ppu_log_host_chain("pool-corrupt"); }
             }
         }
         /* DIAGNOSTIC (FLOW_PSSGTRACE=1): when the title logs a PhyreEngine
@@ -892,7 +892,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
          * only scratch is either reading the wrong descriptor or the descriptor
          * does not name the buffer we expect. */
         { static int _wd = -1; if (_wd < 0) _wd = getenv("SPU_WORKDESC_DUMP") ? 1 : 0;
-          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 3) {
+          if (_wd && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n < 3 && ++_n) {
               fprintf(stderr, "[WORKDESC] tid=0x%X ea=0x%08X:%c", t->tid, work_ea, 10);
               for (int r = 0; r < 16; r++) {
                   fprintf(stderr, "  +0x%03X:", r * 16);
@@ -901,13 +901,13 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
                   fprintf(stderr, "%c", 10);
               } } } }
         { static int _wh = -1; if (_wh < 0) _wh = getenv("SPU_WORKDESC_HDR") ? 1 : 0;
-          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n++ < 40)
+          if (_wh && work_ea > 0x1000000u && vm_base) { static int _n = 0; if (_n < 40 && ++_n)
               fprintf(stderr, "[WORKHDR] tid=0x%X ea=0x%08X w0=%u w1=%u f2=%g f3=%g%c",
                       t->tid, work_ea, vm_read_be32(work_ea), vm_read_be32(work_ea+4),
                       (double)*(const float*)&(const uint32_t){0}, 0.0, 10); }
           if (_wh && work_ea > 0x1000000u && vm_base) { } }
         { static int _sd = -1; if (_sd < 0) _sd = getenv("SPU_SEED_DBG") ? 1 : 0;
-          if (_sd) { static int _n = 0; if (_n++ < 12)
+          if (_sd) { static int _n = 0; if (_n < 12 && ++_n)
               fprintf(stderr, "[SPU-SEED] tid=0x%X entry=0x%05X args=0x%08X seed=0x%08X%c",
                       t->tid, entry, t->args_ea, work_ea, 10); } }
         /* Do NOT seed the inbound mailbox. It is the reply channel for the
@@ -921,7 +921,7 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
           if (_sp) { QueryPerformanceCounter(&_t1); QueryPerformanceFrequency(&_fq);
               extern uint64_t g_spu_interp_steps;
               double sec = (double)(_t1.QuadPart - _t0.QuadPart) / (double)_fq.QuadPart;
-              static int _n = 0; if (_n++ < 20)
+              static int _n = 0; if (_n < 20 && ++_n)
                   fprintf(stderr, "[spu-speed] tid=0x%X %llu insns in %.3f s = %.1f M/s%c",
                           t->tid, (unsigned long long)g_spu_interp_steps, sec,
                           sec > 0 ? g_spu_interp_steps / sec / 1e6 : 0.0, 10); } }
@@ -1457,7 +1457,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
          * real fix is resident SPU threads, or a printf port that resolves
          * to its thread; this is the floor until one of those exists. */
         static int warned = 0;
-        if (warned++ < 8) {
+        if (warned < 8 && ++warned) {
             fprintf(stderr, "[SPU] write_spu_mb: thread 0x%X not found -- "
                             "dropping the word and reporting CELL_OK, as the "
                             "unimplemented stub did\n", tid);
@@ -1515,7 +1515,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
             }
             if (spu_channel_has_data(&c->ch_in_mbox)) {
                 static int _n = 0;
-                if (_n++ < 8)
+                if (_n < 8 && ++_n)
                     fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> BUSY after "
                             "%d ms (mailbox still holds 0x%08X)\n",
                             tid, val, waited, c->ch_in_mbox.value);
@@ -1523,13 +1523,13 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
                 return (int64_t)(int32_t)CELL_EBUSY;
             }
             { static int _n = 0;
-              if (_n++ < 8)
+              if (_n < 8 && ++_n)
                   fprintf(stderr, "[SPU] write_spu_mb tid=0x%X: waited %d ms for the "
                           "mailbox to drain\n", tid, waited); }
         }
 
         { static int _n = 0;
-          if (_n++ < 32)
+          if (_n < 32 && ++_n)
               fprintf(stderr, "[SPU] write_spu_mb tid=0x%X val=0x%08X -> live worker\n",
                       tid, val); }
         spu_channel_write(&c->ch_in_mbox, val);
@@ -1613,7 +1613,7 @@ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
      * the ports cellSpursAttachLv2EventQueue bound; the rest stays as it was. */
     extern uint32_t spurs_port_queue(uint32_t port);
     if (!spu->spu_group_id && (code >= 128 || !spurs_port_queue(code & 63))) {
-        if (code < 128) { static int n; if (n++ < 16)
+        if (code < 128) { static int n; if (n < 16 && ++n)
             fprintf(stderr, "[spu-evt] SPURS user event on unbound port %u dropped (img=%d value=0x%08X)\n",
                     code & 63, spu->image_id, value); }
         return 0;
@@ -1728,7 +1728,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     }
     if (!q && t && t->connected_queue) q = t->connected_queue;
     if (!q) { spu_group_t* g = spu_find_group(group_id); if (g) q = g->event_queue_id; }
-    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && s_d++ < 64)
+    { static int s_d = 0; if (getenv("SPU_MBOXTRACE") && (s_d < 64 && ++s_d))
         fprintf(stderr, "[SPU->PPU] deliver? spu=0x%X intr=%d val=0x%08X q=%u (thread %s)\n",
                 spu_id, is_intr, value, q, t ? "found" : "MISSING"); }
     if (!q) return;
@@ -1737,7 +1737,7 @@ static void ydkj_spu_out_mbox_deliver(uint32_t group_id, uint32_t spu_id,
     sys_event_queue_push_by_id(q,
         ((uint64_t)spu_id << 32) | (is_intr ? 0x2u : 0x1u),
         (uint64_t)value, 0, 0);
-    { static int s_w = 0; if (s_w++ < 32)
+    { static int s_w = 0; if (s_w < 32 && ++s_w)
         fprintf(stderr, "[SPU->PPU] mbox deliver spu=0x%X intr=%d val=0x%08X -> q=%u\n",
                 spu_id, is_intr, value, q); }
 }
@@ -1814,7 +1814,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     uint32_t type      = (uint32_t)ctx->gpr[6];
     { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
       static int n = 0;
-      if (s_t && n++ < 12)
+      if (s_t && (n < 12 && ++n))
           { extern void ppu_guest_caller(char*, size_t);
             char who[64]; ppu_guest_caller(who, sizeof who);
             fprintf(stderr, "[spu-readls] tid=0x%08X off=0x%05X size=%u from %s\n",
@@ -1835,7 +1835,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
               vm_base[value_ea + k] = (uint8_t)(v >> (56 - 8 * k));
           { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_LSREAD_TRACE") ? 1 : 0;
             static int n = 0;
-            if (s_t && n++ < 8)
+            if (s_t && (n < 8 && ++n))
                 fprintf(stderr, "[spu-readls] chain 0x%08X off=0x%05X -> 0x%llX\n",
                         tid, ls_offset, (unsigned long long)v); }
           ctx->gpr[3] = 0;
@@ -2051,7 +2051,7 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
      * it unsatisfied. Print the guest caller chain for the first few so the
      * retry loop can be identified. */
     { static int _bt_n = 0;
-      if (_bt_n++ < 3) {
+      if (_bt_n < 3 && ++_bt_n) {
           /* Matches func_entry in the generated ppu_recomp.h. */
           struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
           extern const struct lv2_bt_fentry function_table[];

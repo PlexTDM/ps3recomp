@@ -998,7 +998,7 @@ static int vp_slot_for(const rsx_state* st, u32 vtex_mask)
             fn = compile_guest_function(s_msl, name);
         }
     }
-    { static int n = 0; if (n++ < 32)
+    { static int n = 0; if (n < 32 && ++n)
         fprintf(stderr, "[RSX metal] vertex program %08X: %d instrs -> %s\n",
                 hash, ni, fn ? "ok" : "FAILED (built-in shader instead)"); }
 
@@ -1073,7 +1073,7 @@ static int fp_slot_for(const rsx_state* st, const u8** uc, u32 cube_mask)
             fn = compile_guest_function(s_msl, name);
         }
     }
-    { static int n = 0; if (n++ < 32)
+    { static int n = 0; if (n < 32 && ++n)
         fprintf(stderr, "[RSX metal] fragment program %016llX: %d instrs, %u constants -> %s\n",
                 (unsigned long long)key, ni, nconst,
                 fn ? "ok" : "FAILED (built-in shader instead)"); }
@@ -1367,7 +1367,7 @@ static int tex_slot_for(const rsx_texture_state* t)
 
     id<MTLTexture> tex = upload_texture(vm_base + ea, w, h, fmt, t->control1,
                                         levels, pitch, cube);
-    { static int n = 0; if (n++ < 16)
+    { static int n = 0; if (n < 16 && ++n)
         fprintf(stderr, "[RSX metal] texture %ux%u fmt 0x%02X %u level(s)%s at 0x%08X (%s) -> %s\n",
                 w, h, fmt, levels ? levels : 1u, cube ? " cube" : "", ea,
                 (t->format & 3u) == 1u ? "local" : "main",
@@ -1562,7 +1562,7 @@ static int surface_get(u32 off, u32 w, u32 h, u32 fmt)
     td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
                MTLTextureUsagePixelFormatView;
     id<MTLTexture> tex = [s_dev newTextureWithDescriptor:td];
-    { static int n = 0; if (n++ < 16)
+    { static int n = 0; if (n < 16 && ++n)
         fprintf(stderr, "[RSX metal] surface 0x%08X %ux%u fmt 0x%02X -> %s\n",
                 off, w, h, fmt & 0x1Fu, tex ? "ok" : "FAILED"); }
 
@@ -1684,7 +1684,7 @@ static void textures_for(const rsx_state* st, MtlDraw* d)
         if (surf >= 0) {
             d->samp[u] = samp_slot_for(t);
             if (rt_is_own_target(d, t->offset)) {
-                { static int n = 0; if (n++ < 1)
+                { static int n = 0; if (n < 1 && ++n)
                     fprintf(stderr, "[RSX metal] unit %u samples the surface the pass "
                                     "draws into (0x%08X); reading the zero texture\n",
                             u, t->offset); }

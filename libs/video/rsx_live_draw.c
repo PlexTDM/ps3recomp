@@ -4396,7 +4396,7 @@ static ID3D12PipelineState* get_pso(
             const int np = rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask, unnorm_dim, cube_mask);
             { static int n = 0;
-              if (n++ < 8)
+              if (n < 8 && ++n)
                   fprintf(stderr, "[unnorm] mask=0x%X cube=0x%X dim0=%ux%u"
                                   " patched=%d\n",
                           unnorm_mask, cube_mask, unnorm_dim[0][0],

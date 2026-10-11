@@ -962,7 +962,7 @@ static void sys_spinlock_lock(ppu_context* ctx)
             unsigned long owner = spin_owner_of(ea);
             unsigned long me    = GetCurrentThreadId();
             static int reported = 0;
-            if (reported++ < 8)
+            if (reported < 8 && ++reported)
                 fprintf(stderr,
                         "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
                         "held by tid %lu, this is tid %lu%s\n",
