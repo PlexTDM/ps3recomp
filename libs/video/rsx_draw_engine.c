@@ -852,6 +852,16 @@ static double eng_now_ms(void)
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
+/* Uploads of an 8-bit texture at least 256 wide: a decoded video's plane
+ * (Bink hands the RSX its Y, Cb and Cr that way). A host can tell from the
+ * count moving that a movie is playing. */
+volatile unsigned g_rsx_video_plane_uploads;
+
+/* The draws of the last frame presented: a few dozen for a menu, a loading
+ * screen or a movie, hundreds and up with a scene on screen. */
+volatile unsigned g_rsx_frame_draws;
+static unsigned s_frame_draws;
+
 /* The port's stand-ins for the title's textures (rsx_draw_engine.h). */
 static rsx_texture_standin_fn s_standin_fn;
 static void* s_standin_user;
@@ -887,6 +897,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     const u8* src = eng_guest_ptr(NULL, location, offset, span);
     if (!src) return 0;
     s_fstat.tex++; s_fstat.tex_bytes += span;
+    if ((fmt & 0x9Fu) == 0x81u /* CELL_GCM_TEXTURE_B8 */ && w >= 256) g_rsx_video_plane_uploads++;
 
     /* The port's stand-in, if it has one for these bytes: from here on the
      * texture is the stand-in's, under the guest's place in the cache. */
@@ -2856,6 +2867,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
     const double t0 = eng_now_ms();
     sink_end_impl(user, r);
     s_fstat.draws++; s_fstat.draw_ms += eng_now_ms() - t0;
+    s_frame_draws++;
 }
 /* 2^(ex - 15) for a half float's exponent field 1..30, as the float with that
  * exponent: no libm, which the standalone draw-engine test is linked without
@@ -3489,6 +3501,7 @@ static void eng_present(u32 buffer_id)
     }
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
+    g_rsx_frame_draws = s_frame_draws; s_frame_draws = 0;
     /* DOD3_STUTTER_MS=<n>: a frame longer than n ms says what the walker did
      * in it -- texture uploads, vertex conversions stored, pipelines built --
      * beside the guest threads' report ([stutter], ppu_hle.cpp). */

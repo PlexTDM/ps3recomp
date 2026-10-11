@@ -267,6 +267,13 @@ void rsx_draw_engine_set_default(int on);
  * NULL restores the toolkit's cellGcm mapping. */
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
 
+/* Counts the uploads that are a decoded video's planes (8-bit, at least 256
+ * wide): it moves while a movie plays. */
+extern volatile unsigned g_rsx_video_plane_uploads;
+
+/* The draws of the last frame presented. */
+extern volatile unsigned g_rsx_frame_draws;
+
 /* A port's stand-in for one of the title's textures. The engine asks at every
  * upload of a 2D texture, with the guest's description of it and its bytes
  * (the whole mip chain, `span` bytes); a nonzero return hands back another
