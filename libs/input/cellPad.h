@@ -212,6 +212,21 @@ void cellPad_poll(void);
 #define CELL_PAD_HOST_OTHER   6   /* a pad of no known family */
 int cellPad_host_kind(u32 port);
 
+/* A port's own keyboard and mouse as port 0's pad, in place of the built-in
+ * keyboard fallback. Asked at every sweep of the host's pads, with whether
+ * the title's window has the focus: what it holds goes in `out` (buttons as
+ * CELL_PAD_CTRL_*, sticks 0-255 with 128 the centre), and the return is
+ * nonzero while it is in use -- a key held, the mouse moved. It plays beside
+ * a real pad: the two are merged, and cellPad_host_kind(0) says NONE while
+ * the keyboard was the last of the two touched. */
+typedef struct CellPadHostInput {
+    u16 buttons;
+    u8  lx, ly, rx, ry;
+    u8  l2, r2;
+} CellPadHostInput;
+typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
+void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
+
 #ifdef __cplusplus
 }
 #endif

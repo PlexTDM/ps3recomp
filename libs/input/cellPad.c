@@ -102,9 +102,23 @@ static int s_data_fresh[PAD_MAX_HOST_PORTS];
  * finds and loses its pads, read by anyone. */
 static volatile int s_host_kind[PAD_MAX_HOST_PORTS];
 
+/* A port's own keyboard and mouse beside port 0's pad (cellPad.h). */
+static cellPad_host_input_fn s_host_input_fn;
+static void* s_host_input_user;
+static volatile int s_host_keyboard_last;   /* of the keyboard and the pad, the one touched last */
+static volatile int s_host_pad0;            /* a real pad is on port 0 */
+
+void cellPad_set_host_input(cellPad_host_input_fn fn, void* user)
+{
+    s_host_input_user = user;
+    s_host_input_fn = fn;
+}
+
 int cellPad_host_kind(u32 port)
 {
-    return port < PAD_MAX_HOST_PORTS ? s_host_kind[port] : CELL_PAD_HOST_NONE;
+    if (port >= PAD_MAX_HOST_PORTS) return CELL_PAD_HOST_NONE;
+    if (port == 0 && s_host_input_fn && (s_host_keyboard_last || !s_host_pad0)) return CELL_PAD_HOST_NONE;
+    return s_host_kind[port];
 }
 
 /* ---------------------------------------------------------------------------
@@ -682,6 +696,40 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* The port's keyboard and mouse into port 0, beside whatever pad is there. */
+static void pad_poll_host_input(void)
+{
+    PadHostState* hs = &s_host_state[0];
+    CellPadHostInput in;
+    int focused = 1;
+#ifdef _WIN32
+    focused = pad_host_window_focused();
+#endif
+    memset(&in, 0, sizeof in);
+    in.lx = in.ly = in.rx = in.ry = 128;
+    const int keyboard_used = s_host_input_fn(s_host_input_user, focused, &in);
+    const int pad = hs->connected;
+    s_host_pad0 = pad;
+    if (!pad) {
+        memset(hs, 0, sizeof *hs);
+        hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+    }
+    /* Which of the two the player is on: a button, a stick well off its
+     * centre or a trigger says the pad; the port says the keyboard. */
+    const int pad_used = pad && (hs->buttons || hs->trigger_l2 > 48 || hs->trigger_r2 > 48 ||
+                                 abs((int)hs->analog_lx - 128) > 56 || abs((int)hs->analog_ly - 128) > 56 ||
+                                 abs((int)hs->analog_rx - 128) > 56 || abs((int)hs->analog_ry - 128) > 56);
+    if (keyboard_used) s_host_keyboard_last = 1;
+    else if (pad_used) s_host_keyboard_last = 0;
+
+    hs->connected = 1;
+    hs->buttons |= in.buttons;
+    if (in.lx != 128 || in.ly != 128) { hs->analog_lx = in.lx; hs->analog_ly = in.ly; }
+    if (in.rx != 128 || in.ry != 128) { hs->analog_rx = in.rx; hs->analog_ry = in.ry; }
+    if (in.l2 > hs->trigger_l2) hs->trigger_l2 = in.l2;
+    if (in.r2 > hs->trigger_r2) hs->trigger_r2 = in.r2;
+}
+
 static void pad_poll_backend(void)
 {
     /* Benign race: two threads may poll in the same tick. That costs one extra
@@ -700,6 +748,10 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
+    if (s_host_input_fn) {
+        pad_poll_host_input();
+        return;
+    }
 #if defined(_WIN32) || defined(__APPLE__)
     if (!s_host_state[0].connected) pad_poll_keyboard();
 #endif
