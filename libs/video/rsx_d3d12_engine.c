@@ -54,6 +54,7 @@
 #include "rsx_texture_layout.h"
 #include "rsx_d3d12_engine.h"
 #include "rsx_host_mouse.h"
+#include "rsx_present_pace.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -3620,9 +3621,82 @@ static void eng_poll_submits(void)
 
 static void eng_dump_frame(u32 surface);
 
+/* A paced present (rsx_present_pace.h) on a thread of its own. The pacing
+ * holds a frame back for a few milliseconds; on the walker that is a few
+ * milliseconds before the next frame's commands are looked at, and a title
+ * that waits for its flip, or for a query the walker has not reached, loses
+ * them from every frame (Drakengard 3 with a cap that follows its frame
+ * times: 95 fps became 69). So the walker hands the present over and goes
+ * on; it needs it done only where it needs the swap chain itself -- before
+ * the next frame's back buffer, and before the swap chain is changed or let
+ * go -- and there it asks for the frame at once (eng_present_join).
+ * Not in exclusive full screen, where DXGI calls back into the window's
+ * thread from Present and that thread must not be waiting for this one. */
+static HANDLE s_pres_thread, s_pres_go, s_pres_done;
+static volatile LONG s_pres_quit;
+static UINT s_pres_interval, s_pres_flags;
+
+static DWORD WINAPI eng_present_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        WaitForSingleObject(s_pres_go, INFINITE);
+        if (s_pres_quit) break;
+        rsx_present_pace();
+        const HRESULT hr = CALL(s_swap, Present, s_pres_interval, s_pres_flags);
+        if (FAILED(hr)) {
+            static int n = 0;
+            if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
+                                 (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
+        }
+        SetEvent(s_pres_done);
+    }
+    return 0;
+}
+
+/* The present handed over last has been made. If it is still being held for
+ * its turn, it is shown now: the walker waits for a present, never for the
+ * pacing of one. */
+static void eng_present_join(void)
+{
+    if (!s_pres_thread || WaitForSingleObject(s_pres_done, 0) == WAIT_OBJECT_0) return;
+    rsx_present_pace_hurry(1);
+    WaitForSingleObject(s_pres_done, INFINITE);
+    rsx_present_pace_hurry(0);
+}
+
+/* 0 when there is no thread to give it to: the caller presents itself. */
+static int eng_present_async(UINT interval, UINT flags)
+{
+    if (!s_pres_thread) {
+        if (!s_pres_go) s_pres_go = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!s_pres_done) s_pres_done = CreateEventA(NULL, TRUE, TRUE, NULL);
+        if (!s_pres_go || !s_pres_done) return 0;
+        s_pres_quit = 0;
+        s_pres_thread = CreateThread(NULL, 0, eng_present_thread, NULL, 0, NULL);
+        if (!s_pres_thread) return 0;
+    }
+    s_pres_interval = interval; s_pres_flags = flags;
+    ResetEvent(s_pres_done);
+    SetEvent(s_pres_go);
+    return 1;
+}
+
+static void eng_present_thread_stop(void)
+{
+    if (!s_pres_thread) return;
+    eng_present_join();
+    s_pres_quit = 1;
+    SetEvent(s_pres_go);
+    WaitForSingleObject(s_pres_thread, 2000);
+    CloseHandle(s_pres_thread);
+    s_pres_thread = NULL;
+}
+
 static void eng_swapchain_release(void)
 {
     if (!s_swap) return;
+    eng_present_join();
     if (s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     for (u32 i = 0; i < 3; i++) RELEASE(s_backbuf[i]);
     RELEASE(s_swap);
@@ -3785,6 +3859,7 @@ static void eng_fullscreen_restore(void)
 {
     s_fs_restore = 0;
     if (!s_swap || s_headless) return;
+    eng_present_join();
     BOOL fs = FALSE;
     if (FAILED(CALL(s_swap, GetFullscreenState, &fs, NULL)) || fs) return;
     fence_wait(fence_signal());
@@ -3846,6 +3921,7 @@ static void eng_submit(u32 present_surface, int wait)
             D3D12_RESOURCE_STATES before;
             if (s_headless) { dst = s_offscreen; rtv = cpu_handle(s_backbuf_rtv_heap, s_rtv_step, 0); before = s_offscreen_state; }
             else {
+                eng_present_join();   /* the last frame's present, if it is paced on its thread */
                 bbi = CALL0(s_swap, GetCurrentBackBufferIndex);
                 dst = s_backbuf[bbi]; rtv = cpu_handle(s_backbuf_rtv_heap, s_rtv_step, bbi);
                 before = D3D12_RESOURCE_STATE_PRESENT; windowed = 1;
@@ -3911,13 +3987,21 @@ static void eng_submit(u32 present_surface, int wait)
         static double hl = -1.0;
         if (hl < 0.0) { const char* e = getenv("RSX_HITCH_LOG"); hl = e ? atof(e) : 0.0; }
         LARGE_INTEGER pq0, pq1, pq2, pqf;
+        const UINT pflags = (!s_vsync && s_tearing && s_display != DISP_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0;
         if (hl > 0.0) { QueryPerformanceFrequency(&pqf); QueryPerformanceCounter(&pq0); }
-        HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync,
-                          (!s_vsync && s_tearing && s_display != DISP_FULLSCREEN) ? DXGI_PRESENT_ALLOW_TEARING : 0);
-        if (FAILED(hr)) {
-            static int n = 0;
-            if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
-                                 (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
+        /* The frame's work is with the GPU; it is shown when its turn comes
+         * (rsx_present_pace.h). Paced, the wait and the present are the
+         * presenting thread's (above); in exclusive full screen, and when
+         * that thread cannot be made, they are done here. */
+        if (!(rsx_present_pace_on() && s_display != DISP_FULLSCREEN && eng_present_async((UINT)s_vsync, pflags))) {
+            eng_present_join();
+            rsx_present_pace();
+            HRESULT hr = CALL(s_swap, Present, (UINT)s_vsync, pflags);
+            if (FAILED(hr)) {
+                static int n = 0;
+                if (n < 8 && ++n) fprintf(stderr, "[rsx engine/d3d12] Present failed: 0x%08lX (removed 0x%08lX)\n",
+                                     (long)hr, (long)CALL0(s_dev, GetDeviceRemovedReason));
+            }
         }
         if (hl > 0.0) QueryPerformanceCounter(&pq1);
         /* Pace: at most ENG_INFLIGHT presents queued. */
@@ -4137,6 +4221,7 @@ static const rsx_draw_backend s_engine_backend = {
 
 static void eng_release_device(void)
 {
+    eng_present_thread_stop();
     if (s_swap && s_display == DISP_FULLSCREEN) CALL(s_swap, SetFullscreenState, FALSE, NULL);
     RELEASE(s_zero_cb); RELEASE(s_readback); s_readback_cap = 0; RELEASE(s_aux_alloc);
     RELEASE(s_null_tex); RELEASE(s_blit_pso); RELEASE(s_depth_pso); RELEASE(s_depth_pack_pso);

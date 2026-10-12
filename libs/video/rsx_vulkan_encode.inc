@@ -833,6 +833,7 @@ static void eng_submit(u32 present_surface, int wait)
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = &s_sem_done[img_index];
         pi.swapchainCount = 1; pi.pSwapchains = &s_swap; pi.pImageIndices = &img_index;
+        rsx_present_pace();   /* shown when its turn comes (rsx_present_pace.h) */
         const VkResult pr = vkQueuePresentKHR(s_queue, &pi);
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);

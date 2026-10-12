@@ -52,6 +52,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_vulkan_engine.h"
 #include "rsx_host_mouse.h"
+#include "rsx_present_pace.h"
 #include "rsx_present_passes.h"
 
 #define ENG_MAX_OBJECTS   4096
