@@ -6,8 +6,10 @@
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -385,7 +387,52 @@ int64_t sys_timer_sleep(ppu_context* ctx)
  *
  * r3 = pointer to receive seconds (u64*)
  * r4 = pointer to receive nanoseconds (u64*)
+ *
+ * The wall clock: seconds since 1970, which a title's C library turns into
+ * the date it shows and stamps its saves with.
+ *
+ * Windows: the host's wall clock at the first reading, carried on by the
+ * guest's ticks -- so it stands still while the title is paused, like the
+ * guest's other clocks (sys_timer.h). It used to be the performance counter
+ * alone, divided into seconds: the time since the PC was started, taken for
+ * the time since 1970. A machine up for four days told the title it was the
+ * 5th of January 1970.
+ *
+ * PS3_TIME_LOG=1: the first answer of this call and of sys_time_get_timezone,
+ * once each.
  * -----------------------------------------------------------------------*/
+#ifdef _WIN32
+static void wall_clock_now(uint64_t* sec, uint64_t* nsec)
+{
+    static volatile LONG s_lock = 0;
+    static volatile LONG s_have = 0;
+    static int64_t  s_base_ticks;
+    static uint64_t s_base_100ns;      /* 100 ns units since 1970 */
+    LARGE_INTEGER now;
+    ensure_qpc_init();
+    QueryPerformanceCounter(&now);
+    const int64_t g = ps3_guest_ticks(now.QuadPart);
+    if (!s_have) {
+        FILETIME ft;
+        ULARGE_INTEGER u;
+        GetSystemTimePreciseAsFileTime(&ft);
+        u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        while (InterlockedCompareExchange(&s_lock, 1, 0) != 0) YieldProcessor();
+        if (!s_have) {
+            s_base_100ns = u.QuadPart - 116444736000000000ULL;   /* 1601 -> 1970 */
+            s_base_ticks = g;
+            InterlockedExchange(&s_have, 1);
+        }
+        InterlockedExchange(&s_lock, 0);
+    }
+    const int64_t d = g - s_base_ticks;
+    const uint64_t el = d > 0 ? (uint64_t)d : 0, q = (uint64_t)s_qpc_freq.QuadPart;
+    const uint64_t t = s_base_100ns + (el / q) * 10000000ULL + ((el % q) * 10000000ULL) / q;
+    *sec = t / 10000000ULL;
+    *nsec = (t % 10000000ULL) * 100ULL;
+}
+#endif
+
 int64_t sys_time_get_current_time(ppu_context* ctx)
 {
     uint32_t sec_addr  = LV2_ARG_PTR(ctx, 0);
@@ -394,15 +441,7 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    now.QuadPart = ps3_guest_ticks(now.QuadPart);
-
-    /* Convert QPC to seconds + nanoseconds */
-    sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-    uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-    nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
+    wall_clock_now(&sec, &nsec);
 #else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -416,7 +455,61 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     if (nsec_addr != 0) {
         write_be64(nsec_addr, nsec);
     }
+    { static int said = 0;
+      if (!said && (said = 1) && getenv("PS3_TIME_LOG")) {
+          const time_t t = (time_t)sec;
+          struct tm u;
+#ifdef _WIN32
+          gmtime_s(&u, &t);
+#else
+          gmtime_r(&t, &u);
+#endif
+          fprintf(stderr, "[SYS] sys_time_get_current_time: %llu s since 1970 (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
+                  (unsigned long long)sec, u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
+      } }
 
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * sys_time_get_timezone
+ *
+ * r3 = pointer to receive the time zone (s32*): minutes east of UTC, without
+ *      summer time
+ * r4 = pointer to receive the summer time in force (s32*): minutes, 0 or 60
+ *
+ * A title's C library adds the two to the wall clock for the local time. The
+ * call was not there: the dispatcher answered CELL_OK and wrote nothing, and
+ * the library went on with whatever its two variables held. (Drakengard 3
+ * stamped a save of October 2026 as December 1933: that, on top of the wall
+ * clock above.) The host's own zone: the difference between its local and its
+ * universal time now, which is exact whatever the summer time's size; of
+ * that, 60 minutes are called summer time while the host says it is in force.
+ * -----------------------------------------------------------------------*/
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t zone_addr   = LV2_ARG_PTR(ctx, 0);
+    uint32_t summer_addr = LV2_ARG_PTR(ctx, 1);
+
+    const time_t now = time(NULL);
+    struct tm local, utc;
+#ifdef _WIN32
+    localtime_s(&local, &now);
+    gmtime_s(&utc, &now);
+#else
+    localtime_r(&now, &local);
+    gmtime_r(&now, &utc);
+#endif
+    int days = local.tm_yday - utc.tm_yday;
+    if (local.tm_year != utc.tm_year) days = local.tm_year > utc.tm_year ? 1 : -1;   /* either side of New Year */
+    const int offset = days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
+    const int summer = local.tm_isdst > 0 ? 60 : 0;
+
+    if (zone_addr != 0)   write_be32(zone_addr, (uint32_t)(int32_t)(offset - summer));
+    if (summer_addr != 0) write_be32(summer_addr, (uint32_t)(int32_t)summer);
+    { static int said = 0;
+      if (!said && (said = 1) && getenv("PS3_TIME_LOG"))
+          fprintf(stderr, "[SYS] sys_time_get_timezone: %d minutes east of UTC, summer time %d minutes\n", offset - summer, summer); }
     return CELL_OK;
 }
 
@@ -748,15 +841,6 @@ int64_t sys_timer_stop(ppu_context* ctx)
 
 /* ---------------------------------------------------------------------------
  * Registration
- *
- * NOTE: There are syscall number collisions in the existing table:
- *   SYS_TIMER_USLEEP (141) == SYS_EVENT_FLAG_WAIT (141)
- *   SYS_TIMER_SLEEP  (142) == SYS_EVENT_FLAG_TRYWAIT (142)
- *   SYS_TIME_GET_CURRENT_TIME (145) == SYS_EVENT_FLAG_CANCEL (145)
- * The event flag handlers are registered separately and will win.
- * Timer sleep/time functions should be called via wrapper functions
- * or fixed syscall numbers should be assigned.
- * For now, we register the timer-specific syscalls that don't collide.
  * -----------------------------------------------------------------------*/
 void sys_timer_init(lv2_syscall_table* tbl)
 {
@@ -773,15 +857,9 @@ void sys_timer_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_TIMER_CONNECT_EVENT_QUEUE,      sys_timer_connect_event_queue);
     lv2_syscall_register(tbl, SYS_TIMER_DISCONNECT_EVENT_QUEUE,   sys_timer_disconnect_event_queue);
 
-    /* These have conflicting numbers with event flag syscalls.
-     * Register them here -- last registration wins. If events are
-     * registered after timers, the event handlers will override.
-     * The runtime should dispatch timer_usleep/sleep/get_current_time
-     * via direct function calls instead. */
     lv2_syscall_register(tbl, SYS_TIME_GET_TIMEBASE_FREQUENCY, sys_time_get_timebase_frequency);
-
-    /* Register these but be aware of collisions */
     lv2_syscall_register(tbl, SYS_TIMER_USLEEP,            sys_timer_usleep);
     lv2_syscall_register(tbl, SYS_TIMER_SLEEP,             sys_timer_sleep);
+    lv2_syscall_register(tbl, SYS_TIME_GET_TIMEZONE,       sys_time_get_timezone);
     lv2_syscall_register(tbl, SYS_TIME_GET_CURRENT_TIME,   sys_time_get_current_time);
 }

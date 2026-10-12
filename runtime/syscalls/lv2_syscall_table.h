@@ -139,6 +139,7 @@ extern uint32_t g_ps3_sdk_version;
 #define SYS_TIMER_SLEEP                 142
 
 /* Time */
+#define SYS_TIME_GET_TIMEZONE           144
 #define SYS_TIME_GET_CURRENT_TIME       145
 #define SYS_TIME_GET_TIMEBASE_FREQUENCY 147
 
