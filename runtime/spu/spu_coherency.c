@@ -12,6 +12,7 @@
 
 #include <stdlib.h>
 #include "spu_coherency.h"
+#include "../ppu/ppu_vm_page.h"   /* g_ppu_vm_page and its bits */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -100,10 +101,21 @@ unsigned long g_spu_lr_raise = 0;
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+    /* SPU_COH_PAGES=1: say which 64 KiB pages get their first reserved line,
+     * and so lose the inline store path for good. A PPU stack among them
+     * (0xD0000000 up, or the main thread's below 0x0FF00000) would be worth
+     * knowing about: every frame store of that thread then takes the call. */
+    { static int log = -1;
+      if (log < 0) log = getenv("SPU_COH_PAGES") ? 1 : 0;
+      if (log && !(g_ppu_vm_page[ea >> 16] & PPU_VM_PAGE_COH)) {
+          fprintf(stderr, "[spu-coh] first reserved line in page 0x%08X (ea 0x%08X, spu %d)\n",
+                  ea & 0xFFFF0000u, ea, ctx ? (int)ctx->spu_id : -1);
+          fflush(stderr); } }
     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
     /* Atomic: ppu_vm_slow_any_update rewrites the page's other bits from
-     * another thread, without the lock-line lock. */
-    __atomic_fetch_or(&g_ppu_vm_page[ea >> 16], (unsigned char)4, __ATOMIC_SEQ_CST);
+     * another thread, without the lock-line lock. The bit a store tests
+     * goes off in the same step. */
+    ppu_vm_page_update(ea >> 16, 0, PPU_VM_PAGE_COH);
     s_coh_armed = 1;
 
     if (!ctx) return;

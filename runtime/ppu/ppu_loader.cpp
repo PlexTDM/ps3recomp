@@ -1301,13 +1301,13 @@ extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
 extern "C" uint32_t g_ww_dyn;
 extern "C" int g_ppu_vm_slow_stores;
 extern "C" int g_ppu_vm_slow_reads;
-extern "C" unsigned char g_ppu_vm_page[65536];      /* spu_coherency.c */
+#include "ppu_vm_page.h"   /* g_ppu_vm_page (spu_coherency.c) and its bits */
 extern "C" uint32_t ppu_hle_inject_base;
 /* The inline paths' one test (ppu_vm_fast.h): which 64 KiB pages a lifted
  * load or store may touch without calling vm_read*_slow / vm_write*_slow.
  * Recompute after changing anything this reads. Bit 4 (a reserved SPU line
- * in the page) is spu_coherency.c's and is left alone; a page is slow for a
- * moment while its bits are rewritten, which is always safe. */
+ * in the page) is spu_coherency.c's and is left alone; bit 8, the one a store
+ * tests, follows from the others (ppu_vm_page_update). */
 extern "C" uint32_t g_ppu_vm_slow_stores_any = 1;   /* as g_ppu_vm_slow_stores starts */
 extern "C" void ppu_vm_slow_any_update(void)
 {
@@ -1321,8 +1321,7 @@ extern "C" void ppu_vm_slow_any_update(void)
         /* Out of the guest VM, or an access that could run off its end. */
         if (ppu_vm_size && (((uint64_t)p + 1) << 16) >= ppu_vm_size) f = 0;
         if (p == gcm_page) f &= (unsigned char)~1u;  /* the ref register's loads */
-        __atomic_fetch_and(&g_ppu_vm_page[p], (unsigned char)4, __ATOMIC_SEQ_CST);
-        if (f) __atomic_fetch_or(&g_ppu_vm_page[p], f, __ATOMIC_SEQ_CST);
+        ppu_vm_page_update(p, (unsigned char)(PPU_VM_PAGE_RD | PPU_VM_PAGE_WR), f);
     }
 }
 static uint32_t g_null_sweep_last = 0;
@@ -2506,11 +2505,16 @@ static void icall_hist(ppu_context* ctx, uint32_t tgt, int phase)
     ReleaseSRWLockExclusive(&lk);
 }
 
+static void ps3_indirect_call_full(ppu_context* ctx);
+
 extern "C" void ps3_indirect_call(ppu_context* ctx)
 {
     /* The ordinary call: no diagnostic armed, and a target this path has
      * resolved before. Everything else -- the first call of a target, a null
-     * or unregistered one, the OPD fixups -- is the full path's.
+     * or unregistered one, the OPD fixups -- is the full path's, in a
+     * function of its own: its diagnostics keep arrays on the stack, and
+     * with them in this frame every indirect call of the title set up and
+     * checked a stack cookie and a 600-byte frame it never used.
      * PPU_ICALL_SLOW=1 takes the full path always. */
     { if (__builtin_expect(g_ppu_icall_full < 0, 0)) g_ppu_icall_full = icall_diag_armed();
       if (__builtin_expect(!g_ppu_icall_full, 1)) {
@@ -2529,6 +2533,11 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
               return;
           }
       } }
+    ps3_indirect_call_full(ctx);
+}
+
+static __attribute__((noinline)) void ps3_indirect_call_full(ppu_context* ctx)
+{
     static int on = -1;
     if (on < 0) on = getenv("PPU_CSCHECK") ? 1 : 0;
     { static int hg = -1; if (hg < 0) hg = getenv("PS3_ICALL_GATE") ? 1 : 0;
