@@ -395,7 +395,7 @@ library, runs all eight lifter suites plus the SPU helper tests, and drives
 
 Builds and is covered by CI (`.github/workflows/macos.yml`, arm64, Debug and
 Release on every push). That workflow builds the runtime library, runs all
-eight lifter test suites — including the 1300+ instruction conformance checks,
+eleven lifter test suites — including the 1300+ instruction conformance checks,
 which compile and *execute* lifted code — and then runs `ps3recomp_host`
 headlessly, asserting the presented pixel matches the guest clear colour and
 that an NV4097 triangle covers the centre pixel. A green tick means the

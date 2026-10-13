@@ -144,6 +144,29 @@ int      ppu_stdcx64(uint64_t addr, uint64_t expected, uint64_t val);
 #define vm_write16(a, v)  vm_fast_write16((a), (v))
 #define vm_write32(a, v)  vm_fast_write32((a), (v))
 #define vm_write64(a, v)  vm_fast_write64((a), (v))
+#else
+/* The frame accesses of a function's entry (ppu_vm_fast.h), where the
+ * accessors are the runtime's functions: nothing to gather. */
+#define PPU_FRAME_INIT(sp, lo, hi)
+#define PPU_FR8(e, a)       vm_read8(a)
+#define PPU_FR16(e, a)      vm_read16(a)
+#define PPU_FR32(e, a)      vm_read32(a)
+#define PPU_FR64(e, a)      vm_read64(a)
+#define PPU_FW8(e, a, v)    vm_write8((a), (v))
+#define PPU_FW16(e, a, v)   vm_write16((a), (v))
+#define PPU_FW32(e, a, v)   vm_write32((a), (v))
+#define PPU_FW64(e, a, v)   vm_write64((a), (v))
+/* And the runs of accesses off one register. */
+#define PPU_RUN_VARS(k)
+#define PPU_RUN(k, reg, lo, span, bits) ((void)0)
+#define PPU_RR8(k, e, a)       vm_read8(a)
+#define PPU_RR16(k, e, a)      vm_read16(a)
+#define PPU_RR32(k, e, a)      vm_read32(a)
+#define PPU_RR64(k, e, a)      vm_read64(a)
+#define PPU_RW8(k, e, a, v)    vm_write8((a), (v))
+#define PPU_RW16(k, e, a, v)   vm_write16((a), (v))
+#define PPU_RW32(k, e, a, v)   vm_write32((a), (v))
+#define PPU_RW64(k, e, a, v)   vm_write64((a), (v))
 #endif
 
 /* Syscall handler */
@@ -189,8 +212,10 @@ SOURCE_PREAMBLE = """\
  * builds the conformance driver) has no __builtin_expect. */
 #if defined(__GNUC__) || defined(__clang__)
 #define PPU_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define PPU_COLD_FN __attribute__((noinline, cold))
 #else
 #define PPU_UNLIKELY(x) (x)
+#define PPU_COLD_FN __declspec(noinline)
 #endif
 
 /* Float->int conversion per Book I 4.6.7: SATURATE out-of-range (positive
@@ -240,8 +265,10 @@ static inline double ppu_fp_default_qnan(void)
 /* One test on the hot path: a NaN input always gives a NaN result on x86 as
  * well, so only a NaN result needs the PPC priority rules (FRA's NaN, then
  * FRB's, else the default QNaN rather than x86's negative one). Bit-identical
- * to testing the inputs first; the hot float code ran three compares per op. */
-static double ppu_fp_bin_nan(double a, double b)
+ * to testing the inputs first; the hot float code ran three compares per op.
+ * The rules are a function of their own, and stay one (PPU_COLD_FN): inlined
+ * at every operation they were a quarter of a float-heavy function's code. */
+PPU_COLD_FN static double ppu_fp_bin_nan(double a, double b)
 {
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
@@ -258,7 +285,7 @@ static inline double ppu_fmul(double a, double b) { return ppu_fp_bin(a, b, a * 
 static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / b); }
 /* FRT = (neg_res ? - : +)([FRA*FRC] + (neg_b ? -FRB : FRB)), fused.
  * NaN priority: FRA, FRB, FRC (negations never apply to propagated NaNs). */
-static double ppu_fmadd_nan(double a, double c, double b)
+PPU_COLD_FN static double ppu_fmadd_nan(double a, double c, double b)
 {
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
@@ -295,6 +322,29 @@ static inline double ppu_frsp(double b)
     if (b != b) return ppu_fp_quiet(b);
     return (double)(float)b;
 }
+
+/* PPU_NV_VERIFY lifts (ppu_nv_dirty.py): a register local that is not
+ * written back before a transfer, because nothing has assigned it since it
+ * last agreed with the register file, is compared with the file instead. */
+static void ppu_nv_differs(ppu_context* ctx, unsigned fn)
+{
+    static int said = 0;
+    if (said < 60) { said++; fprintf(stderr, "[nv-verify] func_%08X (lr %08X): a local taken as unchanged differs from the register file\\n", fn, (unsigned)ctx->lr); fflush(stderr); }
+}
+static inline uint64_t ppu_nv_xf(const double* a, double b)
+{
+    uint64_t x, y; memcpy(&x, a, 8); memcpy(&y, &b, 8);
+    return x ^ y;
+}
+#define PPU_NV_XF(n) ppu_nv_xf(&ctx->fpr[n], f##n)
+#define PPU_NV_XV(n) ((uint64_t)(memcmp(&ctx->vr[n], &v##n, 16) != 0))
+/* ... and a register that changed but is not written back, because nothing
+ * reads it before writing it, gets a value in the file that a reader would
+ * not survive quietly. */
+#define PPU_NV_POISON_G(n) (ctx->gpr[n] = 0xBAD0BAD0BAD00000ull + n)
+#define PPU_NV_POISON_F(n) do { uint64_t _p = 0x7FF4BAD0BAD00000ull + n; memcpy(&ctx->fpr[n], &_p, 8); } while (0)
+#define PPU_NV_POISON_S(n) (ctx->n = 0xBAD0C0DEu)
+#define PPU_NV_POISON_V(n) memset(&ctx->vr[n], 0xBD, 16)
 
 /* AltiVec register byte order: ctx->vr holds RAW big-endian guest bytes (lvx is
  * a plain 16-byte memcpy). Byte/word MOVE ops (vperm, vmrgh*, vsldoi, vspltw)
@@ -369,21 +419,118 @@ PPU_VMX_INLINE void ppu_vperm(void* d, const void* a, const void* b, const void*
 PPU_VMX_INLINE void ppu_vspltw(void* d, const void* b, int u)
 { uint32_t w; memcpy(&w, (const uint8_t*)b + 4 * u, 4); ppu_vst128(d, _mm_set1_epi32((int)w)); }
 /* Float compares: the mask lanes are all-ones or all-zero, so they need no
- * swap; returns how many lanes were true (the dot form's CR6). */
+ * swap. Returns 4 when every lane was true, 0 when none was and 1 otherwise,
+ * which is all the dot form's CR6 asks. */
 PPU_VMX_INLINE int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
 {
     const __m128 x = ppu_vldps(a), y = ppu_vldps(b);
     const __m128 m = op == 0 ? _mm_cmpeq_ps(x, y) : op == 1 ? _mm_cmpge_ps(x, y) : _mm_cmpgt_ps(x, y);
     ppu_vst128(d, _mm_castps_si128(m));
     const int k = _mm_movemask_ps(m);
-    return (k & 1) + ((k >> 1) & 1) + ((k >> 2) & 1) + ((k >> 3) & 1);
+    return k == 15 ? 4 : k != 0;
 }
 PPU_VMX_INLINE int ppu_vcmpequw(void* d, const void* a, const void* b)
 {
     const __m128i m = _mm_cmpeq_epi32(ppu_vld128(a), ppu_vld128(b));
     ppu_vst128(d, m);
     const int k = _mm_movemask_ps(_mm_castsi128_ps(m));
-    return (k & 1) + ((k >> 1) & 1) + ((k >> 2) & 1) + ((k >> 3) & 1);
+    return k == 15 ? 4 : k != 0;
+}
+/* vmaxfp and vminfp. maxps and minps return their second operand when the
+ * two compare equal or unordered, so the two orders differ only for zeros
+ * of opposite sign: their AND is +0, which the maximum prefers, their OR -0.
+ * A NaN operand is the result, quieted, vA's before vB's. */
+PPU_VMX_INLINE void ppu_vmaxfp(void* d, const void* a, const void* b)
+{
+    const __m128 x = ppu_vldps(a), y = ppu_vldps(b);
+    __m128 r = _mm_and_ps(_mm_max_ps(x, y), _mm_max_ps(y, x));
+    r = _mm_blendv_ps(r, _mm_add_ps(y, y), _mm_cmpunord_ps(y, y));
+    ppu_vstps(d, _mm_blendv_ps(r, _mm_add_ps(x, x), _mm_cmpunord_ps(x, x)));
+}
+PPU_VMX_INLINE void ppu_vminfp(void* d, const void* a, const void* b)
+{
+    const __m128 x = ppu_vldps(a), y = ppu_vldps(b);
+    __m128 r = _mm_or_ps(_mm_min_ps(x, y), _mm_min_ps(y, x));
+    r = _mm_blendv_ps(r, _mm_add_ps(y, y), _mm_cmpunord_ps(y, y));
+    ppu_vstps(d, _mm_blendv_ps(r, _mm_add_ps(x, x), _mm_cmpunord_ps(x, x)));
+}
+/* vctsxs and vctuxs: float times `scale` (2^UIMM) to a 32-bit integer,
+ * toward zero, saturating; a NaN gives 0. cvttps2dq answers 0x80000000 for
+ * a NaN and for everything out of int32's range. */
+PPU_VMX_INLINE void ppu_vctsxs(void* d, const void* b, float scale)
+{
+    const __m128 x = _mm_mul_ps(ppu_vldps(b), _mm_set1_ps(scale));
+    __m128i r = _mm_cvttps_epi32(x);
+    r = _mm_xor_si128(r, _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f))));   /* -> 0x7FFFFFFF */
+    r = _mm_and_si128(r, _mm_castps_si128(_mm_cmpord_ps(x, x)));
+    ppu_vst128(d, ppu_vbswap128(r));
+}
+PPU_VMX_INLINE void ppu_vctuxs(void* d, const void* b, float scale)
+{
+    const __m128 x = _mm_mul_ps(ppu_vldps(b), _mm_set1_ps(scale));
+    const __m128 big = _mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f));
+    const __m128i lo = _mm_cvttps_epi32(x);                                  /* x < 2^31 */
+    const __m128i hi = _mm_xor_si128(_mm_cvttps_epi32(_mm_sub_ps(x, _mm_set1_ps(2147483648.0f))),
+                                     _mm_set1_epi32((int)0x80000000u));     /* 2^31 <= x < 2^32 */
+    __m128i r = _mm_blendv_epi8(lo, hi, _mm_castps_si128(big));
+    r = _mm_or_si128(r, _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(4294967296.0f))));
+    r = _mm_and_si128(r, _mm_castps_si128(_mm_cmpgt_ps(x, _mm_setzero_ps())));  /* <= 0 and NaN: 0 */
+    ppu_vst128(d, ppu_vbswap128(r));
+}
+/* lvlx: bytes sh..15 of the aligned quadword at m, left-justified, zeros
+ * after them. lvrx: its bytes 0..sh-1, right-justified, zeros before them,
+ * and no access at all when sh is 0 (the quadword is the one after the data
+ * then, and need not be mapped). pshufb gives 0 for an index with its top
+ * bit set. lvlx, which is how the compilers of the day loaded every
+ * unaligned vector, takes its indices from a table: working them out (a
+ * broadcast of sh and an add) is three more operations on the one port the
+ * shuffles around it are waiting for. */
+static const uint8_t ppu_lvlx_idx[16][16] = {
+    { 0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F },
+    { 0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80 },
+    { 0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80 },
+    { 0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80 },
+    { 0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80 },
+    { 0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80 },
+    { 0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+    { 0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80 },
+};
+PPU_VMX_INLINE void ppu_lvlx(void* d, const uint8_t* m, uint32_t sh)
+{
+    ppu_vst128(d, _mm_shuffle_epi8(ppu_vld128(m), ppu_vld128(ppu_lvlx_idx[sh])));
+}
+PPU_VMX_INLINE void ppu_lvrx(void* d, const uint8_t* m, uint32_t sh)
+{
+    if (!sh) { ppu_vst128(d, _mm_setzero_si128()); return; }
+    const __m128i idx = _mm_add_epi8(_mm_setr_epi8(-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1),
+                                     _mm_set1_epi8((char)sh));
+    ppu_vst128(d, _mm_shuffle_epi8(ppu_vld128(m), idx));
+}
+/* lvsl: the bytes b, b+1, ..., b+15 (lvsr: with b = 16 - sh). */
+PPU_VMX_INLINE void ppu_lvsl(void* d, uint32_t b)
+{
+    ppu_vst128(d, _mm_add_epi8(_mm_setr_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15), _mm_set1_epi8((char)b)));
+}
+/* The bitwise operations, which no byte order touches. vsel takes b where
+ * the mask c has a bit set, a where it has not. */
+PPU_VMX_INLINE void ppu_vand(void* d, const void* a, const void* b)  { ppu_vst128(d, _mm_and_si128(ppu_vld128(a), ppu_vld128(b))); }
+PPU_VMX_INLINE void ppu_vandc(void* d, const void* a, const void* b) { ppu_vst128(d, _mm_andnot_si128(ppu_vld128(b), ppu_vld128(a))); }
+PPU_VMX_INLINE void ppu_vor(void* d, const void* a, const void* b)   { ppu_vst128(d, _mm_or_si128(ppu_vld128(a), ppu_vld128(b))); }
+PPU_VMX_INLINE void ppu_vxor(void* d, const void* a, const void* b)  { ppu_vst128(d, _mm_xor_si128(ppu_vld128(a), ppu_vld128(b))); }
+PPU_VMX_INLINE void ppu_vnor(void* d, const void* a, const void* b)
+{ ppu_vst128(d, _mm_xor_si128(_mm_or_si128(ppu_vld128(a), ppu_vld128(b)), _mm_set1_epi32(-1))); }
+PPU_VMX_INLINE void ppu_vsel(void* d, const void* a, const void* b, const void* c)
+{
+    const __m128i m = ppu_vld128(c);
+    ppu_vst128(d, _mm_or_si128(_mm_andnot_si128(m, ppu_vld128(a)), _mm_and_si128(ppu_vld128(b), m)));
 }
 /* vmrgh and vmrgl: interleave the first (high) or second (low) half of the
  * elements of a and b, in memory order. */
@@ -424,7 +571,7 @@ static inline int ppu_vcmpfp(void* d, const void* a, const void* b, int op)
     ppu_vldf4(a, x); ppu_vldf4(b, y);
     for (int i = 0; i < 4; i++) { int k = op == 0 ? (x[i] == y[i]) : op == 1 ? (x[i] >= y[i]) : (x[i] > y[i]); r[i] = k ? ~0u : 0u; t += k; }
     memcpy(d, r, 16);
-    return t;
+    return t == 4 ? 4 : t != 0;
 }
 static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
 {
@@ -432,7 +579,67 @@ static inline int ppu_vcmpequw(void* d, const void* a, const void* b)
     memcpy(x, a, 16); memcpy(y, b, 16);
     for (int i = 0; i < 4; i++) { int k = x[i] == y[i]; r[i] = k ? ~0u : 0u; t += k; }
     memcpy(d, r, 16);
-    return t;
+    return t == 4 ? 4 : t != 0;
+}
+/* vmaxfp and vminfp: a NaN operand is the result, quieted, vA's before
+ * vB's; of two equal operands -- zeros of either sign, then -- the maximum
+ * is vB where vA is negative, the minimum vA. */
+static inline void ppu_vmaxfp(void* d, const void* a, const void* b)
+{
+    float x[4], y[4], r[4]; uint32_t xw[4]; ppu_vldf4(a, x); ppu_vldf4(b, y); ppu_vldu4(a, xw);
+    for (int i = 0; i < 4; i++)
+        r[i] = (x[i]!=x[i]) ? x[i]+x[i] : (y[i]!=y[i]) ? y[i]+y[i]
+             : (x[i]>y[i]) ? x[i] : (y[i]>x[i]) ? y[i] : ((xw[i] >> 31) ? y[i] : x[i]);
+    ppu_vstf4(d, r);
+}
+static inline void ppu_vminfp(void* d, const void* a, const void* b)
+{
+    float x[4], y[4], r[4]; uint32_t xw[4]; ppu_vldf4(a, x); ppu_vldf4(b, y); ppu_vldu4(a, xw);
+    for (int i = 0; i < 4; i++)
+        r[i] = (x[i]!=x[i]) ? x[i]+x[i] : (y[i]!=y[i]) ? y[i]+y[i]
+             : (x[i]<y[i]) ? x[i] : (y[i]<x[i]) ? y[i] : ((xw[i] >> 31) ? x[i] : y[i]);
+    ppu_vstf4(d, r);
+}
+static inline void ppu_vctsxs(void* d, const void* b, float scale)
+{
+    float x[4]; uint32_t r[4]; ppu_vldf4(b, x);
+    for (int i = 0; i < 4; i++) {
+        const float v = x[i] * scale;
+        r[i] = (uint32_t)((v!=v) ? 0 : (v>=2147483648.0f) ? 2147483647 : (v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v);
+    }
+    ppu_vstu4(d, r);
+}
+static inline void ppu_vctuxs(void* d, const void* b, float scale)
+{
+    float x[4]; uint32_t r[4]; ppu_vldf4(b, x);
+    for (int i = 0; i < 4; i++) {
+        const float v = x[i] * scale;
+        r[i] = (v!=v) ? 0u : (v>=4294967296.0f) ? 4294967295u : (v<=0.0f) ? 0u : (uint32_t)v;
+    }
+    ppu_vstu4(d, r);
+}
+/* lvlx and lvrx as one sixteen-byte window on the quadword and sixteen
+ * zeros, with no branch on the offset (lvrx reads nothing when sh is 0). */
+static inline void ppu_lvlx(void* d, const uint8_t* m, uint32_t sh)
+{ uint8_t t[32]; memcpy(t, m, 16); memset(t + 16, 0, 16); memcpy(d, t + sh, 16); }
+static inline void ppu_lvrx(void* d, const uint8_t* m, uint32_t sh)
+{ uint8_t t[32]; memset(t, 0, 32); if (sh) memcpy(t + 16, m, 16); memcpy(d, t + sh, 16); }
+static inline void ppu_lvsl(void* d, uint32_t b)
+{ uint8_t t[16]; for (int i = 0; i < 16; i++) t[i] = (uint8_t)(b + (uint32_t)i); memcpy(d, t, 16); }
+static inline void ppu_vand(void* d, const void* a, const void* b)
+{ uint64_t x[2], y[2]; memcpy(x, a, 16); memcpy(y, b, 16); x[0] &= y[0]; x[1] &= y[1]; memcpy(d, x, 16); }
+static inline void ppu_vandc(void* d, const void* a, const void* b)
+{ uint64_t x[2], y[2]; memcpy(x, a, 16); memcpy(y, b, 16); x[0] &= ~y[0]; x[1] &= ~y[1]; memcpy(d, x, 16); }
+static inline void ppu_vor(void* d, const void* a, const void* b)
+{ uint64_t x[2], y[2]; memcpy(x, a, 16); memcpy(y, b, 16); x[0] |= y[0]; x[1] |= y[1]; memcpy(d, x, 16); }
+static inline void ppu_vxor(void* d, const void* a, const void* b)
+{ uint64_t x[2], y[2]; memcpy(x, a, 16); memcpy(y, b, 16); x[0] ^= y[0]; x[1] ^= y[1]; memcpy(d, x, 16); }
+static inline void ppu_vnor(void* d, const void* a, const void* b)
+{ uint64_t x[2], y[2]; memcpy(x, a, 16); memcpy(y, b, 16); x[0] = ~(x[0] | y[0]); x[1] = ~(x[1] | y[1]); memcpy(d, x, 16); }
+static inline void ppu_vsel(void* d, const void* a, const void* b, const void* c)
+{
+    uint64_t x[2], y[2], m[2]; memcpy(x, a, 16); memcpy(y, b, 16); memcpy(m, c, 16);
+    x[0] = (x[0] & ~m[0]) | (y[0] & m[0]); x[1] = (x[1] & ~m[1]) | (y[1] & m[1]); memcpy(d, x, 16);
 }
 static inline void ppu_vmrg(void* d, const void* a, const void* b, int esz, int high)
 {
@@ -498,6 +705,12 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
+/* Each lifted function starts with `uint8_t* const vm_base = ppu_vm_base_now();`:
+ * a local of the global's name, which the memory accessors (the inline ones
+ * of ppu_vm_fast.h, and the memcpy forms of lvx/stvx) then use. The global
+ * may be aliased by any guest store as far as the compiler can tell, so it
+ * was loaded again after each one; the local is loaded once. */
+static inline uint8_t* ppu_vm_base_now(void) { return vm_base; }
 
 /* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
@@ -677,6 +890,7 @@ class LiftedFunction:
     body_lines: list[str] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)  # addresses of bl targets
     fallthrough_to: int = 0  # if it falls off the end, the continuation address
+    nv: object = None  # ppu_nv_dirty's liveness summary (--nonvolatile-locals)
 
 
 # Max span (bytes) for a mid-function tail-entry / gap wrapper. A real interior
@@ -823,6 +1037,8 @@ class PPULifter:
         if nid is not None:
             func.body_lines.append(
                 f"    ps3_hle_call(0x{nid:08X}u, ctx); return;  /* import stub */")
+            if self.nonvolatile_locals:
+                self._nv_summary_only(func)
             self.functions.append(func)
             return func
 
@@ -1143,7 +1359,39 @@ class PPULifter:
             return line
         return line[:j + 1] + " { " + rest.strip() + " }"
 
+    @staticmethod
+    def _nv_all_kinds() -> bool:
+        return set(os.environ.get("PPU_NV_KINDS", "gpr,vgpr,fpr,vfpr,vr,spr").split(",")) >= {
+            "gpr", "vgpr", "fpr", "vfpr", "vr", "spr"}
+
+    def _nv_live(self) -> bool:
+        """Are the write-backs of the scratch registers left to liveness
+        (ppu_nv_dirty's second part)? Only where every one of them is a
+        local: PPU_NV_KINDS at its default."""
+        return (os.environ.get("PPU_NV_DIRTY", "1") != "0"
+                and os.environ.get("PPU_NV_LIVE", "1") != "0" and self._nv_all_kinds())
+
+    def _nv_summary_only(self, func) -> None:
+        """A body that names no register still transfers: summarise it."""
+        if self._nv_live():
+            import ppu_nv_dirty
+            _, func.nv = ppu_nv_dirty.rewrite_function(func.body_lines, func.start_addr, live=True)
+
     def _nonvolatile_locals_pass(self, func) -> None:
+        # Write back only what changed, and only where it is read
+        # (ppu_nv_dirty.py). PPU_NV_DIRTY=0 keeps the write-everything form
+        # below, which is also what a function that cannot be followed gets;
+        # PPU_NV_LIVE=0 writes back everything that changed; PPU_NV_FLAGS=0
+        # keeps CR and XER whole; PPU_NV_VERIFY=1 turns what is dropped into
+        # comparisons and poison.
+        if os.environ.get("PPU_NV_DIRTY", "1") != "0" and self._nv_all_kinds():
+            import ppu_nv_dirty
+            new, func.nv = ppu_nv_dirty.rewrite_function(
+                func.body_lines, func.start_addr, verify=os.environ.get("PPU_NV_VERIFY") == "1",
+                stats=NV_DIRTY_STATS, live=self._nv_live())
+            if new is not None:
+                func.body_lines = new
+                return
         gprs, fprs, vrs, sprs = set(), set(), set(), set()
         # Kinds: gpr r14-r31, vgpr r0-r13, fpr f14-f31, vfpr f0-f13, vr
         # v20-v31, spr CR/XER/CTR. The volatile kinds are kept in locals too:
@@ -1165,6 +1413,7 @@ class PPULifter:
             if "spr" in kinds:
                 for _m in self._NV_SPR.finditer(_l): sprs.add(_m.group(1))
         if not (gprs or fprs or vrs or sprs):
+            self._nv_summary_only(func)
             return
         decls = []
         wb = []
@@ -1190,6 +1439,18 @@ class PPULifter:
         for n in sorted(vrs): rl.append(f"v{n} = ctx->vr[{n}];")
         for n in sorted(sprs): rl.append(f"{n} = ctx->{n};")
         rl_inline = (" " + " ".join(rl)) if rl else ""
+        # With some kinds of register left in the file (PPU_NV_KINDS) only
+        # the first part of ppu_nv_dirty applies, on this pass's own choice
+        # of locals.
+        if os.environ.get("PPU_NV_DIRTY", "1") != "0" and not self._nv_all_kinds():
+            import ppu_nv_dirty
+            new, _ = ppu_nv_dirty.rewrite(func.body_lines, func.start_addr, gprs, fprs, vrs, sprs,
+                                          decl_line, " ".join(rl),
+                                          verify=os.environ.get("PPU_NV_VERIFY") == "1",
+                                          stats=NV_DIRTY_STATS, live=False)
+            if new is not None:
+                func.body_lines = new
+                return
         def rewrite(line):
             if gprs: line = self._NV_GPR_ANY.sub(lambda m: f"r{m.group(1)}" if int(m.group(1)) in gprs else m.group(0), line)
             if fprs: line = self._NV_FPR_ANY.sub(lambda m: f"f{m.group(1)}" if int(m.group(1)) in fprs else m.group(0), line)
@@ -1599,7 +1860,7 @@ class PPULifter:
                     body = " ".join(
                         f"vm_write32(_ea + {4*(r-first)}, (uint32_t)ctx->gpr[{r}]);"
                         for r in range(first, 32))
-                return (f"{{ uint64_t _ea = ctx->gpr[{base}] + {disp}; {body} }}")
+                return (f"{{ uint64_t _ea = {_mem_base(base)} + {disp}; {body} }}")
             return f"/* {mn} unhandled operands: {insn.operands} */;"
 
         # ------- Stores -------
@@ -1649,7 +1910,7 @@ class PPULifter:
             rd_i = _reg_idx(ops[0])
             disp, base = _disp_base(ops[1])
             if disp is not None:
-                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32(ctx->gpr[{base}] + {disp});"
+                return f"ctx->gpr[{rd_i}] = (int64_t)(int32_t)vm_read32({_mem_base(base)} + {disp});"
 
         # ------- Indexed Stores -------
         idx_store_map = {
@@ -2022,10 +2283,10 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if mn in ("lfs", "lfsu"):
-                    line = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                    line = (f"{{ uint32_t tmp = vm_read32({_mem_base(base)} + {disp}); "
                             f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
-                    line = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
+                    line = (f"{{ uint64_t tmp = vm_read64({_mem_base(base)} + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
@@ -2042,10 +2303,10 @@ class PPULifter:
                 # idioms and any stored double). [ps3recomp fork JonathanDC64 eb5451b3]
                 if mn in ("stfs", "stfsu"):
                     line = (f"{{ float ftmp = (float)ctx->fpr[{frs}]; uint32_t tmp; "
-                            f"memcpy(&tmp, &ftmp, 4); vm_write32(ctx->gpr[{base}] + {disp}, tmp); }}")
+                            f"memcpy(&tmp, &ftmp, 4); vm_write32({_mem_base(base)} + {disp}, tmp); }}")
                 else:
                     line = (f"{{ uint64_t tmp; memcpy(&tmp, &ctx->fpr[{frs}], 8); "
-                            f"vm_write64(ctx->gpr[{base}] + {disp}, tmp); }}")
+                            f"vm_write64({_mem_base(base)} + {disp}, tmp); }}")
                 if mn.endswith("u"):
                     line += f" ctx->gpr[{base}] += {disp};"
                 return line
@@ -2587,27 +2848,24 @@ class PPULifter:
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
         # zero-fills the right; lvrx is the mirror (fills the right end). lvlxl
-        # is lvlx with a cache hint (same data). Byte-loop matches the raw-byte
-        # convention used by vperm/lvsl.
+        # is lvlx with a cache hint (same data). One byte shuffle each
+        # (ppu_lvlx, ppu_lvrx): spelled as a loop over the sixteen bytes with a
+        # test in it, a compiler made some 190 instructions and a dozen
+        # branches of every one, and Drakengard 3 has 11,800 of them -- most
+        # of what its collision tree walk compiled to.
         if mn == "lvlx" or mn == "lvlxl":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = (sh + (uint32_t)i < 16) ? m[sh + i] : 0; }}")
+                    f"ppu_lvlx(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
         if mn == "lvrx" or mn == "lvrxl":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t sh = (uint32_t)(ea & 0xF); "
-                    f"uint8_t* m = vm_base + (uint32_t)(ea & ~0xFULL); "
-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
-                    f"for (int i = 0; i < 16; i++) d[i] = ((uint32_t)i >= 16u - sh) ? m[i - (int)(16u - sh)] : 0; }}")
+                    f"ppu_lvrx(&ctx->vr[{vd}], vm_base + (uint32_t)(ea & ~0xFULL), (uint32_t)(ea & 0xF)); }}")
 
         # The store mirrors: stvlx writes the leftmost 16-(EA&15) bytes of vS
         # at EA (to the end of that quadword), stvrx the rightmost EA&15 bytes
@@ -2668,11 +2926,9 @@ class PPULifter:
             # lvsl: for byte offset b, generates {b, b+1, b+2, ..., b+15}
             # lvsr: generates {16-b, 17-b, ..., 31-b}
             if mn == "lvsl":
-                return (f"{{ uint8_t b = (uint8_t)(({_xea(ra,rb)}) & 0xF); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                return f"ppu_lvsl(&ctx->vr[{vd}], (uint32_t)(({_xea(ra,rb)}) & 0xF));"
             else:
-                return (f"{{ uint8_t b = (uint8_t)(16 - (({_xea(ra,rb)}) & 0xF)); "
-                        f"for (int i = 0; i < 16; i++) ((uint8_t*)&ctx->vr[{vd}])[i] = b + i; }}")
+                return f"ppu_lvsl(&ctx->vr[{vd}], 16u - (uint32_t)(({_xea(ra,rb)}) & 0xF));"
 
         # VMX permute (vperm) — critical for unaligned loads
         if mn == "vperm":
@@ -2693,19 +2949,16 @@ class PPULifter:
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
-            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
-                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
-                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
-                    f"d[0] = a[0] ^ b[0]; d[1] = a[1] ^ b[1]; }}")
+            if va == vb:
+                # the zeroing idiom: no read of the register it clears
+                return f"memset(&ctx->vr[{vd}], 0, 16);"
+            return f"ppu_vxor(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         if mn == "vor":
             vd = int(ops[0][1:])
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
-            return (f"{{ uint64_t* d = (uint64_t*)&ctx->vr[{vd}]; "
-                    f"uint64_t* a = (uint64_t*)&ctx->vr[{va}]; "
-                    f"uint64_t* b = (uint64_t*)&ctx->vr[{vb}]; "
-                    f"d[0] = a[0] | b[0]; d[1] = a[1] | b[1]; }}")
+            return f"ppu_vor(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         # VMX merge (vmrgh{b,h,w} / vmrgl{b,h,w}) -- interleave the HIGH (elements
         # 0..n/2-1) or LOW (n/2..n-1) half of vA and vB: vD = {a[k],b[k],a[k+1],
@@ -2761,11 +3014,7 @@ class PPULifter:
             va = int(ops[1][1:])
             vb = int(ops[2][1:])
             vc = int(ops[3][1:])
-            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
-                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
-                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
-                    f"uint64_t* c=(uint64_t*)&ctx->vr[{vc}]; "
-                    f"d[0]=(a[0]&~c[0])|(b[0]&c[0]); d[1]=(a[1]&~c[1])|(b[1]&c[1]); }}")
+            return f"ppu_vsel(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}], &ctx->vr[{vc}]);"
 
         # VMX compare (vcmpequw, vcmpeqfp, vcmpgefp, vcmpgtfp)
         # Float compares and vcmpequw. The dot forms set CR6 (8 = all lanes
@@ -2882,11 +3131,8 @@ class PPULifter:
 
         if mn == "vand":
             # Bitwise, so element order does not matter -- no swap needed.
-            ty, cnt, op = vmx_int_binop[mn]
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ {ty}* d=({ty}*)&ctx->vr[{vd}]; {ty}* a=({ty}*)&ctx->vr[{va}]; "
-                    f"{ty}* b=({ty}*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<{cnt};i++) d[i]=a[i]{op}b[i]; }}")
+            return f"ppu_vand(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         if mn in ("vaddubm", "vadduhm", "vadduwm", "vsububm", "vsubuhm", "vsubuwm"):
             # ARITHMETIC, unlike the bitwise ops above, cares about byte order:
@@ -2908,17 +3154,11 @@ class PPULifter:
 
         if mn == "vandc":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
-                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
-                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=a[0]&~b[0]; d[1]=a[1]&~b[1]; }}")
+            return f"ppu_vandc(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         if mn == "vnor":
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint64_t* d=(uint64_t*)&ctx->vr[{vd}]; "
-                    f"uint64_t* a=(uint64_t*)&ctx->vr[{va}]; "
-                    f"uint64_t* b=(uint64_t*)&ctx->vr[{vb}]; "
-                    f"d[0]=~(a[0]|b[0]); d[1]=~(a[1]|b[1]); }}")
+            return f"ppu_vnor(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         # Integer min/max
         for prefix in ("vmax", "vmin"):
@@ -2960,15 +3200,11 @@ class PPULifter:
             # (min=+FLT_MAX, max=-FLT_MAX), and the broadphase built pair
             # lists it then could not undo -- freeing stack memory into the
             # heap. VMX: a NaN operand gives that NaN, quieted (vA first); for
-            # equal operands max prefers +0 and min prefers -0.
+            # equal operands max prefers +0 and min prefers -0 (ppu_vmaxfp,
+            # ppu_vminfp: the lane loop, with its four signbit calls, came to
+            # 125 instructions a site with MSVC's library).
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            if mn == "vmaxfp":
-                pick = "(a[i]>b[i]) ? a[i] : (b[i]>a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i])"
-            else:
-                pick = "(a[i]<b[i]) ? a[i] : (b[i]<a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i])"
-            return (f"{{ float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[{va}],a); ppu_vldf4(&ctx->vr[{vb}],b); "
-                    f"for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ({pick}); "
-                    f"ppu_vstf4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_{mn}(&ctx->vr[{vd}], &ctx->vr[{va}], &ctx->vr[{vb}]);"
 
         # Splat immediate (vspltisb/h/w) — splat a 5-bit signed immediate
         if mn in ("vspltisb", "vspltish", "vspltisw"):
@@ -2977,7 +3213,7 @@ class PPULifter:
             # Sign extend 5-bit to appropriate type
             if simm > 15: simm -= 32
             if mn == "vspltisb":
-                return (f"{{ memset(&ctx->vr[{vd}], (uint8_t){simm}, 16); }}")
+                return f"memset(&ctx->vr[{vd}], (uint8_t){simm}, 16);"
             elif mn == "vspltish":
                 # store BE: swap bytes within each halfword lane
                 return (f"{{ uint8_t* p=(uint8_t*)&ctx->vr[{vd}]; uint16_t hv=(uint16_t)((int16_t){simm}); "
@@ -3052,17 +3288,7 @@ class PPULifter:
         if mn == "vctsxs" or mn == "vctuxs":
             vd, vb = int(ops[0][1:]), int(ops[1][1:])
             uimm = int(ops[2]) if len(ops) > 2 and not ops[2].startswith("v") else 0
-            dst_ty = "int32_t" if mn == "vctsxs" else "uint32_t"
-            scale = f" * {1 << uimm}.0f" if uimm > 0 else ""
-            if mn == "vctsxs":
-                sat = ("(v!=v) ? 0 : (v>=2147483647.0f) ? 2147483647 : "
-                       "(v<=-2147483648.0f) ? (-2147483647-1) : (int32_t)v")
-            else:
-                sat = ("(v!=v) ? 0u : (v>=4294967295.0f) ? 4294967295u : "
-                       "(v<=0.0f) ? 0u : (uint32_t)v")
-            return (f"{{ float b[4]; ppu_vldf4(&ctx->vr[{vb}],b); uint32_t d[4]; "
-                    f"for(int i=0;i<4;i++){{ float v=b[i]{scale}; d[i]=(uint32_t)({dst_ty})({sat}); }} "
-                    f"ppu_vstu4(&ctx->vr[{vd}],d); }}")
+            return f"ppu_{mn}(&ctx->vr[{vd}], &ctx->vr[{vb}], {1 << uimm}.0f);"
 
         # Compare with Rc (vcmpeqfp., vcmpgefp., etc.)
         if mn.startswith("vcmpbfp"):
@@ -3591,8 +3817,11 @@ class PPULifter:
         every chunk file (the helpers are `static inline`, so duplicating
         them across translation units is harmless and keeps each chunk
         self-contained)."""
+        # A verifying lift (PPU_NV_VERIFY=1) checks its access runs as well:
+        # ppu_vm_fast.h, which the header includes, reads PPU_RUN_VERIFY.
+        run_verify = "#define PPU_RUN_VERIFY 1\n" if os.environ.get("PPU_NV_VERIFY") == "1" else ""
         lines = [SOURCE_PREAMBLE.replace('#include "ppu_recomp.h"',
-                 f'#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
+                 f'{run_verify}#include "{getattr(self, "header_name", "ppu_recomp.h")}"')]
 
         # Emit helper macros
         lines.append("/* Rotate helpers */")
@@ -3734,6 +3963,97 @@ class PPULifter:
             return False
         return not (self.code_lo <= tgt < self.code_hi)
 
+    # The trampoline drain after a call, where the call cannot leave one.
+    #
+    # Every call is followed by DRAIN_TRAMPOLINE, because a callee may end in
+    # a tail jump: it sets g_trampoline_fn and returns, and its caller runs
+    # the target. The drain reads a thread-local after every call, which on
+    # Windows is three loads to reach the block and one for the pointer. But
+    # only lifted code sets the trampoline, and only in a tail jump or where
+    # a body runs off its end, so a function whose body does neither returns
+    # with it clear (its own calls drained theirs) and the drain after a
+    # direct call to it finds nothing: four fifths of the direct calls in a
+    # title. A --hook'ed function is native code that may call the lifted
+    # body, so calls to it keep the drain. ps3_indirect_call (runtime/ppu/
+    # ppu_loader.cpp) drains before it returns, on both its paths, so the one
+    # after it is always idle too.
+    # PPU_DRAIN_ELIDE=0 keeps every drain.
+    _RE_CALL_DRAIN = re.compile(
+        r"((?:(\w*func_[0-9A-Fa-f]{8})\(ctx\)|ps3_indirect_call\(ctx\));) DRAIN_TRAMPOLINE\(ctx\);")
+
+    def _drainless(self) -> set:
+        """Names of the functions that never return with the trampoline set."""
+        cached = getattr(self, "_drainless_cache", None)
+        if cached is None:
+            cached = set()
+            if os.environ.get("PPU_DRAIN_ELIDE", "1") != "0":
+                for f in self._emit_functions():
+                    if f.fallthrough_to or f.start_addr in self.hooks:
+                        continue
+                    if any("g_trampoline_fn" in l for l in f.body_lines):
+                        continue
+                    cached.add(f.name)
+            self._drainless_cache = cached
+            self._drain_elide = os.environ.get("PPU_DRAIN_ELIDE", "1") != "0"
+        return cached
+
+    def _nv_needs(self):
+        """(need, verify) for ppu_nv_dirty.expand, or None: the scratch
+        registers each transfer has to write back, from the whole program's
+        liveness. Solved once, when the first function is emitted."""
+        cached = getattr(self, "_nv_need_cache", 0)
+        if cached == 0:
+            cached = None
+            funcs = self._emit_functions()
+            if any(f.nv is not None for f in funcs):
+                import ppu_nv_dirty
+                t0 = time.time()
+                summ = {f.start_addr: (f.nv if f.nv is not None
+                                       else ppu_nv_dirty.summarize_plain(f.body_lines)) for f in funcs}
+                fall = {f.start_addr: f.fallthrough_to for f in funcs
+                        if f.fallthrough_to and f.fallthrough_to in summ}
+                entries = (getattr(self, "opd_entries", None)
+                           or getattr(self, "function_entries", None) or set(summ))
+                ends = {f.start_addr: f.end_addr for f in funcs}
+                if os.environ.get("PPU_NV_SUMM"):
+                    # the solver's input, for working on it without a lift
+                    import pickle
+                    with open(os.environ["PPU_NV_SUMM"], "wb") as _pf:
+                        pickle.dump((summ, set(entries), set(self.hooks), fall, ends), _pf)
+                log = {}
+                need = ppu_nv_dirty.solve(summ, entries, set(self.hooks), fall, ends, log)
+                self._nv_counts = [0, 0]
+                self._nv_summ = summ
+                # v20-v31 are re-read after a call only if some function that
+                # is called (not merely continued into: the tail of a function
+                # holds its restores without its saves) hands one back changed
+                # -- a restore routine.
+                # r14-r31 are re-read after a direct call to a function that
+                # hands some back changed (ppu_nv_dirty: "nvout").
+                self._nv_nvout = {a: v["nvout"] for a, v in summ.items() if v.get("nvout")}
+                _nb = sorted(a for a in self._nv_nvout if a in self.call_targets)
+                print(f"  r14-r31 handed back changed by {len(_nb)} called functions"
+                      f"{': ' + ', '.join('%08X' % a for a in _nb[:8]) if _nb else ''}", flush=True)
+                _called = set(self.call_targets) | set(entries)
+                _vc = [a for a, v in summ.items() if v.get("vclob") and a in _called]
+                self._nv_vr_reload = bool(_vc)
+                print(f"  v20-v31 after a call: {'re-read' if _vc else 'kept'} "
+                      f"({len(_vc)} functions assign one they do not save"
+                      f"{': ' + ', '.join('%08X' % a for a in _vc[:6]) if _vc else ''})", flush=True)
+                cached = (need, os.environ.get("PPU_NV_VERIFY") == "1")
+                plain = sum(1 for v in summ.values() if v.get("plain"))
+                print(f"  register liveness: {len(summ)} functions ({plain} unfollowed), "
+                      f"{log['rounds']} rounds, {time.time() - t0:.1f} s", flush=True)
+                print(f"      an indirect call's target is taken to read {ppu_nv_dirty.names(log['any_in'])}", flush=True)
+                for _r, _fs in sorted(log["why_any"].items()):
+                    print(f"          {_r}: read before written by {len(_fs)} such functions "
+                          f"({', '.join('%08X' % _a for _a in _fs[:4])})", flush=True)
+                print(f"      and its caller to read afterwards    {ppu_nv_dirty.names(log['ind_out'])}", flush=True)
+                for _r, _fs in sorted(log["why_out"].items()):
+                    print(f"          {_r}: at {len(_fs)} calls ({', '.join('%08X' % _a for _a in _fs[:4])})", flush=True)
+            self._nv_need_cache = cached
+        return cached
+
     def _function_def_lines(self, func, func_by_addr, sorted_addrs,
                             addr_index) -> list[str]:
         """C lines for one lifted function (body + fallthrough trampoline)."""
@@ -3743,7 +4063,24 @@ class PPULifter:
             lines.append(f"/* {label} */")
         hooked = "_lifted" if func.start_addr in self.hooks else ""
         lines.append(f"void {func.name}{hooked}(ppu_context* ctx) {{")
+        # The base of guest memory in a local (see the prelude). PPU_VM_BASE_LOCAL=0: not.
+        if os.environ.get("PPU_VM_BASE_LOCAL", "1") != "0" and any(
+                "vm_" in l or "PPU_F" in l or "PPU_R" in l for l in func.body_lines):
+            lines.append("        uint8_t* const vm_base = ppu_vm_base_now();")
+        drainless = self._drainless()
+        elide = self._drain_elide
+        nv = self._nv_needs()
+        if nv is not None:
+            import ppu_nv_dirty
         for bline in func.body_lines:
+            if nv is not None and "/*@NV" in bline:
+                bline = ppu_nv_dirty.expand(bline, self._nv_summ[func.start_addr],
+                                            nv[0][func.start_addr], nv[1], self._nv_counts,
+                                            self._nv_vr_reload, self._nv_nvout)
+            if elide and "DRAIN_TRAMPOLINE" in bline:
+                bline = self._RE_CALL_DRAIN.sub(
+                    lambda m: m.group(1) if (m.group(2) is None or m.group(2) in drainless)
+                    else m.group(0), bline)
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
         # If a function doesn't end with blr/b/bctr (a return or unconditional
@@ -4319,6 +4656,25 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
 # ---------------------------------------------------------------------------
 
 _WORKER_STATE: dict = {}
+# What ppu_nv_dirty did in this process (functions rewritten or left alone,
+# write-backs kept of how many); the workers hand theirs to the parent.
+NV_DIRTY_STATS: dict = {}
+
+
+def _nv_stats_take() -> dict:
+    out = dict(NV_DIRTY_STATS)
+    NV_DIRTY_STATS.clear()
+    return out
+
+
+def _nv_stats_add(st: dict) -> None:
+    for k, v in st.items():
+        if isinstance(v, dict):
+            d = NV_DIRTY_STATS.setdefault(k, {})
+            for kk, vv in v.items():
+                d[kk] = d.get(kk, 0) + vv
+        else:
+            NV_DIRTY_STATS[k] = NV_DIRTY_STATS.get(k, 0) + v
 
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
@@ -4365,8 +4721,8 @@ def _worker_lift(task):
         insns = disassemble_bytes(blob, start, _WORKER_STATE["be"]) if blob else []
         f = lifter.lift_function(insns, start, end)
         results.append((f.name, f.start_addr, f.end_addr, f.body_lines, f.calls,
-                        f.fallthrough_to))
-    return idx0, results, lifter.call_targets, lifter.branch_targets
+                        f.fallthrough_to, f.nv))
+    return idx0, results, lifter.call_targets, lifter.branch_targets, _nv_stats_take()
 
 
 def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
@@ -4392,7 +4748,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              getattr(lifter, "toc_base", 0),
                              getattr(lifter, "nonvolatile_locals", False)))
     try:
-        for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
+        for idx0, results, ct, bt, nvst in pool.imap_unordered(_worker_lift, tasks):
+            _nv_stats_add(nvst)
             results_by_idx[idx0] = results
             lifter.call_targets |= ct
             lifter.branch_targets |= bt
@@ -4409,10 +4766,10 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
         raise
 
     for idx0 in sorted(results_by_idx):
-        for name, s, e, body, calls, ft in results_by_idx[idx0]:
+        for name, s, e, body, calls, ft, nv in results_by_idx[idx0]:
             lifter.functions.append(LiftedFunction(
                 name=name, start_addr=s, end_addr=e,
-                body_lines=body, calls=calls, fallthrough_to=ft))
+                body_lines=body, calls=calls, fallthrough_to=ft, nv=nv))
 
 
 def main() -> None:
@@ -4513,10 +4870,13 @@ def main() -> None:
             seg_blobs = [(base_addr, file_data)]
 
     # Get function boundaries
+    _opd_entries = set()
     if args.functions:
         with open(args.functions) as f:
             func_list = json.load(f)
         func_bounds = [(int(str(e["start"]), 0), int(str(e["end"]), 0)) for e in func_list]
+        # The functions with a descriptor: what a guest function pointer can name.
+        _opd_entries = {int(str(e["start"]), 0) for e in func_list if e.get("opd")}
     else:
         detected = detect_functions(all_insns)
         func_bounds = [(f["start"], f["end"]) for f in detected]
@@ -4914,6 +5274,7 @@ def main() -> None:
     lifter.nonvolatile_locals = args.nonvolatile_locals
     lifter.hooks = {int(h, 0) for h in args.hook}
     lifter.function_entries = _func_entries
+    lifter.opd_entries = _opd_entries
     lifter.jump_tables = jt_dispatchers
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
@@ -4995,6 +5356,29 @@ def main() -> None:
         print(f"Wrote {len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
     print(f"  {len(lifter.functions)} functions lifted")
+    if NV_DIRTY_STATS:
+        _st = NV_DIRTY_STATS
+        print(f"  register write-backs: {_st.get('done', 0)} functions write back what changed "
+              f"({_st.get('stores', 0)} stores at {_st.get('points', 0)} transfers, "
+              f"{_st.get('stores_all', 0)} before); {_st.get('bail', 0)} keep the full form")
+        for _why, _n in sorted(_st.get("why", {}).items(), key=lambda kv: -kv[1]):
+            print(f"      {_n:6d}  {_why}")
+        if _st.get("frame_entry"):
+            print(f"      {_st['frame_entry']} functions test their entry's frame accesses at once")
+        if _st.get("runs"):
+            print(f"      {_st.get('run_acc', 0)} loads and stores in {_st['runs']} runs off one register, "
+                  f"a page test each run")
+        if _st.get("whole_flags"):
+            print(f"      {_st['whole_flags']} functions keep CR and XER whole")
+        if getattr(lifter, "_nv_counts", None):
+            print(f"      of the scratch registers' write-backs {lifter._nv_counts[1]} are live "
+                  f"(of {lifter._nv_counts[0]})")
+        if _st.get("ctx"):
+            _cp = os.path.join(args.output, "nv_contexts.txt")
+            with open(_cp, "w", encoding="utf-8", newline="\n") as _cf:
+                for _k, _n in sorted(_st["ctx"].items(), key=lambda kv: (kv[0][0], -kv[1])):
+                    _cf.write(f"{_n:9d}  {_k}\n")
+            print(f"  register mentions by context -> {_cp}")
     print(f"  {len(lifter.call_targets)} unique call targets")
 
 
