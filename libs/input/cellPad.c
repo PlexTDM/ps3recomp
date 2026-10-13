@@ -755,6 +755,24 @@ static void pad_poll_backend(void)
      * every port. cellPadGetData hands each one out exactly once. */
     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) s_data_fresh[_i] = 1;
 
+    /* PAD_NO_HOST=1: no controller and no key of the host's reaches the
+     * title, and port 0 is a pad nobody touches.
+     * For a run driven by PAD_FILE or PAD_SCRIPT: the controllers are read
+     * whether or not the title's window is in front, so one lying on the
+     * desk (a drifting stick, a bump) or in someone's hands for another
+     * game steers a run that was meant to be hands-off. */
+    { static int no_host = -1;
+      if (no_host < 0) no_host = getenv("PAD_NO_HOST") ? 1 : 0;
+      if (no_host) {
+          PadHostState* hs = &s_host_state[0];
+          hs->buttons = 0;
+          hs->analog_lx = hs->analog_ly = 128;
+          hs->analog_rx = hs->analog_ry = 128;
+          hs->trigger_l2 = hs->trigger_r2 = 0;
+          hs->connected = 1;
+          return;
+      } }
+
 #if PAD_BACKEND_XINPUT
     pad_poll_xinput();
 #elif PAD_BACKEND_SDL2
