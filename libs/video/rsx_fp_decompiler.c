@@ -936,13 +936,17 @@ static int rsx_fp_decompile_internal(
                                  "      /* exec_if=none: write suppressed */\n");
                     } else {
                         /* Per-component select gated by the CC sign test.
-                         * lerp(dst, _v, mask) == mask ? _v : dst since the
-                         * mask is exactly 0.0/1.0 from the bool->float cast. */
+                         * A real select, not lerp(dst, _v, mask): lerp is
+                         * arithmetic (dst + mask * (_v - dst)), so an Inf or
+                         * NaN in the unselected operand poisons the result
+                         * (0 * Inf = NaN), and a register holding raw bits
+                         * (a packed word) loses its denormal and NaN
+                         * patterns on the way through the ALU. */
                         snprintf(buf, sizeof(buf),
                                  "      float4 _p = (float4)((cc%u).%s %s (float4)0.0);\n"
-                                 "      %s[%u].%s = lerp(%s[%u].%s, _v.%s, _p.%s);\n",
+                                 "      %s[%u].%s = (_p.%s != 0.0) ? _v.%s : %s[%u].%s;\n",
                                  cc_read, cswz, cmp_op,
-                                 reg, dst_idx, m, reg, dst_idx, m, m, m);
+                                 reg, dst_idx, m, m, m, reg, dst_idx, m);
                     }
                     out_puts(&o, buf);
                 }
