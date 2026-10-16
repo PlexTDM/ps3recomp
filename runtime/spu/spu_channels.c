@@ -336,11 +336,33 @@ typedef struct spu_mfc_slot {
 static spu_mfc_slot* s_mfc_slots;
 static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
 
+/* The engine this thread looked up last. Every DMA of a run asks for the
+ * engine of the one context that runs it, and the registry's read lock on
+ * each ask is two interlocked operations on one line all SPU threads share.
+ * The answer stays good while no node has been freed since it was taken:
+ * s_mfc_gen counts the frees (under the writer lock), and a node lives
+ * until its owner releases it, which only happens once the owner has
+ * stopped using the context. A context at a freed one's address -- a
+ * stack context in the next job -- finds the count moved and looks up
+ * again. SPU_MFC_TLS=0 asks the registry every time. */
+static volatile uint32_t s_mfc_gen;
+static SPU_TLS spu_context* t_mfc_ctx;
+static SPU_TLS mfc_engine*  t_mfc_engine;
+static SPU_TLS uint32_t     t_mfc_gen;
+static int s_mfc_tls = -1;
+
 static mfc_engine* mfc_for(spu_context* ctx)
 {
+    if (__builtin_expect(s_mfc_tls < 0, 0)) {
+        const char* e = getenv("SPU_MFC_TLS");
+        s_mfc_tls = !(e && e[0] == '0');
+    }
+    if (t_mfc_ctx == ctx && t_mfc_gen == __atomic_load_n(&s_mfc_gen, __ATOMIC_ACQUIRE) && s_mfc_tls)
+        return t_mfc_engine;
     AcquireSRWLockShared(&s_mfc_claim_lock);
     for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         if (slot->ctx == ctx) {
+            t_mfc_ctx = ctx; t_mfc_engine = &slot->mfc; t_mfc_gen = s_mfc_gen;
             ReleaseSRWLockShared(&s_mfc_claim_lock);
             return &slot->mfc;
         }
@@ -366,6 +388,7 @@ static mfc_engine* mfc_for(spu_context* ctx)
     mfc_engine_init(&slot->mfc);
     slot->next = s_mfc_slots;
     s_mfc_slots = slot;
+    t_mfc_ctx = ctx; t_mfc_engine = &slot->mfc; t_mfc_gen = s_mfc_gen;
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
     return &slot->mfc;
 }
@@ -378,6 +401,7 @@ void spu_mfc_release(spu_context* ctx)
         if ((*link)->ctx != ctx) continue;
         spu_mfc_slot* slot = *link;
         *link = slot->next;
+        __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);   /* before the node goes */
         free(slot);
         break;
     }
@@ -394,6 +418,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
         uintptr_t owner = (uintptr_t)slot->ctx;
         if (owner >= lo && owner < hi) {
             *link = slot->next;
+            __atomic_add_fetch(&s_mfc_gen, 1, __ATOMIC_RELEASE);
             free(slot);
         } else {
             link = &slot->next;
