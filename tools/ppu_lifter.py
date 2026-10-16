@@ -1294,6 +1294,9 @@ class PPULifter:
         # XER[SO] provably 0 for the whole binary (main(): _so_never_set): the
         # CR updates leave its copy out (_translate).
         self.so_zero = False
+        # No mtvscr in the binary: VSCR[NJ] keeps its initial 0, and the VMX
+        # float helpers that read it are handed the constant (_vmx_helper).
+        self.vscr_const = False
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -1896,11 +1899,12 @@ class PPULifter:
             return f"{fn}({D}, {B}, {lo});"
         if form == "ab":   return f"{fn}({D}, {A}, {B});"
         if form == "abS":  return f"{fn}({D}, {A}, {B}, &ctx->vscr);"
-        if form == "abF":  return f"{fn}({D}, {A}, {B}, ctx->vscr);"
+        vscr = "0u" if self.vscr_const else "ctx->vscr"
+        if form == "abF":  return f"{fn}({D}, {A}, {B}, {vscr});"
         if form == "abc":  return f"{fn}({D}, {A}, {B}, {C});"
         if form == "abcS": return f"{fn}({D}, {A}, {B}, {C}, &ctx->vscr);"
-        if form == "abcF": return f"{fn}({D}, {A}, {B}, {C}, ctx->vscr);"
-        if form == "bF":   return f"{fn}({D}, {B}, ctx->vscr);"
+        if form == "abcF": return f"{fn}({D}, {A}, {B}, {C}, {vscr});"
+        if form == "bF":   return f"{fn}({D}, {B}, {vscr});"
         if form == "u":    return f"{fn}({D}, {B}, {va});"
         if form == "uS":   return f"{fn}({D}, {B}, {va}, &ctx->vscr);"
         if form == "cmp":
@@ -5379,11 +5383,28 @@ def _so_never_set(segs, big_endian, lo, hi):
     return True
 
 
+def _mtvscr_absent(segs, big_endian, lo, hi):
+    """True when no word in [lo, hi) is mtvscr (opcode 4, XO 0x644): nothing
+    then writes VSCR's NJ bit, so it keeps its initial 0 for the whole run."""
+    import struct as _st
+    fmt = ">I" if big_endian else "<I"
+    for va, d in segs:
+        a = max(va, lo)
+        e = min(va + len(d), hi)
+        a += (-(a - va)) % 4
+        for off in range(a - va, e - va - 3, 4):
+            w = _st.unpack_from(fmt, d, off)[0]
+            if w >> 26 == 4 and (w & 0x7FF) == 0x644:
+                return False
+    return True
+
+
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, nonvolatile_locals=False, so_zero=False):
+                 toc_base=0, nonvolatile_locals=False, so_zero=False, vscr_const=False):
     _WORKER_STATE["nonvolatile_locals"] = nonvolatile_locals
     _WORKER_STATE["so_zero"] = so_zero
+    _WORKER_STATE["vscr_const"] = vscr_const
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -5415,6 +5436,7 @@ def _worker_lift(task):
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.nonvolatile_locals = _WORKER_STATE.get("nonvolatile_locals", False)
     lifter.so_zero = _WORKER_STATE.get("so_zero", False)
+    lifter.vscr_const = _WORKER_STATE.get("vscr_const", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -5451,7 +5473,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
                              getattr(lifter, "nonvolatile_locals", False),
-                             getattr(lifter, "so_zero", False)))
+                             getattr(lifter, "so_zero", False),
+                             getattr(lifter, "vscr_const", False)))
     try:
         for idx0, results, ct, bt, nvst in pool.imap_unordered(_worker_lift, tasks):
             _nv_stats_add(nvst)
@@ -6014,6 +6037,13 @@ def main() -> None:
         if lifter.so_zero:
             print("  XER[SO]: no OE-form instruction or mtxer in the code, so SO stays 0: "
                   "CR updates leave its copy out (PPU_SO_EXACT=1 keeps it)")
+    if func_bounds and os.environ.get("PPU_VSCR_EXACT", "0") != "1":
+        _so_lo = min(st for st, _ in func_bounds)
+        _so_hi = lifter.code_hi if lifter.code_hi is not None else max(en for _, en in func_bounds)
+        lifter.vscr_const = _mtvscr_absent(seg_blobs, big_endian, _so_lo, _so_hi)
+        if lifter.vscr_const:
+            print("  VSCR: no mtvscr in the code, so NJ stays 0: the VMX float helpers "
+                  "are handed it as a constant (PPU_VSCR_EXACT=1 reads it)")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
