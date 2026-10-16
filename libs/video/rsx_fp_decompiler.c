@@ -842,6 +842,15 @@ static int rsx_fp_decompile_internal(
             out_puts(&o, "    /* TODO: unhandled FP opcode ");
             out_puts(&o, rsx_fp_opcode_name(opcode));
             out_puts(&o, " */\n");
+            /* The program goes on without it, so its output is wrong where
+             * it matters: name each skipped opcode once. */
+            { static volatile unsigned long long s_seen[2];
+              const unsigned long long bit = 1ull << (opcode & 63u);
+              if (!(s_seen[(opcode >> 6) & 1u] & bit)) {
+                  s_seen[(opcode >> 6) & 1u] |= bit;
+                  fprintf(stderr, "[fp decompiler] unhandled opcode 0x%02X (%s): skipped\n",
+                          opcode, rsx_fp_opcode_name(opcode));
+              } }
             handled = 0;
             break;
         }
