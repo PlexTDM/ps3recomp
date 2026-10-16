@@ -3361,19 +3361,24 @@ class PPULifter:
         # lvxl/stvxl are lvx/stvx plus a cache least-recently-used hint; the
         # architectural effect is identical, and leaving them undecoded emitted a
         # silent no-op `.word` (4 sites in the Rubber Ducky demo's VMX memcpy).
+        # One 16-byte copy each way: the quadword is aligned, and an aligned
+        # 16-byte access is a single one on x86 with AVX and on ARMv8.4+, as
+        # vm_raw_ld16/st16's two 8-byte halves are. ppu_nv_dirty.py reads these
+        # forms (a vector register written whole, or stored -- a prologue's
+        # save of v20-v31 is how a function is known not to clobber them).
         if mn in ("lvx", "lvxl"):
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_ld16(&ctx->vr[{vd}], ea); }}")
+                    f"memcpy(&ctx->vr[{vd}], vm_base + (uint32_t)ea, 16); }}")
 
         if mn in ("stvx", "stvxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
+                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
