@@ -351,14 +351,21 @@ class Regs:
 RE_F_FIELD_W = re.compile(r"ctx->cr\s*=\s*\(ctx->cr & ~\(0xFu\s*<<\s*(\d+)\)\)\s*\|\s*\((.+?)\s*<<\s*\1\);")
 RE_F_BIT_W = re.compile(r"ctx->cr = \(ctx->cr & ~\(1u << \(31 - (\d+)\)\)\) \| \((.+?) << \(31 - \1\)\);")
 RE_F_BIT_R = re.compile(r"\(ctx->cr >> \(31 - (\d+)\)\) & 1\b")
-RE_F_FIELD_R = re.compile(r"\(ctx->cr >> (\d+)\) & (0xF|\d+)\b")
+RE_F_FIELD_R = re.compile(r"\(ctx->cr >> (\d+)\) & (0xF|\d+)u?\b")
 RE_F_MFCR = re.compile(r"(ctx->gpr\[\d+\] = )ctx->cr;")
+RE_F_MFOCRF = re.compile(r"(ctx->gpr\[\d+\] = )ctx->cr & 0x([0-9A-Fa-f]{8})u;")
 RE_F_MTCRF = re.compile(r"ctx->cr = \(ctx->cr & 0x([0-9A-Fa-f]{8})u\) \| "
                         r"\(\(uint32_t\)(ctx->gpr\[\d+\]) & 0x([0-9A-Fa-f]{8})u\);")
 RE_F_MTCR = re.compile(r"ctx->cr = \(uint32_t\)(ctx->gpr\[\d+\]);")
 RE_F_LEFT = re.compile(r"ctx->cr\b")
 F_SC = ("ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u);", "ctx->crf[0] = (_sc ? 2u : 0u);")
 F_REC = ("ctx->cr = (ctx->cr & 0x0FFFFFFFu) | (_c << 28);", "ctx->crf[0] = _c;")
+# stwcx./stdcx. with XER[SO] in CR0, a vcmp record form's CR6, an FP record form's CR1
+F_SC_SO = ("ctx->cr = (ctx->cr & ~(0xFu << 28)) | (_sc ? (2u << 28) : 0u) | ((ctx->xer >> 31) << 28);",
+           "ctx->crf[0] = (_sc ? 2u : 0u) | ((ctx->xer >> 31) & 1u);")
+F_VREC = ("ctx->cr = (ctx->cr & ~0xF0u) | (_c6 << 4);", "ctx->crf[6] = _c6;")
+F_FREC = ("ctx->cr = (ctx->cr & ~0x0F000000u) | ((ctx->fpscr >> 4) & 0x0F000000u);",
+          "ctx->crf[1] = (ctx->fpscr >> 28) & 0xFu;")
 RE_X_CA_W = re.compile(r"ctx->xer = \(ctx->xer & ~\(1u << 29\)\) \| (.+?);")
 RE_X_CA_R = re.compile(r"\(ctx->xer >> 29\) & 1\b")
 RE_X_SRA = re.compile(r"(ppc_sra[wd]\()&ctx->xer\b")
@@ -378,6 +385,10 @@ def _field_w(m):
 def _field_r(m):
     sh = int(m.group(1))
     if sh % 4:
+        # one bit at any shift (the branch decode's `(ctx->cr >> 31-BI) & 1`):
+        # bit sh % 4 of the field that holds it
+        if m.group(2) == "1":
+            return "((ctx->crf[%d] >> %d) & 1)" % (7 - sh // 4, sh % 4)
         return m.group(0)
     return "(ctx->crf[%d] & %s)" % (7 - sh // 4, m.group(2))
 
@@ -408,6 +419,20 @@ def _mtcrf(m):
     return "{ " + " ".join(out) + " }"
 
 
+def _mfocrf(m):
+    """mfocrf: the fields FXM names, the rest 0."""
+    mask = int(m.group(2), 16)
+    parts = []
+    for n in range(8):
+        sh = 28 - 4 * n
+        nib = (mask >> sh) & 0xF
+        if nib == 0xF:
+            parts.append("(ctx->crf[%d] << %d)" % (n, sh) if sh else "ctx->crf[%d]" % n)
+        elif nib:
+            return m.group(0)
+    return m.group(1) + ("(" + " | ".join(parts) + ")" if parts else "0") + ";"
+
+
 def _mtcr(m):
     return "{ " + " ".join("ctx->crf[%d] = ((uint32_t)%s >> %d) & 0xFu;" % (n, m.group(1), 28 - 4 * n)
                            for n in range(8)) + " }"
@@ -419,12 +444,13 @@ def split_flags(lines):
     out = []
     for l in lines:
         if "ctx->cr" in l:
-            l = l.replace(*F_SC).replace(*F_REC)
+            l = l.replace(*F_SC_SO).replace(*F_SC).replace(*F_REC).replace(*F_VREC).replace(*F_FREC)
             l = RE_F_FIELD_W.sub(_field_w, l)
             l = RE_F_BIT_W.sub(_bit_w, l)
             l = RE_F_BIT_R.sub(_bit_r, l)
             l = RE_F_FIELD_R.sub(_field_r, l)
             l = RE_F_MFCR.sub(lambda m: m.group(1) + CR_PACK + ";", l)
+            l = RE_F_MFOCRF.sub(_mfocrf, l)
             l = RE_F_MTCRF.sub(_mtcrf, l)
             l = RE_F_MTCR.sub(_mtcr, l)
             if RE_F_LEFT.search(_mask(l)):
@@ -448,6 +474,17 @@ VR_HELPERS = {"ppu_vmaddfp", "ppu_vnmsubfp", "ppu_vaddfp", "ppu_vsubfp", "ppu_vm
 VR_LOADERS = {"ppu_vldu4", "ppu_vldf4"}
 # the first argument: all sixteen bytes (the lifter's memset of a register is always the whole of it)
 VR_WRITERS = VR_HELPERS | {"ppu_vstu4", "ppu_vstf4", "memset"}
+# runtime/ppu/ppu_vmx.h's helpers (vmx_vaddfp, vmx_vpkswss, ...): the same shape --
+# the result first, written whole from a temporary; the vector operands after it.
+VMX_PREFIX = "vmx_v"
+
+
+def _vr_helper(name):
+    return name in VR_HELPERS or (name is not None and name.startswith(VMX_PREFIX))
+
+
+def _vr_writer(name):
+    return name in VR_WRITERS or (name is not None and name.startswith(VMX_PREFIX))
 RE_CONST_CAST = re.compile(r"\(const [\w ]+\*\)\s*&$")
 RE_MEMBER = re.compile(r"(?:\.\w+|\[[^\]]*\])+")
 
@@ -497,7 +534,7 @@ def _vr_is_def(m, a, b, t):
     name, idx = _enclosing_call(m, a, t.start())
     if name in VR_LOADERS and idx == 0:
         return False
-    if name in VR_HELPERS and idx >= 1:
+    if _vr_helper(name) and idx >= 1:
         return False
     return True
 
@@ -545,7 +582,7 @@ def _scan(m, a, b, regs, simple):
             # written whole, and not read, as the result of a vector helper
             # or the destination of a memcpy (lvx)
             name, idx = _enclosing_call(m, a, t.start()) if d else (None, -1)
-            if simple and d and idx == 0 and name in VR_WRITERS and m[a:t.start()].rstrip().endswith("&"):
+            if simple and d and idx == 0 and _vr_writer(name) and m[a:t.start()].rstrip().endswith("&"):
                 must |= bit
             else:
                 use |= bit

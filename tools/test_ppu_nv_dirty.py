@@ -7,8 +7,8 @@ page test for a prologue's saves and for a run of accesses off one
 register. None of that may change what a function does. This test assembles
 a small PowerPC program that uses each of those -- a prologue and epilogue
 with a CR save, a loop on a compare, a carry chain, float and vector
-arithmetic, loads and stores off one register and off the stack, a direct
-and an indirect call -- lifts it three ways through the lifter's command
+arithmetic, a one-field CR read (mfocrf), loads and stores off one register
+and off the stack, a direct and an indirect call -- lifts it three ways through the lifter's command
 line:
 
   plain      without --nonvolatile-locals: every register in the context
@@ -77,6 +77,7 @@ def mr(ra, rs): return _x(rs, ra, rs, 444)                     # or ra,rs,rs
 def cmpw(bf, ra, rb): return (31 << 26) | (bf << 23) | (ra << 16) | (rb << 11)
 def cmpwi(bf, ra, imm): return (11 << 26) | (bf << 23) | (ra << 16) | (imm & 0xFFFF)
 def mfcr(rt): return _x(rt, 0, 0, 19)
+def mfocrf(rt, fxm): return (31 << 26) | (rt << 21) | (1 << 20) | (fxm << 12) | (19 << 1)
 def mtcrf(fxm, rs): return (31 << 26) | (rs << 21) | (fxm << 12) | (144 << 1)
 def mflr(rt): return 0x7C0802A6 | (rt << 21)
 def mtlr(rs): return 0x7C0803A6 | (rs << 21)
@@ -147,6 +148,7 @@ def _program():
         addi(30, 30, -1), cmpwi(0, 30, 0),
     ])
     pc = emit(pc, [bc(12, 0 * 4 + 1, pc, loop)])                          # bgt cr0
+    pc = emit(pc, [mfocrf(9, 0x20), add(29, 29, 9)])                      # one field: cr2
     after = pc + 4 * 14
     pc = emit(pc, [
         li(9, 48), lvx(1, 31, 9), li(9, 64), lvx(2, 31, 9), li(9, 99), lvlx(6, 31, 9),
