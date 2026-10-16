@@ -899,8 +899,14 @@ static void cellFsAioRead(ppu_context* ctx)
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
+/* For the runtime's C side (cellSysCacheMount): a guest path as the host path
+ * this layer opens. */
+extern "C" void (*g_ps3_fs_host_path)(char* out, size_t cap, const char* guest);
+static void ppu_fs_host_path(char* out, size_t cap, const char* guest) { host_path(out, cap, guest); }
+
 extern "C" void ppu_fs_register(void)
 {
+    g_ps3_fs_host_path = ppu_fs_host_path;
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
     /* Register by the literal import NID: LBP imports 0xB1840B53 for
      * cellFsSdataOpen, which ps3_compute_nid("cellFsSdataOpen") does NOT match

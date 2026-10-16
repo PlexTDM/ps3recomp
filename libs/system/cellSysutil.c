@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include "../../runtime/platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
  * addresses, not host pointers. */
@@ -395,6 +397,49 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
  * System cache
  * -----------------------------------------------------------------------*/
 
+/* Set by runtime/ppu/ppu_fs.cpp: a guest path as the host path the file layer
+ * opens for it. Without it (a build with no ppu_fs) the cache is not touched. */
+void (*g_ps3_fs_host_path)(char* out, size_t cap, const char* guest) = 0;
+
+/* Every file below host directory `dir`, deleted; the directories stay (the
+ * title's mkdir of them is then a no-op, as before). */
+static int syscache_empty(const char* dir, int depth)
+{
+    int n = 0;
+    if (depth > 8) return 0;
+    DIR* d = opendir(dir);
+    if (!d) return 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[1200];
+        if ((size_t)snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= sizeof p) continue;
+        struct stat st;
+        if (stat(p, &st) != 0) continue;
+        if (st.st_mode & S_IFDIR) n += syscache_empty(p, depth + 1);
+        else if (remove(p) == 0) n++;
+    }
+    closedir(d);
+    return n;
+}
+
+/* Empty the mounted cache on the host. Mount answers OK_CLEARED, which tells
+ * the title the system wiped the cache and it must start it anew -- and the
+ * files were left in place. A title then trusts whatever the last run left,
+ * and this port's runs end by the process going away, not through the
+ * title's shutdown: Drakengard 3's FIOS formats a disc-data cache in
+ * /dev_hdd1 once the free space it asks for is there, writes the index header
+ * last, and the next start found an index with no header and re-read it a
+ * sector at a time, reopening both files for each, for the rest of the run. */
+static void syscache_clear_host(const char* guest_dir)
+{
+    if (!g_ps3_fs_host_path || !guest_dir[0]) return;
+    char host[1100];
+    g_ps3_fs_host_path(host, sizeof host, guest_dir);
+    const int n = syscache_empty(host, 0);
+    if (n) printf("[cellSysutil] system cache %s: %d file(s) cleared\n", guest_dir, n);
+}
+
 s32 cellSysCacheMount(char* param)
 {
     /* The argument is a GUEST EA of CellSysCacheParam:
@@ -418,15 +463,16 @@ s32 cellSysCacheMount(char* param)
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
     vm_base[ea + 0x20 + n] = '\0';
     s_cache_mounted = 1;
+    syscache_clear_host(s_cache_path);
 
-    return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED */
+    return CELL_OK;   /* CELL_SYSCACHE_RET_OK_CLEARED, and it is */
 }
 
+/* Clears the mounted cache's contents; the cache stays mounted. */
 s32 cellSysCacheClear(void)
 {
     printf("[cellSysutil] SysCacheClear()\n");
-    s_cache_mounted = 0;
-    s_cache_path[0] = '\0';
+    if (s_cache_mounted) syscache_clear_host(s_cache_path);
     return CELL_OK;
 }
 
