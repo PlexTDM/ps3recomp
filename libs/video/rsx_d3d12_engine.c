@@ -73,7 +73,15 @@
 #define ENG_MAX_BLOBS     4096
 #define ENG_MAX_SAMPLERS  256
 #define ENG_MAX_BUFS      16384
-#define ENG_ALIGN         256u
+/* Where a reservation in the stage starts. Texture uploads are copied out of
+ * the stage with CopyTextureRegion, whose placed footprint has to start on
+ * D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT (512) -- constant buffers need only
+ * 256. A device that reports UnrestrictedBufferTextureCopyPitchSupported
+ * (Windows 11's runtime with a current driver) takes any offset, so 256 went
+ * unnoticed there; on Windows 10 the copy made the whole command list fail
+ * to close (E_INVALIDARG), and the engine stopped drawing for the rest of
+ * the session on the first loading screen. */
+#define ENG_ALIGN         512u
 #define ENG_STAGE_MAX     (384u << 20)
 #define ENG_STAGE_CHUNK   (16u << 20)
 #define ENG_FRAMES        4           /* allocator slots */
@@ -965,12 +973,39 @@ static int eng_stage_pick(u32 need)
     return empty;
 }
 
+/* Buffer <-> texture copies (CopyTextureRegion from a placed footprint)
+ * want the footprint's offset on D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+ * (512) and its row pitch on D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256),
+ * unless the device reports UnrestrictedBufferTextureCopyPitchSupported
+ * (D3D12_OPTIONS13: the runtimes of Agility SDK 1.602 on, which Windows
+ * 11's own is and Windows 10's is not). On a device without it a copy that
+ * breaks the rule makes its whole command list fail to close.
+ *
+ * RSX_D3D12_STRICT_COPY=1 holds a device that relaxes the rule to it all the
+ * same: a list with such a copy is failed as that runtime fails it, so that
+ * a machine with the relaxation can show what one without it does.
+ * RSX_D3D12_STAGE_ALIGN=<n> sets the stage's alignment (512; 256 was the
+ * old one, which broke the rule). */
+static u32 s_stage_align = ENG_ALIGN;
+static int s_copy_relaxed = 1, s_copy_strict_test, s_list_bad_copy;
+static u32 s_bad_copies;
+
+static void eng_check_copy(u64 offset, u32 row_pitch, const char* what)
+{
+    if (s_copy_relaxed && !s_copy_strict_test) return;
+    if (!(offset & 511u) && !(row_pitch & 255u)) return;
+    s_list_bad_copy = 1;
+    if (s_bad_copies++ < 8)
+        fprintf(stderr, "[rsx engine/d3d12] %s copy at offset %llu, row pitch %u: off the alignment this device requires\n",
+                what, (unsigned long long)offset, row_pitch);
+}
+
 static int eng_stage_reserve(u32 bytes, u32* out_off)
 {
     if (bytes > ENG_STAGE_MAX) return 0;
     for (int tries = 0; tries < 2; tries++) {
         EngStage* s = s_chain_n ? &s_stage[s_chain[s_chain_n - 1]] : NULL;
-        const u32 start = s ? (s->used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u) : 0;
+        const u32 start = s ? (s->used + s_stage_align - 1u) & ~(s_stage_align - 1u) : 0;
         if (s && (u64)start + bytes <= s->cap) {
             *out_off = s->base + start;
             s->used = start + bytes;
@@ -1504,6 +1539,19 @@ static int eng_init_device(u32 width, u32 height)
         RELEASE(factory); return -1;
     }
     if (getenv("D3D12_DBG") && FAILED(CALL(s_dev, QueryInterface, &IID_ID3D12InfoQueue, (void**)&s_infoq))) s_infoq = NULL;
+    {   /* D3D12_FEATURE_DATA_D3D12_OPTIONS13, spelt out for SDKs older than it */
+        struct { BOOL unrestricted_copy_pitch, unrestricted_vertex_alignment, flip_y, flip_z, copy_between_dimensions,
+                      alpha_blend_factor; } o13;
+        memset(&o13, 0, sizeof o13);
+        s_copy_relaxed = SUCCEEDED(CALL(s_dev, CheckFeatureSupport, (D3D12_FEATURE)42, &o13, sizeof o13)) && o13.unrestricted_copy_pitch;
+        const char* e = getenv("RSX_D3D12_STRICT_COPY");
+        s_copy_strict_test = e && e[0] == '1';
+        e = getenv("RSX_D3D12_STAGE_ALIGN");
+        if (e && atoi(e) >= 256 && !(atoi(e) & (atoi(e) - 1))) s_stage_align = (u32)atoi(e);
+        fprintf(stderr, "[rsx engine/d3d12] relaxed copy alignment: %s%s, stage alignment %u\n",
+                s_copy_relaxed ? "yes" : "no", s_copy_strict_test ? " (held to the strict rule: RSX_D3D12_STRICT_COPY)" : "",
+                s_stage_align);
+    }
     D3D12_COMMAND_QUEUE_DESC qd = {0}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     if (FAILED(CALL(s_dev, CreateCommandQueue, &qd, &IID_ID3D12CommandQueue, (void**)&s_queue))) { RELEASE(factory); return -1; }
 
@@ -2727,6 +2775,7 @@ static void eng_encode_upload(const EngRecord* r)
     src.PlacedFootprint.Footprint.Height = h;
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = r->up_pitch;
+    eng_check_copy(src.PlacedFootprint.Offset, r->up_pitch, "texture upload");
     CALL(s_list, CopyTextureRegion, &dst, 0, 0, 0, &src, NULL);
     s_gt_copies++;
 }
@@ -3577,6 +3626,8 @@ static void eng_submit_list(u64* out_fence)
         CALL(s_list, ResolveQueryData, s_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, s_slot * 2u, 2, s_tsread, (UINT64)s_slot * 16u);
     }
     HRESULT hr = CALL0(s_list, Close);
+    if (SUCCEEDED(hr) && s_list_bad_copy && s_copy_strict_test) hr = E_INVALIDARG;   /* as a runtime without the relaxation fails it */
+    s_list_bad_copy = 0;
     s_list_open = 0;
     if (FAILED(hr)) {
         fprintf(stderr, "[rsx engine/d3d12] command list Close failed: 0x%08lX (removed 0x%08lX)\n",
@@ -4080,6 +4131,7 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h, vo
     dst.PlacedFootprint.Footprint.Width = w; dst.PlacedFootprint.Footprint.Height = h;
     dst.PlacedFootprint.Footprint.Depth = 1; dst.PlacedFootprint.Footprint.RowPitch = pitch;
     D3D12_BOX box = { x, y, 0, x + w, y + h, 1 };
+    eng_check_copy(dst.PlacedFootprint.Offset, pitch, "readback");
     CALL(s_list, CopyTextureRegion, &dst, 0, 0, 0, &src, &box);
     CALL0(s_list, Close);
     ID3D12CommandList* lists[1] = { (ID3D12CommandList*)s_list };
