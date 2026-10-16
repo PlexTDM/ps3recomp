@@ -16,6 +16,8 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active = 0;
+/* the fork's runtime: no SPU has reserved a line */
+int g_spu_coh_armed;
 uint32_t g_ww_lo = 0, g_ww_hi = 0;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }

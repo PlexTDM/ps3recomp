@@ -24,6 +24,10 @@
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
+/* the fork's runtime: no SPU has reserved a line, no page is watched, all memory committed */
+int g_spu_coh_armed;
+void vm_watch_touch(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
+int vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
 uint32_t g_ww_lo, g_ww_hi;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }

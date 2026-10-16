@@ -7,6 +7,9 @@
 #include "win32_compat.h"
 extern "C" {
 uint8_t* vm_base;
+/* the fork's runtime: the inline accessors' page table, no SPU reservation */
+unsigned char g_ppu_vm_page[65536];
+int g_spu_coh_armed;
 // This loader fixture has no guest threads, SPUs, RSX, or diagnostic watchers.
 // Any attempt to use those subsystems is a test failure, not a success stub.
 uint32_t ppu_hle_inject_base=0x20000000;

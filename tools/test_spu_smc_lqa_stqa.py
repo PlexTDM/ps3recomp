@@ -55,6 +55,9 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t a, uint32_t b)
 { (void)ctx; (void)a; (void)b; return 0; }
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)   /* #266's rejoin check */
 { (void)ctx; (void)lsa; return NULL; }
+/* the fork's interpreter hand-off times itself */
+uint64_t g_spu_interp_steps;
+static uint64_t spu_host_ns(void) { return 0; }
 
 %s
 

@@ -24,6 +24,8 @@ with tempfile.TemporaryDirectory(prefix="spu-sdcrz-") as tmp:
                     "-I" + str(root / "runtime/platform"),
                     str(spu / "tests/test_spu_sdcrz.c"),
                     *[str(spu / name) for name in common],
-                    str(root / "runtime/platform/win32_compat.c"), "-lm",
+                    str(root / "runtime/platform/win32_compat.c"),
+                    str(root / "runtime/platform/env_cache.c"),
+                    str(root / "runtime/spu/tests/fork_runtime_standins.c"), "-lm",
                     "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True, timeout=10, env=env, cwd=tmp)

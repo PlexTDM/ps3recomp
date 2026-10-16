@@ -20,6 +20,11 @@ static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint
     dispatches++; dispatched_image = image; dispatched_size = size;
     dispatched_context = context; return 1;
 }
+/* The fork's exit path dispatches with the taskset and task id (for its
+ * serial tasksets); the same interception. */
+static int spu_workload_dispatch_task(const uint8_t* image, uint32_t size, uint32_t context,
+                                      uint32_t taskset_ea, uint32_t taskid)
+{ (void)taskset_ea; (void)taskid; return spu_workload_dispatch_async(image, size, context); }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;
 #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)

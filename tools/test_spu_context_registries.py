@@ -26,6 +26,11 @@ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
             command += [str(spu / c) for c in common if not
                         (name == 'test_spu_registry_allocation' and c == 'spu_coherency.c')]
             command += [str(root / 'runtime/platform/win32_compat.c'), '-pthread', '-lm']
+        # The fork's env cache and runtime stand-ins: the older programs define
+        # their own (1ee3bf1), the registry allocation test does not.
+        if name == 'test_spu_registry_allocation':
+            command += [str(root / 'runtime/platform/env_cache.c'),
+                        str(root / 'runtime/spu/tests/fork_runtime_standins.c')]
         subprocess.run(command + ['-o', str(binary)], check=True)
         if name == 'test_spu_registry_allocation':
             for mode, diagnostic in [('mfc', 'cannot allocate private MFC engine'),

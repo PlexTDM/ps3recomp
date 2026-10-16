@@ -27,6 +27,8 @@ s32 cellHttpResponseGetAllHeaders(CellHttpTransId, void*, u32*, void*, u32, u32*
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
+/* the fork's runtime: no SPU has reserved a line */
+int g_spu_coh_armed;
 uint32_t g_ww_lo, g_ww_hi;
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }

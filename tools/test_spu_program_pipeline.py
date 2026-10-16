@@ -68,7 +68,10 @@ class Pipeline(unittest.TestCase):
         workload = (runtime / 'spu_workload.c').read_text()
         workload = workload[workload.index('uint64_t spu_workload_fingerprint('):
                             workload.index('/* ---- dispatch')]
-        (self.root / 'workload.c').write_text('#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
+        # The fork's task statistics in that slice read a clock and the environment.
+        prelude = ('#define _POSIX_C_SOURCE 200809L\n#ifdef _WIN32\n#include <windows.h>\n#endif\n'
+                   '#include <stdlib.h>\n#include <time.h>\n')
+        (self.root / 'workload.c').write_text(prelude + '#include "spu_workload.h"\n#include <stdio.h>\n#include <string.h>\n' + workload)
         channels = (runtime / 'spu_channels.c').read_text()
         channels = channels[channels.index('typedef void (*spu_fn)'):
                             channels.index('/* Which image registered')]

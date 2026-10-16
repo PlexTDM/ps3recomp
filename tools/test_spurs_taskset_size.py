@@ -23,6 +23,10 @@ void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t ea) {(void)ea;}
 void ps3_ww_report_inline(uint32_t ea,uint64_t value,int width) {(void)ea;(void)value;(void)width;}
+/* the fork's runtime: no SPU has reserved a line; tasksets are not serialised */
+int g_spu_coh_armed;
+void spu_taskset_set_serial(uint32_t ea, int on) {(void)ea;(void)on;}
+void spu_taskset_set_contention(uint32_t ea, int n) {(void)ea;(void)n;}
 static _Alignas(128) uint8_t memory[0x10000];
 #define PTR(type, ea) ((type*)(uintptr_t)(ea))
 static void expect(int ok, const char* what) {
@@ -78,5 +82,6 @@ with tempfile.TemporaryDirectory(prefix='spurs-taskset-size-') as name:
     subprocess.run([os.environ.get('CC','cc'),'-std=gnu17','-O1','-UNDEBUG',
         '-ffunction-sections','-fdata-sections','-I'+str(ROOT),'-I'+str(ROOT/'include'),
         '-I'+str(ROOT/'runtime/spu'),str(fixture),str(ROOT/'libs/spurs/spurs_taskset.c'),
+        str(ROOT/'runtime/platform/env_cache.c'),
         *linker,'-pthread','-lm','-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True,timeout=10,cwd=tmp)

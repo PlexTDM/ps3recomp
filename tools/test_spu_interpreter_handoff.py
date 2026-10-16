@@ -20,7 +20,8 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
                     '-I'+str(root/'runtime/platform'),
                     str(spu/'tests/test_spu_interpreter_handoff.c'),
                     *[str(spu / name) for name in sources],
-                    str(root/'runtime/platform/win32_compat.c'), '-pthread', '-lm',
+                    str(root/'runtime/platform/win32_compat.c'), str(root/'runtime/platform/env_cache.c'),
+                    str(root/'runtime/spu/tests/fork_runtime_standins.c'), '-pthread', '-lm',
                     '-o', str(binary)], check=True)
     failed = []
     for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
