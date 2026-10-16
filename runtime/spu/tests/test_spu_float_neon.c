@@ -31,7 +31,7 @@ static uint32_t rnd_float(void)
 
 int main(void)
 {
-#if !defined(__ARM_NEON)
+#if !defined(__ARM_NEON) && !((defined(__x86_64__) || defined(_M_X64)) && defined(__SSE4_1__))
     puts("test_spu_float_neon: no NEON, nothing to compare");
     return 0;
 #else
