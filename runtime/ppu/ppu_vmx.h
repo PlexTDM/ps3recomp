@@ -299,7 +299,10 @@ VMX_INL void VMX_REF(vmx_vnmsubfp)(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { 
     for (int i = 0; i < 4; i++) {
         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
-        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(-fmaf(x, z, -y))), vscr)); } VMX_OUT; }
+        /* -(x*z - y), the difference rounded once and then negated: the sign
+         * flipped as bits, since GCC folds -fmaf(x, z, -y) into a negated
+         * multiply-add, which gives +0 where this is -0. */
+        vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, -y)) ^ 0x80000000u), vscr)); } VMX_OUT; }
 
 #define VMX_FUN(name, expr, flush_in, nanmode) \
 VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16]; \
