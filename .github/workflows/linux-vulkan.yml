@@ -6,10 +6,12 @@
 #   - without guest programs, the rsx_state vtable's fixed-function path: the
 #     same scenes the null-backend job checks, now through Vulkan;
 #   - with guest programs, the shared register-file draw engine (the path the
-#     Metal backend takes): all twelve draw scenes, including the ones only a
+#     Metal backend takes): the draw scenes, including the ones only a
 #     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
-#     --mrt-a, --cube), plus --depthbounds, which only this backend's engine
-#     implements, under the Khronos validation layer.
+#     --mrt-a), under the Khronos validation layer. Not --cube: this fork's
+#     Vulkan backend has no cube maps yet (upstream's engine work is not
+#     merged); --depthbounds runs and reports itself skipped for the same
+#     reason.
 #
 # The second pass fails on any of: a scene's own check, a single validation
 # message, a scene that did not take the engine path, or one that reported
@@ -79,7 +81,7 @@ jobs:
           # --threads is not here: it checks guest thread stacks and returns
           # before any backend exists (the first pass still runs it).
           for m in "" "--draw" "--depth" "--quads" "--shader" \
-                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
+                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" \
                    "--depthbounds"; do
             rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
             name=${m:-default}

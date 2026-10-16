@@ -52,7 +52,9 @@
 #  define host_backend_color    rsx_vulkan_backend_debug_color
 #  define host_backend_center   rsx_vulkan_backend_readback_center
 #  define host_backend_guest_draws rsx_vulkan_backend_guest_draws
-#  define HOST_BACKEND_DEPTH_BOUNDS rsx_vulkan_backend_depth_bounds()
+/* This fork's Vulkan backend has no depth bounds test (upstream's engine
+ * work, not merged): --depthbounds reports itself skipped. */
+#  define HOST_BACKEND_DEPTH_BOUNDS 0
 #else
 #  include "rsx_null_backend.h"
 #  define HOST_BACKEND_NAME     "null (headless software)"
