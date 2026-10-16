@@ -31,6 +31,7 @@ def extract(src, name):
 
 
 HARNESS = r'''
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -51,6 +52,15 @@ static HANDLE lwm_sem(uint32_t lwmutex) { s_asked = lwmutex; return nullptr; }
 static void ReleaseSemaphore(HANDLE, long, void*) {}
 static void Sleep(unsigned) {}
 static unsigned WaitForSingleObject(HANDLE, unsigned) { return 0; }
+/* The fork's lwmutex lock word and lwcond wake counters, which sys_lwcond_wait
+ * reaches only with a semaphore in hand (never here). */
+typedef unsigned DWORD;
+static DWORD lwm_lock_wait(uint32_t, HANDLE, DWORD) { return 0; }
+static void lwm_unlock_any(uint32_t, HANDLE) {}
+static std::atomic<uint32_t>* lwc_gen(uint32_t) { return nullptr; }
+static int lwc_sleep_mode(void) { return 1; }
+static uint32_t lwc_poll_us(void) { return 0; }
+static void lwc_wait(std::atomic<uint32_t>*, uint32_t, uint32_t) {}
 %s
 %s
 int main() {

@@ -28,6 +28,11 @@ int spu_coh_is_reserved(uint32_t ea) { (void)ea;return 0; }
 void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea,const void* c) { (void)ea;(void)c; }
 void spu_lockline_lock(void) {}
+/* the fork's runtime: SPU_DMA_RANGE off, all memory committed */
+uint32_t g_spu_dma_rng_lo, g_spu_dma_rng_hi;
+long g_spu_dma_rng_cap;
+void spu_dma_range_init(void) {}
+int vm_commit_reserved(void* p, uint64_t n) { (void)p; (void)n; return 1; }
 void spu_lockline_unlock(void) {}
 void spu_lockguard_check(spu_context* c,uint32_t ea,const uint8_t* p,uint32_t n,const char* what)
 { (void)c;(void)ea;(void)p;(void)n;(void)what; }
