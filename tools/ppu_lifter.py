@@ -1291,6 +1291,9 @@ class PPULifter:
             prefix += "_"
         self.prefix = prefix
         self.weak_emit = bool(weak_emit)
+        # XER[SO] provably 0 for the whole binary (main(): _so_never_set): the
+        # CR updates leave its copy out (_translate).
+        self.so_zero = False
         # Cache for _range_insns: (instructions, len, ordered, addrs). Keyed by
         # the instruction-list identity so the FULL list (mid-function / serial
         # lift) is sorted+indexed once, not rescanned per call.
@@ -1941,7 +1944,15 @@ class PPULifter:
         if (raw is not None and (raw >> 26) in (59, 63) and raw & 1
                 and code and not code.startswith("/*")):
             code += " ctx->cr = (ctx->cr & ~0x0F000000u) | ((ctx->fpscr >> 4) & 0x0F000000u);"
+        if self.so_zero and "ctx->xer >> 31" in code:
+            for so in self._SO_COPIES:
+                code = code.replace(so, "")
         return code
+
+    # The spellings of a copy of XER[SO] into CR (compares, record forms,
+    # stwcx./stdcx.), dropped when the binary never sets SO.
+    _SO_COPIES = (" | ((ctx->xer >> 31) & 1u)", "_c |= (uint32_t)((ctx->xer >> 31) & 1u); ",
+                  " | ((ctx->xer >> 31) << 28)")
 
     def _translate_op(self, insn: Instruction, func: LiftedFunction) -> str:
         """Translate one Instruction to a C statement string."""
@@ -5341,10 +5352,33 @@ def _nv_stats_add(st: dict) -> None:
             NV_DIRTY_STATS[k] = NV_DIRTY_STATS.get(k, 0) + v
 
 
+def _so_never_set(segs, big_endian, lo, hi):
+    """True when no word in [lo, hi) of the segments is an instruction that can
+    set XER[SO]: an XO-form arithmetic op with OE=1, or mtspr to XER (mtxer).
+    Data words in the window only make this say False more often."""
+    import struct as _st
+    oe_xo = {266, 10, 138, 234, 202, 489, 457, 491, 459, 233, 235, 104, 40, 8, 136, 232, 200}
+    fmt = ">I" if big_endian else "<I"
+    for va, d in segs:
+        a = max(va, lo)
+        e = min(va + len(d), hi)
+        a += (-(a - va)) % 4
+        for off in range(a - va, e - va - 3, 4):
+            w = _st.unpack_from(fmt, d, off)[0]
+            if w >> 26 != 31:
+                continue
+            if (w >> 10) & 1 and ((w >> 1) & 0x1FF) in oe_xo:
+                return False
+            if (w >> 1) & 0x3FF == 467 and (((w >> 16) & 31) | (((w >> 11) & 31) << 5)) == 1:
+                return False
+    return True
+
+
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, nonvolatile_locals=False):
+                 toc_base=0, nonvolatile_locals=False, so_zero=False):
     _WORKER_STATE["nonvolatile_locals"] = nonvolatile_locals
+    _WORKER_STATE["so_zero"] = so_zero
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -5375,6 +5409,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.nonvolatile_locals = _WORKER_STATE.get("nonvolatile_locals", False)
+    lifter.so_zero = _WORKER_STATE.get("so_zero", False)
     results = []
     for start, end in bounds:
         blob = b""
@@ -5410,7 +5445,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             getattr(lifter, "nonvolatile_locals", False)))
+                             getattr(lifter, "nonvolatile_locals", False),
+                             getattr(lifter, "so_zero", False)))
     try:
         for idx0, results, ct, bt, nvst in pool.imap_unordered(_worker_lift, tasks):
             _nv_stats_add(nvst)
@@ -5966,6 +6002,13 @@ def main() -> None:
     lifter.function_entries = _func_entries
     lifter.opd_entries = _opd_entries
     lifter.jump_tables = jt_dispatchers
+    if func_bounds and os.environ.get("PPU_SO_EXACT", "0") != "1":
+        _so_lo = min(st for st, _ in func_bounds)
+        _so_hi = lifter.code_hi if lifter.code_hi is not None else max(en for _, en in func_bounds)
+        lifter.so_zero = _so_never_set(seg_blobs, big_endian, _so_lo, _so_hi)
+        if lifter.so_zero:
+            print("  XER[SO]: no OE-form instruction or mtxer in the code, so SO stays 0: "
+                  "CR updates leave its copy out (PPU_SO_EXACT=1 keeps it)")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
