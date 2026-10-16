@@ -52,3 +52,54 @@ directory the guest filesystem should resolve against:
 
 Graphics come up on Direct3D 12 on Windows and Metal on macOS with no extra
 configuration; see [docs/BUILDING.md](../../docs/BUILDING.md#graphics-backends).
+
+## Automatically discover and register SPU ELF programs
+
+Supply the decrypted files your port uses when configuring the project. With
+`PORT_ENABLE_SPU=ON` (the default), `PORT_SPU_INPUTS` scans every supplied file
+for embedded ELF32 big-endian SPU programs, deduplicates exact images, lifts
+supported programs, and compiles their generated registration table:
+
+```bash
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp \
+    -DRECOMP_DIR=/path/to/my_game/recompiled \
+    '-DPORT_SPU_INPUTS=/path/to/EBOOT.ELF;/path/to/decrypted_module.elf'
+cmake --build build
+```
+
+Generation is fresh and lives in `build/generated_spu/`. Input or generator
+changes trigger reconfiguration. `inventory.json` records every occurrence,
+exact-image SHA256, runtime fingerprints, generated image IDs, per-program
+status, and tool/input/output provenance. Configure fails if a candidate is
+invalid or unsupported, so a partial registration table cannot silently pass.
+With no supplied inputs, the existing manually generated `SPU_DIR` workflow
+continues to work.
+
+This scans only supplied files. It does not decrypt, decompress, infer raw
+job-module boundaries, or promise that a generated program can run correctly.
+Automated lifting currently supports one executable PT_LOAD per ELF with
+nonoverlapping memory ranges across all PT_LOAD segments, including BSS tails.
+Overlapping loads are reported as unsupported because the loader can overwrite
+code that a segment-based lift would use. Executable
+sections bound code when present; stripped images use the executable segment
+and may need manual code/data boundaries. The workload registry distinguishes
+programs by fingerprint; standalone SPU thread selection still uses the
+runtime's existing entry-address logic.
+
+For discovery outside CMake, use the same builder directly:
+
+```bash
+python /path/to/ps3recomp/tools/build_spu_workloads.py \
+    --input /path/to/EBOOT.ELF --input /path/to/decrypted_module.elf \
+    --lifted /path/to/owned_spu_output \
+    --out /path/to/owned_spu_output/spu_workloads.c --constructor
+```
+
+The output directory must be empty or previously created by this command, and
+`--out` must be directly inside it. Every run replaces that generation as a
+unit, including after failure; failure retains diagnostics and omits buildable
+registration/source-list files. `--allow-partial` explicitly permits supported
+registrations while keeping `complete=false` in the report; the template always
+requires complete coverage. `--extra-funcs` accepts the discovered `spu_<sha256>`
+name for explicit entry overrides. The existing `--images` interface is still
+available for manually extracted programs.

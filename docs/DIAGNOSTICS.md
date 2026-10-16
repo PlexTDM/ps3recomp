@@ -1461,3 +1461,18 @@ not changed while a title runs.
 - **`YDKJ_TUNERFIX`** — YDKJ_TUNERFIX (at the top so it wins over any registered handler): the profiler-presence query sysPrxForUser 0xE0998DBF, called by libsre _cellSpursIsLaunchedFromTuner (0x3000D318), must return 0x8001112E ("profiler not loaded") on a normal run. Anything else trips the usertrace.c:123 assert AND makes the fn report "launched from tuner", so the caller runs tuner/trace setup that fails with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
   `runtime/ppu/ppu_hle.cpp:223`  _(+1 more sites)_
 
+
+## Parked DMA-list resume dumps
+
+The `RESUME-ELEMS` dump in `mfc_list_stall_ack` prints the first 16 resumes
+per header call site (translation unit), consistent with the adjacent bounded
+`RESUME` diagnostic. Its saturating interlocked counter shares that admission
+budget across host workers; it is not a process-wide budget across translation
+units. No logger configuration or DMA/tag behavior changes when the budget fills.
+Existing adjacent diagnostics keep their existing admission policies.
+
+Run `python tools/test_mfc_resume_elements.py` for actual parked-list tests:
+empty resumes, GET/PUT copies, repark followed by completion, and concurrent
+resume admission. `MFC_TEST_SANITIZE=1` additionally runs them with UBSan on a
+compiler that supports it. The concurrent check verifies this dump's bound;
+it does not assert that unrelated existing diagnostic counters are race-free.

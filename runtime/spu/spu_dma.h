@@ -16,6 +16,7 @@
 #define SPU_DMA_H
 
 #include "spu_context.h"
+#include "spu_coherency.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -180,6 +181,39 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
      * GET, release before a PUT pair with the PPU's fences. Free on x86. */
     if ((cmd & 0xF0u) == 0x40u) __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* GET*  */
     else                        __atomic_thread_fence(__ATOMIC_RELEASE);   /* PUT*  */
+    /* Upper16 command-channel bits carry replacement/transfer class IDs. */
+    if ((cmd & 0xFFFFu) == MFC_SDCRZ_CMD) {
+        /* CBEA 1.02 section 7.7.3: SDCRZ writes zeros in EA space, without an
+         * LSA operand. Storage-control alignment is implementation-specific
+         * (table 7-6); currently support whole 128-byte blocks, up to 16 KiB.
+         * Reject other forms visibly instead of applying ordinary LS DMA
+         * validation or claiming an unsupported command completed. */
+        if (!size || size > MFC_MAX_DMA_SIZE || (size & 127u) || (ea & 127u) ||
+            (ea >> 32) || !mfc_ea_range_committed(ea, size)) {
+            fprintf(stderr, "[mfc] REJECTED SDCRZ range: ea=0x%016llX size=%u\n",
+                    (unsigned long long)ea, size);
+            return -1;
+        }
+        /* Storage controls impose a barrier in their tag group. Ordinary
+         * transfers finish synchronously, but a stalled list does not. This
+         * engine cannot execute SDCRZ ahead of that still-pending transfer. */
+        if (spu->list_stall_mask & (1u << (spu->mfc_tag & 31u))) {
+            fprintf(stderr, "[mfc] REJECTED SDCRZ behind stalled tag %u\n",
+                    spu->mfc_tag & 31u);
+            return -1;
+        }
+        /* Serialize zeroing with reservation compare-and-commit. Notify each
+         * touched line even for a zero-to-zero write: byte comparisons alone
+         * cannot detect that a peer's reservation was lost. Issuer exclusion
+         * follows the existing plain-MFC-write model; issuer reservation
+         * behavior for storage controls is not separately modeled here. */
+        spu_lockline_lock();
+        memset(vm_base + (uint32_t)ea, 0, size);
+        for (uint32_t offset = 0; offset < size; offset += 128u)
+            spu_coh_notify_write_except((uint32_t)ea + offset, spu);
+        spu_lockline_unlock();
+        return 0;
+    }
     /* SPU_DMA_WATCH=<hex>: report any transfer whose destination RANGE covers
      * this guest address. A DMA landing in the loaded ELF image is always a
      * bug, and it is invisible to the sampling traces -- YDKJ had an SPU job
@@ -831,13 +865,26 @@ static inline int mfc_list_stall_ack(struct mfc_engine* mfc, spu_context* spu,
      * about to land. If the handler was supposed to fill in the claimed job's
      * EA and did not, the elements read back empty and the transfer is a no-op
      * -- which looks identical to "the pipeline never ran" from the PPU side. */
-    { uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
-      fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
-              spu->list_stall_dest_lsa[t], _e);
-      for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
-          fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
-                  spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
-      fprintf(stderr, "\n"); }
+    { /* First 16 dumps per header call site, shared safely by its workers.
+       * Saturate instead of wrapping the counter back into logging. */
+      static volatile LONG _n = 0;
+      LONG _seen = InterlockedCompareExchange(&_n, 0, 0);
+      int _emit = 0;
+      while (_seen < 16) {
+          LONG _previous = InterlockedCompareExchange(&_n, _seen + 1, _seen);
+          if (_previous == _seen) { _emit = 1; break; }
+          _seen = _previous;
+      }
+      if (_emit) {
+        uint32_t _e = spu->list_stall_elem_lsa[t] & SPU_LS_MASK;
+        fprintf(stderr, "[mfc-list] RESUME-ELEMS dest=0x%05X elems\n0x%05X:",
+                spu->list_stall_dest_lsa[t], _e);
+        for (uint32_t _o = 0; _o < 16 && (_e + _o) + 3 < SPU_LS_SIZE; _o += 4)
+            fprintf(stderr, " %02X%02X%02X%02X", spu->ls[_e+_o], spu->ls[_e+_o+1],
+                    spu->ls[_e+_o+2], spu->ls[_e+_o+3]);
+        fprintf(stderr, "\n");
+      }
+    }
     int rc = mfc_run_list(spu, spu->list_stall_elem_lsa[t], spu->list_stall_remaining[t],
                           spu->list_stall_dest_lsa[t], spu->list_stall_ea_base[t],
                           spu->list_stall_cmd[t], t);
@@ -1457,7 +1504,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
         /* Global count of loadCommands fetches: the per-run claim-vs-stage
          * summary in spurs_policy.c diffs this across a PM run to catch the
          * dispatch that CLAIMS a ticket but never stages its job. */
-        { extern volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
+        { extern SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets; g_wws_batch_gets++; }
         static int _n = 0;
         if (_n < 8 && ++_n) {
             const uint8_t* p = spu->ls + 0xC00;
@@ -1507,7 +1554,8 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
     /* Mark tag as completed -- EXCEPT a list parked at a stall-and-notify
      * element: its tag group stays incomplete until MFC_WrListStallAck resumes
      * it to the end (mfc_list_stall_ack marks completion then). */
-    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))))
+    if (!(spu->list_stall_mask & (1u << (tag & 0x1F))) &&
+        ((cmd & 0xFFFFu) != MFC_SDCRZ_CMD || rc == 0))
         mfc->tag_completed |= (1u << tag);
 
     return rc;

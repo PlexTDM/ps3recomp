@@ -170,6 +170,11 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
                         const u8* src, u32 w, u32 h,
                         const rsx_tex_layout* tl, int argb_as_rgba);
 
+/* Per-final-RGBA-lane gamma flags from TEXTURE_ADDRESS bits 20..23.
+ * Float/depth/non-gamma formats return zero; source signed flags take
+ * precedence after the existing crossbar. No texture bytes are converted. */
+u8 rsx_texture_gamma_mask(u32 format, u32 control1, u32 filter, u32 address);
+
 /* --- component remap (NV4097 TEXTURE_CONTROL1 crossbar) ------------------
  *
  * Each of the texture's four outputs is either a channel of the sampled

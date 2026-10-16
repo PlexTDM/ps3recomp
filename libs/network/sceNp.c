@@ -12,6 +12,7 @@
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "np_psnr.h"
 #include "../system/cellSysutil.h"
+#include "../filesystem/edat.h"
 
 
 /* ---------------------------------------------------------------------------
@@ -67,6 +68,9 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     s_np_initialized = 1;
     return CELL_OK;
 }
+
+/* Whether sceNpInit has run; sceNpBasic follows it (see sceNpBasic.c). */
+int np_is_initialized(void) { return s_np_initialized; }
 
 s32 sceNpTerm(void)
 {
@@ -307,4 +311,36 @@ s32 sceNpScoreTerm(void)
         return SCE_NP_ERROR_NOT_INITIALIZED;
     s_score_initialized = 0;
     return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * NPDRM
+ *
+ * On hardware sceNpDrmIsAvailable[2](klicensee, path) checks the licence for an
+ * NPDRM file and leaves the klicensee with the kernel, so later cellFsOpen calls
+ * on EDATs return plaintext. Free (license type 3) and disc-bound game data use a
+ * title-specific klicensee that only the game knows; record it for the EDAT
+ * reader (libs/filesystem/edat.c), which verifies it against each file's
+ * dev_hash before using it. The two calls differ only in licence-check details
+ * that do not apply here.
+ * -----------------------------------------------------------------------*/
+
+static s32 np_drm_is_available(const u8* k_licensee, const char* drm_path)
+{
+    const u8* k = GUEST_PTR(k_licensee, const u8*);
+    const char* path = GUEST_PTR(drm_path, const char*);
+    /* A NULL klicensee is legal for content that needs none; nothing to record. */
+    if (k) edat_add_klicensee(k);
+    fprintf(stderr, "[sceNp] DRM availability check: %s\n", path ? path : "(null)");
+    return CELL_OK;
+}
+
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path)
+{
+    return np_drm_is_available(k_licensee, drm_path);
+}
+
+s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path)
+{
+    return np_drm_is_available(k_licensee, drm_path);
 }

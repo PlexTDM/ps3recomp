@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include "../platform/win32_dirent.h"   /* <dirent.h>, or a Win32 stand-in */
 
@@ -38,6 +39,35 @@ extern "C" void ydkj_host_bt(const char* tag);
 #endif
 #ifndef O_BINARY
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
+#endif
+
+/* 64-bit file offsets and sizes. Windows is LLP64: `long` is 32 bits, so
+ * fseek(long)/ftell and `struct stat` (st_size is a 32-bit _off_t on MinGW, and
+ * stat() is stat64i32) cannot express a file past 2 GiB. Disc archives are
+ * routinely bigger: Lseek truncated the offset, Fstat's size came from ftell's
+ * overflow result and Stat's from the 32-bit wrapper, and what those return
+ * differs between CRTs: MinGW-w64's own stat() wrapper (msvcrt builds) fails
+ * with EOVERFLOW, UCRT's _stat64i32 (llvm-mingw) returns the size truncated, so
+ * the same title took different paths depending on the toolchain. POSIX LP64
+ * is unaffected. */
+#ifdef _WIN32
+#  define FS_SEEK64(f, o, w) _fseeki64((f), (int64_t)(o), (w))
+#  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
+typedef struct _stat64 fs_stat64_t;
+/* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
+static int FS_STAT64(const char* p, fs_stat64_t* s)
+{
+    char t[1100]; size_t n = strlen(p);
+    if (n >= sizeof t) return _stat64(p, s);
+    memcpy(t, p, n + 1);
+    while (n > 1 && (t[n - 1] == '/' || t[n - 1] == '\\') && t[n - 2] != ':') t[--n] = 0;
+    return _stat64(t, s);
+}
+#else
+#  define FS_SEEK64(f, o, w) fseeko((f), (off_t)(o), (w))
+#  define FS_TELL64(f)       ((int64_t)ftello(f))
+#  define FS_STAT64(p, s)    stat((p), (s))
+typedef struct stat fs_stat64_t;
 #endif
 
 extern "C" uint8_t* vm_base;
@@ -56,6 +86,7 @@ extern "C" const char* ppu_vfs_root = ".";
 #define CELL_FS_ENOENT       (-2147418106)   /* 0x80010006 -- was -2147418090, which is 0x80010016 = CELL_ENOTCONN, not ENOENT */
 #define CELL_FS_EISDIR       (-2147418094)   /* 0x80010012 */
 #define CELL_FS_EIO          (-2147418111)
+#define CELL_FS_ENOSYS       (-2147418109)   /* 0x80010003 */
 #define CELL_FS_S_IFDIR      0x4000u
 #define CELL_FS_S_IFREG      0x8000u
 #define CELL_FS_O_RDONLY     0
@@ -550,8 +581,8 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
-    fseek(g_files[fd], (long)off, worigin);
-    long p = ftell(g_files[fd]);
+    FS_SEEK64(g_files[fd], off, worigin);
+    int64_t p = FS_TELL64(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -582,8 +613,8 @@ static void cellFsStat(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
-    struct stat st;
-    if (stat(hpath, &st) != 0) {
+    fs_stat64_t st;
+    if (FS_STAT64(hpath, &st) != 0) {
         if (getenv("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
@@ -602,10 +633,10 @@ static void cellFsFstat(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] fstat fd=%d  (by %s)\n", fd, w); }
-    long cur = ftell(g_files[fd]);
-    fseek(g_files[fd], 0, SEEK_END);
-    long sz = ftell(g_files[fd]);
-    fseek(g_files[fd], cur, SEEK_SET);
+    int64_t cur = FS_TELL64(g_files[fd]);
+    FS_SEEK64(g_files[fd], 0, SEEK_END);
+    int64_t sz = FS_TELL64(g_files[fd]);
+    FS_SEEK64(g_files[fd], cur, SEEK_SET);
     /* FS_FSTAT_CAP=<bytes>: DIAGNOSTIC. Report a smaller size than the file
      * has. You Don't Know Jack reads a 100 KB archive whole but only probes
      * (open/fstat/close) its 500 KB and 2.4 MB ones; if that branch is driven
@@ -614,12 +645,12 @@ static void cellFsFstat(ppu_context* ctx)
     { const char* cap = getenv("FS_FSTAT_CAP");
       const char* only = getenv("FS_FSTAT_CAP_PATH");
       if (cap && only && *only && !(g_fd_path[fd][0] && strstr(g_fd_path[fd], only))) cap = 0;
-      if (cap) { long c = strtol(cap, 0, 0);
+      if (cap) { long long c = strtoll(cap, 0, 0);
           if (c > 0 && sz > c) {
-              fprintf(stderr, "[fs] fstat fd=%d size %ld -> capped %ld (FS_FSTAT_CAP)\n", fd, sz, c);
+              fprintf(stderr, "[fs] fstat fd=%d size %lld -> capped %lld (FS_FSTAT_CAP)\n", fd, (long long)sz, c);
               sz = c; } } }
     if (sb) write_stat(sb, CELL_FS_S_IFREG | 0x1B6, (uint64_t)sz);
-    if (getenv("PS3_FSLOG")) { static int _n=0; if (_n < 12 && ++_n) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%lX\n",fd,sz); }
+    if (getenv("PS3_FSLOG")) { static int _n=0; if (_n < 12 && ++_n) fprintf(stderr,"[FSDBG] cellFsFstat(fd=%d) -> size=0x%llX\n",fd,(unsigned long long)sz); }
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -659,6 +690,59 @@ static void cellFsReaddir(ppu_context* ctx)
     vm_base[dirent + 2 + nl] = 0;
     if (nread_ptr) vm_write64(nread_ptr, 0x102);
     ctx->gpr[3] = CELL_OK;
+}
+
+/* CellFsDirectoryEntry is a 52-byte stat followed by a 258-byte dirent,
+ * rounded to four-byte alignment: 312 bytes. entries_size is bytes, while
+ * data_count is a big-endian u32 count of complete entries. The stream is
+ * shared with cellFsReaddir and cellFsClosedir. */
+static void cellFsGetDirectoryEntries(ppu_context* ctx)
+{
+    const uint32_t fd = (uint32_t)ctx->gpr[3];
+    const uint32_t entries = (uint32_t)ctx->gpr[4];
+    const uint32_t bytes = (uint32_t)ctx->gpr[5];
+    const uint32_t count_ptr = (uint32_t)ctx->gpr[6];
+    const uint64_t limit = ppu_vm_size ? ppu_vm_size : 0x100000000ull;
+    if (!entries || !count_ptr || uint64_t(entries) + bytes > limit ||
+        uint64_t(count_ptr) + 4 > limit) {
+        ctx->gpr[3] = 0x8001000Du; // CELL_EFAULT
+        return;
+    }
+    if (fd < 3 || fd >= FS_MAX || !g_dirs[fd]) {
+        ctx->gpr[3] = 0x8001002Au; // CELL_EBADF
+        return;
+    }
+    uint32_t count = 0;
+    ctx->gpr[3] = CELL_OK;
+    for (; count < bytes / 312; ++count) {
+        errno = 0;
+        struct dirent* entry = readdir(g_dirs[fd]);
+        if (!entry) {
+            if (errno) ctx->gpr[3] = 0x8001002Bu; // CELL_EIO
+            break;
+        }
+        char path[1300];
+        snprintf(path, sizeof path, "%s/%s", g_dir_path[fd], entry->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            ctx->gpr[3] = 0x8001002Bu; // entry disappeared or cannot be inspected
+            break;
+        }
+        uint32_t out = entries + count * 312;
+        memset(vm_base + out, 0, 312);
+        bool directory = (st.st_mode & S_IFDIR) != 0;
+        write_stat(out, (directory ? CELL_FS_S_IFDIR : CELL_FS_S_IFREG) |
+                        (uint32_t(st.st_mode) & 0777), uint64_t(st.st_size));
+        vm_write64(out + 0x0C, uint64_t(st.st_atime));
+        vm_write64(out + 0x14, uint64_t(st.st_mtime));
+        vm_write64(out + 0x1C, uint64_t(st.st_ctime));
+        size_t length = strlen(entry->d_name);
+        if (length > 255) length = 255;
+        vm_base[out + 52] = directory ? CELL_FS_TYPE_DIR : CELL_FS_TYPE_REG;
+        vm_base[out + 53] = uint8_t(length);
+        memcpy(vm_base + out + 54, entry->d_name, length);
+    }
+    vm_write32(count_ptr, count);
 }
 
 static void cellFsClosedir(ppu_context* ctx)
@@ -714,6 +798,29 @@ static void cellFsFsync(ppu_context* ctx)
 /* File-area preallocation (LBP cache warm-up spams this): host filesystems
  * grow files on write, so accepting is correct -- no preallocation needed. */
 static void cellFsAllocateFileAreaWithoutZeroFill(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+
+/* Free space for (path, u32* block_size, u64* free_block_count). Unregistered,
+ * the call took the unresolved-NID path: CELL_OK with both out-params left as
+ * unwritten, so a title sizing a cache read whatever was there. Report a
+ * 4 KiB block and 32 GiB free: enough for any cache, and the same on every host. */
+static void cellFsGetFreeSize(ppu_context* ctx)
+{
+    uint32_t bs = (uint32_t)ctx->gpr[4], fb = (uint32_t)ctx->gpr[5];
+    if (bs) vm_write32(bs, 4096);
+    if (fb) vm_write64(fb, (32ULL << 30) / 4096);
+    ctx->gpr[3] = CELL_OK;
+}
+static void cellFsChmod(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* host ignores PS3 mode bits */
+static void cellFsUtime(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }   /* timestamps are not modelled */
+/* SDATA opened from an already-open fd is not implemented: fail visibly rather
+ * than return CELL_OK with *sdata_fd never written. */
+static void cellFsSdataOpenByFd(ppu_context* ctx)
+{
+    static int n;
+    if (n++ < 4) fprintf(stderr, "[fs] cellFsSdataOpenByFd(fd=%d) not implemented -> CELL_ENOSYS\n",
+                         (int)(uint32_t)ctx->gpr[3]);
+    ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOSYS;
+}
 
 /* ---- cellFs AIO -----------------------------------------------------------
  *
@@ -808,12 +915,17 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(ps3_compute_nid("cellFsStat"),     "cellFsStat",     cellFsStat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFstat"),    "cellFsFstat",    cellFsFstat);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpendir"),  "cellFsOpendir",  cellFsOpendir);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetDirectoryEntries"), "cellFsGetDirectoryEntries", cellFsGetDirectoryEntries);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsReaddir"),  "cellFsReaddir",  cellFsReaddir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsClosedir"), "cellFsClosedir", cellFsClosedir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsMkdir"),    "cellFsMkdir",    cellFsMkdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsRmdir"),    "cellFsRmdir",    cellFsRmdir);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsUnlink"),   "cellFsUnlink",   cellFsUnlink);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsFsync"),    "cellFsFsync",    cellFsFsync);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsGetFreeSize"),   "cellFsGetFreeSize",   cellFsGetFreeSize);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsChmod"),         "cellFsChmod",         cellFsChmod);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsUtime"),         "cellFsUtime",         cellFsUtime);
+    ps3_hle_register_ctx(ps3_compute_nid("cellFsSdataOpenByFd"), "cellFsSdataOpenByFd", cellFsSdataOpenByFd);
     ps3_hle_register_ctx(ps3_compute_nid("cellFsAllocateFileAreaWithoutZeroFill"),
                          "cellFsAllocateFileAreaWithoutZeroFill", cellFsAllocateFileAreaWithoutZeroFill);
     /* AIO by literal import NID -- ps3_compute_nid() of the friendly name does

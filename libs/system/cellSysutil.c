@@ -81,12 +81,16 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 static SRWLOCK s_completion_lock = SRWLOCK_INIT;
 #define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
 #define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
-#define COMPLETION_TLS __declspec(thread)
 #else
 #include <pthread.h>
 static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 #define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
 #define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
+#endif
+/* MinGW GCC ignores __declspec(thread), so it is for MSVC only. */
+#if defined(_MSC_VER)
+#define COMPLETION_TLS __declspec(thread)
+#else
 #define COMPLETION_TLS _Thread_local
 #endif
 

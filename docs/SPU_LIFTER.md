@@ -343,3 +343,21 @@ assembly in every channel consumer — would have required touching
 swap indices on LS-loaded data. The per-lane swap in LS access is
 strictly less invasive and is the model the helper authors had already
 committed to.
+
+## Discovery and registration coverage
+
+The existing workload builder can connect discovery, lifting, and registration
+for every SPU ELF candidate in explicitly supplied files:
+
+```bash
+python tools/build_spu_workloads.py --input /path/to/EBOOT.ELF \
+    --input /path/to/decrypted_module.elf --lifted /path/to/generated_spu \
+    --out /path/to/generated_spu/spu_workloads.c --constructor
+```
+
+See [the project template](../templates/project/README.md#automatically-discover-and-register-spu-elf-programs)
+for automatic CMake integration, output ownership, coverage failures, partial
+mode, and limitations. A `registered` status confirms generation and table
+coverage; it does not establish correct execution of the program. The standalone
+lifter's optional `--report PATH` emits function ranges, unsupported instruction
+counts, and direct branch/call targets for tools consuming its output.

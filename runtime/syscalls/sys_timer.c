@@ -2,7 +2,11 @@
  * ps3recomp - Timer and time syscalls (implementation)
  */
 
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
+#endif
 #include "sys_timer.h"
+#include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
@@ -433,6 +437,47 @@ static void wall_clock_now(uint64_t* sec, uint64_t* nsec)
 }
 #endif
 
+/* LV2 144: r3/r4 point to signed BE32 minute offsets. The first is the
+ * standard UTC offset; the second is the current seasonal adjustment.
+ * Derive the adjustment instead of assuming every DST shift is 60 minutes. */
+int64_t sys_time_get_timezone(ppu_context* ctx)
+{
+    uint32_t zone_addr = LV2_ARG_PTR(ctx, 0);
+    uint32_t dst_addr = LV2_ARG_PTR(ctx, 1);
+    if (!zone_addr || !dst_addr || zone_addr > UINT32_MAX - 3 || dst_addr > UINT32_MAX - 3)
+        return (int32_t)CELL_EFAULT;
+
+    time_t now = time(NULL);
+    struct tm local;
+    int32_t standard_minutes, daylight_minutes;
+#ifdef _WIN32
+    _tzset();
+    long west_seconds, daylight_bias;
+    if (localtime_s(&local, &now) || _get_timezone(&west_seconds) || _get_dstbias(&daylight_bias))
+        return (int32_t)CELL_EAGAIN;
+    standard_minutes = (int32_t)(-west_seconds / 60);
+    daylight_minutes = local.tm_isdst > 0 ? (int32_t)(-daylight_bias / 60) : 0;
+#else
+    if (!localtime_r(&now, &local)) return (int32_t)CELL_EAGAIN;
+    daylight_minutes = 0;
+    if (local.tm_isdst > 0) {
+        struct tm standard = local;
+        standard.tm_isdst = 0;
+        time_t standard_epoch = mktime(&standard);
+        if (standard_epoch == (time_t)-1) return (int32_t)CELL_EAGAIN;
+        daylight_minutes = (int32_t)(difftime(standard_epoch, now) / 60);
+    }
+    standard_minutes = (int32_t)(local.tm_gmtoff / 60) - daylight_minutes;
+#endif
+    write_be32(zone_addr, (uint32_t)standard_minutes);
+    write_be32(dst_addr, (uint32_t)daylight_minutes);
+    { static int said = 0;
+      if (!said && (said = 1) && getenv("PS3_TIME_LOG"))
+          fprintf(stderr, "[SYS] sys_time_get_timezone: %d minutes east of UTC, summer time %d minutes\n",
+                  standard_minutes, daylight_minutes); }
+    return CELL_OK;
+}
+
 int64_t sys_time_get_current_time(ppu_context* ctx)
 {
     uint32_t sec_addr  = LV2_ARG_PTR(ctx, 0);
@@ -468,48 +513,6 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
                   (unsigned long long)sec, u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
       } }
 
-    return CELL_OK;
-}
-
-/* ---------------------------------------------------------------------------
- * sys_time_get_timezone
- *
- * r3 = pointer to receive the time zone (s32*): minutes east of UTC, without
- *      summer time
- * r4 = pointer to receive the summer time in force (s32*): minutes, 0 or 60
- *
- * A title's C library adds the two to the wall clock for the local time. The
- * call was not there: the dispatcher answered CELL_OK and wrote nothing, and
- * the library went on with whatever its two variables held. (Drakengard 3
- * stamped a save of October 2026 as December 1933: that, on top of the wall
- * clock above.) The host's own zone: the difference between its local and its
- * universal time now, which is exact whatever the summer time's size; of
- * that, 60 minutes are called summer time while the host says it is in force.
- * -----------------------------------------------------------------------*/
-int64_t sys_time_get_timezone(ppu_context* ctx)
-{
-    uint32_t zone_addr   = LV2_ARG_PTR(ctx, 0);
-    uint32_t summer_addr = LV2_ARG_PTR(ctx, 1);
-
-    const time_t now = time(NULL);
-    struct tm local, utc;
-#ifdef _WIN32
-    localtime_s(&local, &now);
-    gmtime_s(&utc, &now);
-#else
-    localtime_r(&now, &local);
-    gmtime_r(&now, &utc);
-#endif
-    int days = local.tm_yday - utc.tm_yday;
-    if (local.tm_year != utc.tm_year) days = local.tm_year > utc.tm_year ? 1 : -1;   /* either side of New Year */
-    const int offset = days * 1440 + (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
-    const int summer = local.tm_isdst > 0 ? 60 : 0;
-
-    if (zone_addr != 0)   write_be32(zone_addr, (uint32_t)(int32_t)(offset - summer));
-    if (summer_addr != 0) write_be32(summer_addr, (uint32_t)(int32_t)summer);
-    { static int said = 0;
-      if (!said && (said = 1) && getenv("PS3_TIME_LOG"))
-          fprintf(stderr, "[SYS] sys_time_get_timezone: %d minutes east of UTC, summer time %d minutes\n", offset - summer, summer); }
     return CELL_OK;
 }
 

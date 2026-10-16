@@ -105,6 +105,12 @@ jobs:
             -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
           /tmp/test_spu_helpers
 
+      # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
+      - name: Run the cellFont init test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+          /tmp/test_font_initialize_with_revision
+
       # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
       # handler is called through the NID it registered under.
       - name: Run the sys_net loopback test
@@ -132,6 +138,12 @@ jobs:
         run: |
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
           /tmp/test_np_nat
+
+      # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
+      - name: Run the Commerce2 CreateCtx test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
+          /tmp/test_np_commerce2
 
 
       # Guest vertex and fragment programs through the decompilers, glslang
@@ -220,6 +232,10 @@ jobs:
           # plausible and still fails here. Exercises rsx_texture_layout and
           # rsx_texture_decode end to end with no GPU involved.
           ./build/ps3recomp_host --tex
+          # The same texture after the guest also derived a VRAM offset in its
+          # 1 MB page number: the texture says main memory, so it must still
+          # resolve through the IO map rather than into VRAM.
+          ./build/ps3recomp_host --tex-io
           # A polygon and a quad strip, neither of which any host API draws:
           # both have to be expanded into triangles first. The pentagon is
           # green and the strip red over it, and the centre pixel belongs to
@@ -285,6 +301,12 @@ jobs:
           ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
           /tmp/test_guest_ptr_trap
 
+      # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
+      - name: Run the savedata PARAM.SFO test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
+          /tmp/test_savedata_param_sfo
+
       # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
       # queue) on host threads. It was Windows-only until the shim grew joinable
       # handles and multi-object waits; here it is the memory-model regression
@@ -329,6 +351,23 @@ jobs:
             runtime/platform/win32_compat.c \
             -lpthread -lm
           /tmp/test_spu_lockline_peer
+
+      # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
+      # that with PUTLLC on the taskset line, which never woke the parked
+      # task's host thread: it saw the signal only when its 1 s wait timed out.
+      - name: Run the SPURS task wake test
+        run: |
+          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+            -o /tmp/test_spu_taskset_wake \
+            runtime/spu/tests/test_spu_taskset_wake.c \
+            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+            runtime/platform/win32_compat.c \
+            -lpthread -lm
+          /tmp/test_spu_taskset_wake
 
       # A thread group starting its threads on their image's LIFTED code. This
       # is the path a real title needs and the one that used to be missing: the

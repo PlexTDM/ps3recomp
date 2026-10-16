@@ -10,6 +10,7 @@
  * NIDs are computed from the names (ps3_compute_nid), so this stays correct
  * without hand-written NID literals.
  */
+#define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #include "ppu_recomp.h"     /* ppu_context */
 #include "ps3emu/nid.h"     /* ps3_compute_nid */
 extern "C" int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still while paused */
@@ -144,6 +145,11 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * notably the dlmalloc mspace behind the game's big-allocator, whose tree then
  * fell apart and reported OOM on a tiny request with 100+ MB free.
  *
+ * The same on every host: on POSIX the semaphore is win32_compat's. This was
+ * Windows-only for a while, which left every lwmutex on Linux a bare owner
+ * stamp -- Twisted Metal's FIOS layer then freed one block from two threads
+ * and its dlmalloc free() aborted on a chunk already merged into top.
+ *
  * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
  * released by its owning thread, but guest code passes lwmutex ownership
  * between threads (LBP's job system) and threads exit while holding -- one
@@ -169,14 +175,11 @@ static volatile long g_lwm_tab_lock = 0;
  * convoy root. Default OFF. */
 static int lwm_trace(void){ static int v=-1; if(v<0){const char*e=getenv("PS3_LWMUTEX_TRACE"); v=e?1:0;} return v; }
 static long long lwm_now_us(void){
-#ifdef _WIN32
     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (long long)(c.QuadPart*1000000ll/freq.QuadPart);
-#else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000ll + ts.tv_nsec / 1000;
-#endif
+    /* Seconds and remainder apart: on POSIX the frequency is 1e9, and the
+     * counter times 1e6 overflows after a few hours of uptime. */
+    return (long long)((c.QuadPart/freq.QuadPart)*1000000ll + (c.QuadPart%freq.QuadPart)*1000000ll/freq.QuadPart);
 }
 /* Find an EXISTING slot (no create) for hold-tracking. */
 static struct LwmSlot* lwm_find(uint32_t addr){
@@ -672,6 +675,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
 #define SYS_NET_EWOULDBLOCK_V 35
 extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -1005,6 +1009,10 @@ extern "C" void ppu_sysprx_register(void)
     /* sceNpScore ranking calls take up to 15 arguments: the ones past r10
      * come off the stack, so they need the full context. */
     np_score_register_ctx();
+    /* cellSaveDataUserAutoLoad/UserAutoSave take nine arguments; the ninth
+     * (userdata) is on the guest stack, so they need the full context too.
+     * Registered here so no project has to remember the call. */
+    cellSaveData_register_ctx_handlers();
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

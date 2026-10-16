@@ -141,7 +141,9 @@ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
  * flight. As plain globals these were clobbered between a job finishing and its
  * own completion being pushed, so a query could be answered with an unrelated
  * job's mailbox. Per-thread keeps each job paired with its own answer. */
-#ifdef _WIN32
+/* __declspec(thread) for MSVC only: MinGW GCC ignores it, which would make
+ * these process-wide. spurs_job.c and cellSpurs.c must agree. */
+#if defined(_MSC_VER)
 #  define SPURS_JOB_TLS __declspec(thread)
 #else
 #  define SPURS_JOB_TLS __thread

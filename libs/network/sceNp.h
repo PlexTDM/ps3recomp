@@ -133,6 +133,12 @@ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId);
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* onlineName);
 s32 sceNpManagerGetAccountAge(s32* age);
 
+/* NPDRM availability checks. The guest passes its klicensee (16 bytes) and the
+ * path of an EDAT/SELF; the klicensee is handed to the EDAT reader, which then
+ * decrypts that title's files on open. Always CELL_OK (licence present). */
+s32 sceNpDrmIsAvailable(const u8* k_licensee, const char* drm_path);
+s32 sceNpDrmIsAvailable2(const u8* k_licensee, const char* drm_path);
+
 /* Set the fake PSN username (call before sceNpInit if desired) */
 void sceNpSetFakeUsername(const char* username);
 

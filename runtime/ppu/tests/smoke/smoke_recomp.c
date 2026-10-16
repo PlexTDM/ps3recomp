@@ -452,6 +452,8 @@ void func_00010000(ppu_context* ctx)
 {
     uint32_t argc = (uint32_t)ctx->gpr[3];
     uint32_t argv = (uint32_t)ctx->gpr[4];
+    uint32_t envp = (uint32_t)ctx->gpr[5];
+    uint64_t envc = ctx->gpr[6];
     uint32_t toc  = (uint32_t)ctx->gpr[2];
     uint32_t tp   = (uint32_t)ctx->gpr[13];
     uint32_t gcm_ctx, ctrl;
@@ -466,6 +468,11 @@ void func_00010000(ppu_context* ctx)
     smoke_check(argc == 1, "argc is not 1");
     smoke_check(argv != 0 && vm_read8(vm_read32(argv + 4)) != 0,
                 "argv[0] does not point at a string");
+    /* Even an empty environment has an addressable NULL pointer slot. The
+     * guest CRT reads envp[0] before checking the environment count. */
+    smoke_check(envp != 0, "r5 does not point at an environment list");
+    smoke_check(envc == 0, "r6 is not the empty environment count");
+    smoke_check(vm_read64(envp) == 0, "envp[0] is not NULL");
 
     /* The image itself: initialised data, the BSS tail past filesz, and the
      * PT_TLS template ppu_run copied into the main thread's TLS block. */

@@ -344,6 +344,26 @@ void cellGcm_set_report_value(u32 index, u32 value)
     s_report_measured[index] = 1;
 }
 
+/* NV4097_SET_CONTEXT_DMA_REPORT (0x1A8): where NV4097_GET_REPORT writes.
+ * Local (0xFEED0000, the default): the s_report_data slots above, read back
+ * through cellGcmGetReport* / cellGcmGetReportDataAddress. Main memory
+ * (0xFEED0001, or CELL_GCM_CONTEXT_DMA_REPORT_LOCATION_MAIN 0xBAD68000): the
+ * report's 24-bit offset is an IO offset, and the 16-byte report goes to
+ * guest memory at gcm_io2ea(offset), where the title reads it itself.
+ * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
+static u32 s_report_dma = 0xFEED0000u;
+static u64 s_report_last_ts;
+
+/* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
+ * walker pass must not share a time stamp or go backwards. */
+static u64 gcm_report_timestamp(void)
+{
+    u64 t = get_timestamp_ns();
+    if (t <= s_report_last_ts) t = s_report_last_ts + 1u;
+    s_report_last_ts = t;
+    return t;
+}
+
 /* Label area (256 labels, each u32). Labels live in GUEST memory so the
  * recompiled game can poll them via vm_read32; cellGcmGetLabelAddress returns a
  * guest address into this window (16-byte spaced as on hardware). A host array
@@ -486,6 +506,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -859,12 +880,17 @@ static u32 gcm_io2ea(u32 io)
 
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
+/* Milliseconds on a monotonic clock, for the runtime's own timeouts and rate
+ * logs. Off Windows this returned 0, so every interval measured with it was
+ * 0 there: rate logs never printed and timeouts never expired. */
 unsigned long long ps3_ms_now(void)
 {
 #ifdef _WIN32
     return (unsigned long long)GetTickCount64();
 #else
-    return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
 #endif
 }
 
@@ -883,6 +909,9 @@ void (*g_gcm_fifo_kick_hook)(void) = 0;
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* How long a self-JUMP park may stand with `put` somewhere else before the
+ * drain gives up on it being patched and follows `put` instead. */
+#define GCM_PARK_GRACE_MS 50ull
 /* How close `current` must get to `end` before the runtime will recycle a ring
  * on the title's behalf. One gcmReserve is 8 bytes; a page of slack keeps a
  * title that is merely near the end from being touched. */
@@ -1593,8 +1622,12 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 
 static void gcm_fifo_dump_around(u32 getoff)
 {
+    /* Only ever called on a recovery (bad branch, stuck get), and capped, so
+     * it no longer hides behind GCM_RECDBG: the words the walker stopped on
+     * are the one thing a run that wedged once in three can still tell us,
+     * and GCM_RECDBG is far too loud to leave on for a 15-minute run. */
     static int d = 0;
-    if (!getenv("GCM_RECDBG") || d++ >= 3) return;
+    if (d++ >= 3) return;
     for (u32 t = 0; t < GCM_TRACE_N; t++) {
         u32 k = (s_tr_i + t) % GCM_TRACE_N;
         if (!s_tr_w[k]) continue;
@@ -2069,8 +2102,32 @@ static void gcm_rsx_process_fifo_unlocked(void)
                    * park standing -- it only patches a park when it reuses that
                    * block. Waiting for a patch that will not come freezes the
                    * FIFO for the rest of the run, so follow the write head. */
-                  if (put != s_fifo_getoff) { gcm_fifo_dump_around(s_fifo_getoff);
-                                              gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put); }
+                  /* ...but not at once. A title that links its segments by
+                   * patching the park moves `put` first and patches second:
+                   * inFAMOUS 2 ends each of its main-memory command blocks in
+                   * a park, writes the next commands at the ring start, sets
+                   * put, and only then rewrites the park as a JUMP to them. A
+                   * drain that lands between the two saw put elsewhere, went
+                   * straight to it, and dropped everything from the ring
+                   * start to put -- the frame's fence with it, so the title
+                   * waited on that label for the rest of the run. Give the
+                   * patch time to arrive, and resync only for a park that
+                   * has stood with the same put for longer than any title
+                   * takes between the two stores. */
+                  if (put != s_fifo_getoff) {
+                      extern unsigned long long ps3_ms_now(void);
+                      static u32 park_off, park_put;
+                      static unsigned long long park_since;
+                      const unsigned long long now = ps3_ms_now();
+                      if (park_off != s_fifo_getoff || park_put != put) {
+                          park_off = s_fifo_getoff; park_put = put; park_since = now;
+                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                          park_off = 0;
+                          gcm_fifo_dump_around(s_fifo_getoff);
+                          gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
+                      }
+                  }
+                  why = "parked";
                   break;
               }
               s_fifo_getoff = tgt; }
@@ -2184,6 +2241,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      * Drakengard 3's handler is what patches the park the FIFO
                      * then waits on, so rendering stopped for good. */
                     extern void rsx_raise_user_cmd(u32 arg);
+                    /* A title that registered its handler with the HLE
+                     * cellGcmSetUserHandler has no lv2 interrupt thread
+                     * reading that event; its handler runs from the pump.
+                     * The `continue` skips the 0xEB00 case below, so queue
+                     * it for the pump here. */
                     if (s_user_handler_opd) cellGcmQueueUserCommand(vm_read32(dea));
                     rsx_raise_user_cmd(vm_read32(dea));
                     continue;
@@ -2342,70 +2404,86 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     /* NV4097_CLEAR_REPORT_VALUE(ZPASS): the draw engine counts
                      * the samples of the draws up to the next GET_REPORT. */
                     if (m == 0x17C8 && vm_read32(dea) == 1u) s_zpass_query_open = 1;
+                    if (m == 0x1A8) s_report_dma = vm_read32(dea);
                     if (m == 0x1800) {
-                        const u32 v = vm_read32(dea), idx = (v & 0xFFFFFFu) / 16u;
+                        const u32 v = vm_read32(dea), off = v & 0xFFFFFFu, idx = off / 16u;
                         /* GCM_REPORT_LOG=1: every report command, uncapped (how
                          * many queries a frame issues, and of which type). */
                         { static int rn = 0, all = -1; if (all < 0) all = getenv("GCM_REPORT_LOG") ? 1 : 0;
-                          if (all || (rn < 6 && ++rn)) printf("[GET_REPORT] type=%u idx=%u%c", v >> 24, idx, 10); }
-                        const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
-                                                   rsx_draw_engine_enabled() && !getenv("RSX_NO_QUERIES");
-                        s_zpass_query_open = 0;
-                        if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
-                            s_report_data[idx].timestamp = get_timestamp_ns();
-                            /* GCM_ZPASS_VALUE=<n>: the sample count a ZPASS
-                             * report carries when it is not measured (default
-                             * 0xFFFF, "visible"). */
-                            { static long zp = -2; if (zp == -2) { const char* e = getenv("GCM_ZPASS_VALUE"); zp = e ? strtol(e, 0, 0) : 0xFFFF; }
-                              s_report_data[idx].value = (v >> 24) == 1u ? (u32)zp : 0u; }
-                        }
-                        /* The report lands in GUEST memory as well: the SDK's
-                         * cellGcmGetReportDataAddress and friends are inline
-                         * helpers that compute localAddress + 0x0E000000 +
-                         * index * 16 and read the CellGcmReportData there
-                         * ({timestamp, value, zero}, big-endian). Only the host
-                         * array above was ever written, so a title that polls the
-                         * area -- Drakengard 3's UE3 renderer, for every occlusion
-                         * query it issues -- read value 0: "no pixels passed",
-                         * every queried object occluded, hidden until the next
-                         * re-test. Characters, props and distant buildings
-                         * flickered in for a frame and vanished again. */
-                        {
-                            const u64 ts = get_timestamp_ns();
-                            const u32 off = v & 0xFFFFFFu;
+                          if (all || (rn < 6 && ++rn)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+                        /* A report DMA object in main memory: the report lands at
+                         * that IO offset (CellGcmReportData, big-endian: u64
+                         * timer, u32 value, u32 padding). */
+                        if (s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u) {
+                            s_zpass_query_open = 0;
+                            const u64 ts = gcm_report_timestamp();
                             const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-                            /* The local report area follows the 256 labels in the
-                             * same window (notify, labels, reports: the layout the
-                             * real system exposes through cellGcmGetLabelAddress,
-                             * and the one a title's inline report readers derive
-                             * from it). The HLE window has 0x1000 bytes between the
-                             * labels and the control block, room for 256 reports;
-                             * a title that uses more is reported once. */
-                            if (off + 16u <= 0x1000u) {
-                                const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
-                                vm_write32(rea + 0, (u32)(ts >> 32));
-                                vm_write32(rea + 4, (u32)ts);
-                                vm_write32(rea + 8, val);
-                                vm_write32(rea + 12, 0u);
-                            } else { static int _n = 0; if (_n < 4 && ++_n)
-                                printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
-                            /* GCM_REPORT_LOCAL_MIRROR=1 also writes the report at
-                             * local offset 0x0E000000 + offset. Off by default:
-                             * that range is the title's own VRAM -- the real local
-                             * report area is in the driver's reserved block (RPCS3
-                             * keeps it with the labels) -- and Drakengard 3 keeps
-                             * vertex streams there. Reports 0x7FC-0x7FF landed
-                             * in the middle of a mesh's per-vertex float stream
-                             * outside the village, and the timestamps read as
-                             * 1e18 lit the object up as a blinding white box. */
-                            static int local_mirror = -1;
-                            if (local_mirror < 0) { const char* e = getenv("GCM_REPORT_LOCAL_MIRROR"); local_mirror = e ? atoi(e) : 0; }
-                            if (local_mirror && s_config.localAddress && off + 16u <= s_config.localSize) {
-                                const u32 rea = s_config.localAddress + 0x0E000000u + off;
-                                vm_write32(rea + 0, (u32)(ts >> 32));
-                                vm_write32(rea + 4, (u32)ts);
-                                vm_write32(rea + 8, val);
-                                vm_write32(rea + 12, 0u);
+                            const u32 rea = gcm_io2ea(off);
+                            if (rea) {
+                                vm_write32(rea, (u32)(ts >> 32));
+                                vm_write32(rea + 4u, (u32)ts);
+                                vm_write32(rea + 8u, val);
+                                vm_write32(rea + 12u, 0u);
+                            } else { static int un = 0; if (un < 4 && ++un) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+                        } else {
+                            const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
+                                                       rsx_draw_engine_enabled() && !getenv("RSX_NO_QUERIES");
+                            s_zpass_query_open = 0;
+                            if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
+                                s_report_data[idx].timestamp = get_timestamp_ns();
+                                /* GCM_ZPASS_VALUE=<n>: the sample count a ZPASS
+                                 * report carries when it is not measured (default
+                                 * 0xFFFF, "visible"). */
+                                { static long zp = -2; if (zp == -2) { const char* e = getenv("GCM_ZPASS_VALUE"); zp = e ? strtol(e, 0, 0) : 0xFFFF; }
+                                  s_report_data[idx].value = (v >> 24) == 1u ? (u32)zp : 0u; }
+                            }
+                            /* The report lands in GUEST memory as well: the SDK's
+                             * cellGcmGetReportDataAddress and friends are inline
+                             * helpers that compute localAddress + 0x0E000000 +
+                             * index * 16 and read the CellGcmReportData there
+                             * ({timestamp, value, zero}, big-endian). Only the host
+                             * array above was ever written, so a title that polls the
+                             * area -- Drakengard 3's UE3 renderer, for every occlusion
+                             * query it issues -- read value 0: "no pixels passed",
+                             * every queried object occluded, hidden until the next
+                             * re-test. Characters, props and distant buildings
+                             * flickered in for a frame and vanished again. */
+                            {
+                                const u64 ts = get_timestamp_ns();
+                                const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
+                                /* The local report area follows the 256 labels in the
+                                 * same window (notify, labels, reports: the layout the
+                                 * real system exposes through cellGcmGetLabelAddress,
+                                 * and the one a title's inline report readers derive
+                                 * from it). The HLE window has 0x1000 bytes between the
+                                 * labels and the control block, room for 256 reports;
+                                 * a title that uses more is reported once. */
+                                if (off + 16u <= 0x1000u) {
+                                    const u32 rea = GCM_LABEL_GUEST_BASE + 0x1000u + off;
+                                    vm_write32(rea + 0, (u32)(ts >> 32));
+                                    vm_write32(rea + 4, (u32)ts);
+                                    vm_write32(rea + 8, val);
+                                    vm_write32(rea + 12, 0u);
+                                } else { static int _n = 0; if (_n < 4 && ++_n)
+                                    printf("[GET_REPORT] index %u beyond the 256 the label window holds\n", idx); }
+                                /* GCM_REPORT_LOCAL_MIRROR=1 also writes the report at
+                                 * local offset 0x0E000000 + offset. Off by default:
+                                 * that range is the title's own VRAM -- the real local
+                                 * report area is in the driver's reserved block (RPCS3
+                                 * keeps it with the labels) -- and Drakengard 3 keeps
+                                 * vertex streams there. Reports 0x7FC-0x7FF landed
+                                 * in the middle of a mesh's per-vertex float stream
+                                 * outside the village, and the timestamps read as
+                                 * 1e18 lit the object up as a blinding white box. */
+                                static int local_mirror = -1;
+                                if (local_mirror < 0) { const char* e = getenv("GCM_REPORT_LOCAL_MIRROR"); local_mirror = e ? atoi(e) : 0; }
+                                if (local_mirror && s_config.localAddress && off + 16u <= s_config.localSize) {
+                                    const u32 rea = s_config.localAddress + 0x0E000000u + off;
+                                    vm_write32(rea + 0, (u32)(ts >> 32));
+                                    vm_write32(rea + 4, (u32)ts);
+                                    vm_write32(rea + 8, val);
+                                    vm_write32(rea + 12, 0u);
+                                }
                             }
                         }
                     }
@@ -2722,6 +2800,22 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
                 g_gcm_fifo_drained_ea, spins);
 }
 
+/* A host that brings its backend up on another thread -- a frame clock that
+ * opens the window while the title boots -- can register the draw engine after
+ * the title has already called cellGcmSetDisplayBuffer. The engine then knows
+ * no scanout, and every flip presents whatever surface happens to be bound:
+ * Twisted Metal on Linux showed an offscreen target instead of its composited
+ * display buffer. rsx_draw_engine_init calls this to catch up. */
+void cellGcm_replay_display_buffers_to_engine(void)
+{
+    for (u32 i = 0; i < CELL_GCM_MAX_DISPLAY_BUFFER_NUM; i++)
+        if (s_display_buffer_set[i])
+            rsx_draw_engine_set_display_buffer(i, 0, s_display_buffers[i].offset,
+                                               s_display_buffers[i].pitch,
+                                               s_display_buffers[i].width,
+                                               s_display_buffers[i].height);
+}
+
 /* NID: 0xDC09357E */
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
@@ -2877,7 +2971,15 @@ static int gcm_word_into_fifo(u32 ctx, u32 word, int allow_wrap)
      * while the guest may be between advancing current and flushing: put
      * then lands on begin, the guest's closing fence is never executed, and
      * it spins on `ref` for good. Safe when the walker has left the head of
-     * the ring well behind, which is the region the guest writes next. */
+     * the ring well behind, which is the region the guest writes next.
+     *
+     * Only for a ring the runtime owns, i.e. one whose buffer-full callback is
+     * still the runtime's (cellGcmSetupContext installs it). A title with its
+     * own callback manages its own buffers, and its context need not be a ring
+     * at all: Killzone 3 flips on a 0x30000-byte draw context whose `end`
+     * moves down as it allocates from the top, so it always looks nearly full.
+     * Rewinding it to `begin` in mid-frame cut the frame short, dropping the
+     * fence release in its tail, and the title then waited for it forever. */
     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
     /* Not for a prepare-flip marker: wrapping here skips the title's own
      * buffer-full callback, which waits for the RSX to leave the head of the
@@ -2885,7 +2987,9 @@ static int gcm_word_into_fifo(u32 ctx, u32 word, int allow_wrap)
      * wrote its next frames over commands the walker had not read yet -- the
      * walker decoded vertex floats as JUMPs and resynced, a dozen times a run
      * once every object drew. Its callback wraps the ring correctly. */
-    if (allow_wrap && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+    const u32 cb_opd = vm_read32(ctx + 0xC);
+    const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+    if (allow_wrap && runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
         s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
         { static int rw = -1; if (rw < 0) rw = getenv("GCM_RING_WATCH") ? 1 : 0;
           static int n = 0; if (rw && (n < 64 && ++n))
@@ -3232,14 +3336,16 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         return CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
-    /* Allocate a fresh IO region past the Init command-buffer window. */
-    u32 io_offset = gcm_io_alloc(size);
-
+    /* A free slot first, then the IO region: allocating the region before
+     * the slot check leaked IO space on every refused call. */
     IoMapping* mapping = find_free_mapping();
     if (!mapping) {
         printf("[cellGcmSys] WARNING: no free IO mapping slots\n");
         return CELL_GCM_ERROR_FAILURE;
     }
+
+    /* Allocate a fresh IO region past the Init command-buffer window. */
+    u32 io_offset = gcm_io_alloc(size);
 
     mapping->ea     = ea;
     mapping->io     = io_offset;
@@ -3291,6 +3397,37 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
     populate_offset_table(ea, io, size);
 
     return CELL_OK;
+}
+
+/* NID: 0x626E8518 */
+s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
+{
+    /* RPCS3 cellGcmSys.cpp accepts exactly STRICT_ORDERING (not an arbitrary
+     * bit mask). The software FIFO already reads shared guest memory in FIFO
+     * order after its acquire fence; there is no relaxed DMA mapping path to
+     * select here. Preserve that path rather than pretending to enable a new
+     * ordering mode by storing an unused flag. */
+    if (flags != CELL_GCM_IOMAP_FLAG_STRICT_ORDERING)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    if ((ea | io | size) & 0xFFFFFu || !size)
+        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+    const u64 ea_end = (u64)ea + size;
+    const u64 io_end = (u64)io + size;
+    /* The HLE models the standard 256 MiB RSX IO aperture. Widen sums before
+     * checking bounds so wrapping inputs cannot publish aliases at page 0. */
+    if (ea_end > 0x100000000ull || io_end > 0x10000000ull)
+        return CELL_GCM_ERROR_INVALID_VALUE;
+    /* The legacy mapper checks only an identical EA base. Preflight complete
+     * intervals on both sides so a rejected flagged map changes neither the
+     * mapping list nor either direction of the translation table. */
+    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+        const IoMapping* m = &s_io_mappings[i];
+        if (m->active &&
+            (((u64)ea < (u64)m->ea + m->size && ea_end > m->ea) ||
+             ((u64)io < (u64)m->io + m->size && io_end > m->io)))
+            return CELL_GCM_ERROR_ADDRESS_OVERWRAP;
+    }
+    return cellGcmMapEaIoAddress(ea, io, size);
 }
 
 /* NID: 0xDB23E867 (disambiguation by context) */
@@ -3395,7 +3532,16 @@ u32 cellGcmResolveIO(u32 offset)
  * local allocations (gcm/cube: ioSize 16MB, FP ucode at local 0xB90000 --
  * table hit returned the empty command-buffer EA instead of VRAM). Callers
  * that KNOW the location (texture format bits, SET_SHADER_PROGRAM bits) must
- * use this. `local` != 0 -> local memory. */
+ * use this. `local` != 0 -> local memory.
+ *
+ * A MAIN offset asks the IO table first. cellGcmResolveOffset would send it
+ * to VRAM whenever the guest once derived a local offset in the same 1 MB
+ * page number, and a title with both a large IO map and a full VRAM has
+ * many such pages: Twisted Metal's menu fragment programs at IO 0x08B96040
+ * and 0x0F75E800 and a G-buffer texture at IO 0x02A1F380 were read out of
+ * VRAM -- texture bytes that decode as a NOP program, so the menu's UI drew
+ * transparent black. An offset the IO table does not map keeps the old
+ * guess. */
 u32 cellGcmResolveLocated(int local, u32 offset)
 {
     if (local)
@@ -3730,6 +3876,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
+    s_report_dma = 0xFEED0000u;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -4081,11 +4228,11 @@ u32 cellGcm_control_guest_addr(void) { return GCM_CONTROL_GUEST_ADDR; }
 void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
 {
     populate_offset_table(ea, io, size);
-    if (s_io_mapping_count < CELL_GCM_MAX_IO_MAPPINGS) {
-        s_io_mappings[s_io_mapping_count].ea     = ea;
-        s_io_mappings[s_io_mapping_count].io     = io;
-        s_io_mappings[s_io_mapping_count].size   = size;
-        s_io_mappings[s_io_mapping_count].active = 1;
+    /* A free slot, not s_io_mappings[count]: an unmap leaves a hole, and the
+     * count then indexes a live slot. */
+    IoMapping* m = find_free_mapping();
+    if (m) {
+        m->ea = ea; m->io = io; m->size = size; m->active = 1;
         s_io_mapping_count++;
     }
     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }

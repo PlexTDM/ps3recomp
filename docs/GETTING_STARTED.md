@@ -64,8 +64,8 @@ here ever stops matching the tools:
 ```bash
 python tools/ppu_loader.py  game/EBOOT.ELF -o out/          # 1. image, OPD functions, imports
 python tools/ppu_lifter.py  game/EBOOT.ELF --functions out/EBOOT.functions.json \
-                            --hle-stubs out/EBOOT.imports.json -o src/recomp/   # 2. lift
-python tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp   # 3. HLE handler table
+                            --hle-stubs out/EBOOT.imports.json -o recompiled/   # 2. lift
+python tools/gen_hle_nids.py --all --out recompiled/ppu_hle_nids.cpp   # 3. HLE handler table
 cmake -B build -G Ninja && cmake --build build                      # 4. build
 ```
 
@@ -141,7 +141,7 @@ cd my_game/
 python ../tools/ppu_lifter.py game/EBOOT.ELF \
     --functions out/EBOOT.functions.json \
     --hle-stubs out/EBOOT.imports.json \
-    --output src/recomp/
+    --output recompiled/
 ```
 
 This writes `ppu_recomp.h` plus `ppu_recomp_NNN.cpp` chunks (which can total
@@ -171,7 +171,7 @@ firmware NIDs to this runtime's HLE implementations — that is a separate
 generated file:
 
 ```bash
-python ../tools/gen_hle_nids.py --all --out src/gen/ppu_hle_nids.cpp
+python ../tools/gen_hle_nids.py --all --out recompiled/ppu_hle_nids.cpp
 ```
 
 Compile the result into the port along with the lifted sources. It defines
@@ -181,7 +181,7 @@ it still links, which is why the omission is not a build error. The runtime
 warns at startup when it ends up with no handlers registered.
 
 **The project template does this for you.** Its `CMakeLists.txt` generates the
-every-module table at configure time unless `src/recomp/ppu_hle_nids.cpp`
+every-module table at configure time unless `recompiled/ppu_hle_nids.cpp`
 already exists, so this step only needs running by hand in a build system you
 rolled yourself — which is exactly where it gets forgotten.
 
@@ -196,7 +196,7 @@ reaches the table in the first place. Do both.
 ### Step 6: Build the Recompiled Game
 
 ```bash
-cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp
+cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp -DRECOMP_DIR=$PWD/recompiled
 cmake --build build
 ```
 

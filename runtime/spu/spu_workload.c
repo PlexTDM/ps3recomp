@@ -762,6 +762,9 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
                        ((uint32_t)ti[0x16] << 8) | ti[0x17];
         uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
                        ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
+        /* TaskInfo stores ELF metadata in the low three bits. Keep those
+         * guest bytes intact and use only the address for loading. */
+        elf &= ~7u;
         if (!elf) continue;
         size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
         if (!sz) continue;
@@ -1221,7 +1224,8 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
     /* Nothing on this stack may stay in the lock-line reserver set. */
     { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
+      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
+      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
     return 0;
 }
 #else
@@ -1731,6 +1735,35 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
               t0 = now;
           }
       } }
+}
+
+/* A successful PUTLLC/PUTLLUC committed the 128-byte guest line `line`.
+ *
+ * A task signalling another task does it on the SPU, as libspurs does: a
+ * GETLLAR/PUTLLC loop that sets the target's bit in the taskset's signalled
+ * bitset. That updates the guest bit the waiter checks but never touches
+ * s_sig_cv, so the parked task only saw it when its 1 s timed wait ran out.
+ * Twisted Metal's post-FX pipeline chains its six tasks this way several
+ * times a frame and took 4 s or more per frame. Wake the waiters whenever a
+ * line holding a parked taskset's signalled bitset is committed; a commit
+ * that did not signal them only costs a spurious wake, which the wait loop
+ * re-checks. */
+void spu_taskset_line_committed(uint32_t line)
+{
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        const uint64_t k = s_parked[i];
+        if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
+#ifdef _WIN32
+        AcquireSRWLockExclusive(&s_sig_lock);
+        WakeAllConditionVariable(&s_sig_cv);
+        ReleaseSRWLockExclusive(&s_sig_lock);
+#else
+        pthread_mutex_lock(&s_sig_lock);
+        pthread_cond_broadcast(&s_sig_cv);
+        pthread_mutex_unlock(&s_sig_lock);
+#endif
+        return;
+    }
 }
 
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by

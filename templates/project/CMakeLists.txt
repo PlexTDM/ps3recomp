@@ -90,6 +90,14 @@ if(EXISTS "${RECOMP_DIR}/ppu_hle_nids.cpp")
 else()
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     set(HLE_NID_TABLE "${CMAKE_CURRENT_BINARY_DIR}/ppu_hle_nids.cpp")
+    # The generator discovers handlers from library definitions. Rebuild when
+    # an existing module changes, and reconfigure when a new module is added.
+    file(GLOB_RECURSE HLE_NID_SOURCES CONFIGURE_DEPENDS
+        "${PS3RECOMP_DIR}/libs/*.c")
+    # A removed input cannot make the output older than a remaining dependency.
+    # Track the list itself so deletions also remove stale handler references.
+    set(HLE_NID_SOURCE_LIST "${CMAKE_CURRENT_BINARY_DIR}/hle_nid_sources.txt")
+    file(GENERATE OUTPUT "${HLE_NID_SOURCE_LIST}" CONTENT "${HLE_NID_SOURCES}\n")
     add_custom_command(
         OUTPUT "${HLE_NID_TABLE}"
         COMMAND "${Python3_EXECUTABLE}"
@@ -97,6 +105,7 @@ else()
                 --out "${HLE_NID_TABLE}" --all
         DEPENDS "${PS3RECOMP_DIR}/tools/gen_hle_nids.py"
                 "${PS3RECOMP_DIR}/tools/nid_database.py"
+                ${HLE_NID_SOURCES} "${HLE_NID_SOURCE_LIST}"
         COMMENT "Generating the HLE NID -> handler table")
     message(STATUS "HLE NID table:   generated (every module)")
 endif()
@@ -129,8 +138,15 @@ set(SPU_DIR "${CMAKE_CURRENT_SOURCE_DIR}/spu" CACHE PATH
     "Directory holding the lifted SPU images (<SPU_DIR>/<image>/spu_recomp.c)")
 option(PORT_ENABLE_SPU "Compile and register the title's lifted SPU images" ON)
 
+set(PORT_SPU_INPUTS "" CACHE STRING
+    "Input files to scan for all embedded SPU ELF programs (semicolon-separated decrypted ELF/PRX/data paths)")
 set(SPU_SOURCES "")
-if(PORT_ENABLE_SPU)
+if(PORT_ENABLE_SPU AND PORT_SPU_INPUTS)
+    include("${PS3RECOMP_DIR}/cmake/PS3RecompSPU.cmake")
+    ps3recomp_generate_spu("${CMAKE_CURRENT_BINARY_DIR}/generated_spu" ${PORT_SPU_INPUTS})
+    list(APPEND SPU_SOURCES ${SPU_GENERATED_SOURCES}
+         "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+elseif(PORT_ENABLE_SPU)
     file(GLOB SPU_LIFTED CONFIGURE_DEPENDS "${SPU_DIR}/*/spu_recomp.c")
     if(SPU_LIFTED)
         list(LENGTH SPU_LIFTED SPU_IMAGE_COUNT)
@@ -230,6 +246,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE
         -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
+        # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
+        # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).
+        -fwrapv
     )
 elseif(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE
