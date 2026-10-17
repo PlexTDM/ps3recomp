@@ -400,19 +400,27 @@ unsigned long long ppu_thread_cpu_us(unsigned tid)
     (void)tid; return 0;
 #endif
 }
+/* ppu_prof_resolve_host, set by ppu_loader.cpp where it is linked in (the
+ * replay and the runtime's tests have no lifted code to name). */
+uint32_t (*g_ppu_prof_resolve)(void* ra);
+static unsigned prof_site(void* ra, unsigned fallback)
+{
+    return ra && g_ppu_prof_resolve ? (unsigned)g_ppu_prof_resolve(ra) : fallback;
+}
 /* Last syscall/HLE callsite of guest thread `tid` (see prof_pc). */
 unsigned ppu_thread_prof_pc(unsigned tid)
 {
     if (tid < 2 || tid > PPU_THREAD_MAX) return 0;
     ppu_thread_info* t = &g_ppu_threads[tid - 1];
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
-    return t->prof_pc;
+    return prof_site(t->prof_ra, t->prof_pc);
 }
 
 /* Profiler accessor: snapshot slot idx (0-based). Returns 1 if the slot holds
  * a live thread, filling tid/cia/name. Lets a host-side sampling profiler
  * iterate guest threads without depending on ppu_thread_info's layout. */
 static unsigned s_prof_main_pc = 0;   /* main guest thread: ctx lives outside the table */
+static void* volatile s_prof_main_ra;
 
 int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
 {
@@ -421,12 +429,13 @@ int ppu_prof_snapshot(int idx, unsigned* tid, unsigned* cia, const char** name)
     if (idx == 0 && t->state == PPU_THREAD_STATE_FREE) {
         /* slot 0 stays FREE (the main thread never registers) -- serve its
          * dispatcher breadcrumb here so the profiler sees tid 1. */
-        *tid = 1; *cia = s_prof_main_pc; *name = "main";
-        return s_prof_main_pc != 0;
+        *tid = 1; *cia = prof_site(s_prof_main_ra, s_prof_main_pc); *name = "main";
+        return *cia != 0;
     }
     if (t->state == PPU_THREAD_STATE_FREE) return 0;
     *tid  = (unsigned)(idx + 1);
-    *cia  = t->prof_pc ? t->prof_pc : (unsigned)t->ctx.cia;
+    const unsigned site = prof_site(t->prof_ra, t->prof_pc);
+    *cia  = site ? site : (unsigned)t->ctx.cia;
     *name = t->name;
     return 1;
 }
@@ -440,6 +449,17 @@ void ppu_prof_stamp(void* vctx, unsigned lr)
     int in_range = (t >= g_ppu_threads && t < g_ppu_threads + PPU_THREAD_MAX);
     if (!in_range) { s_prof_main_pc = lr; return; }
     t->prof_pc = lr;
+}
+
+/* The same breadcrumb as the caller's host return address, which a reader
+ * names (ppu_prof_resolve_host) when it wants it: the dispatchers stamp on
+ * every call, and readers are the profilers and lock diagnostics. */
+void ppu_prof_stamp_ra(void* vctx, void* ra)
+{
+    char* p = (char*)vctx - offsetof(ppu_thread_info, ctx);
+    ppu_thread_info* t = (ppu_thread_info*)p;
+    if (t < g_ppu_threads || t >= g_ppu_threads + PPU_THREAD_MAX) { s_prof_main_ra = ra; return; }
+    t->prof_ra = ra;
 }
 
 int64_t sys_ppu_thread_create(ppu_context* ctx)

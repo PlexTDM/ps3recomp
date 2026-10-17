@@ -17,12 +17,16 @@ extern uint8_t* vm_base;
 
 /* ---- export registry ---------------------------------------------------- *
  * Flat NID -> guest-address table, filled as modules load. A handful of system
- * PRXs export a few hundred symbols total, so a linear array with linear lookup
- * is plenty (lookups happen once per import resolution, not per call). */
+ * PRXs export a few hundred symbols total. ps3_hle_call asks on every call,
+ * though, so the lookup goes through an open-addressed index (entry + 1, 0
+ * empty) instead of a scan of the array. */
 typedef struct { uint32_t nid; uint32_t guest_addr; } prx_export_reg_entry;
 #define PRX_EXPORT_REG_CAP 2048
+#define PRX_EXPORT_INDEX   4096u
 static prx_export_reg_entry s_export_reg[PRX_EXPORT_REG_CAP];
 static uint32_t             s_export_reg_n = 0;
+static uint16_t             s_export_index[PRX_EXPORT_INDEX];
+static inline uint32_t prx_export_slot(uint32_t nid) { return (nid * 2654435761u) >> 20; }
 
 static void prx_export_register(uint32_t nid, uint32_t guest_addr)
 {
@@ -34,18 +38,22 @@ static void prx_export_register(uint32_t nid, uint32_t guest_addr)
             return;
         }
     }
-    if (s_export_reg_n < PRX_EXPORT_REG_CAP)
+    if (s_export_reg_n < PRX_EXPORT_REG_CAP) {
         s_export_reg[s_export_reg_n++] = (prx_export_reg_entry){ nid, guest_addr };
-    else
+        uint32_t i = prx_export_slot(nid);
+        while (s_export_index[i]) i = (i + 1) & (PRX_EXPORT_INDEX - 1);
+        s_export_index[i] = (uint16_t)s_export_reg_n;
+    } else
         fprintf(stderr, "[prx] export registry full, dropping NID 0x%08X\n", nid);
 }
 
 uint32_t prx_resolve_export(uint32_t nid)
 {
-    for (uint32_t i = 0; i < s_export_reg_n; i++)
-        if (s_export_reg[i].nid == nid)
-            return s_export_reg[i].guest_addr;
-    return 0;
+    for (uint32_t i = prx_export_slot(nid);; i = (i + 1) & (PRX_EXPORT_INDEX - 1)) {
+        const uint32_t v = s_export_index[i];
+        if (!v) return 0;
+        if (s_export_reg[v - 1].nid == nid) return s_export_reg[v - 1].guest_addr;
+    }
 }
 
 uint32_t prx_export_registry_count(void) { return s_export_reg_n; }

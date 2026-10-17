@@ -2139,9 +2139,30 @@ static inline uint32_t icall_cache_slot(uint32_t a)
     return (a * 2654435761u) >> (32 - PPU_ICALL_CACHE_BITS);
 }
 
+/* A flat table over the low 32 MB of guest addresses, where a title's own
+ * code is, for ps3_indirect_call: one load, no hash and no collisions, where
+ * the cache above holds 4096 targets and a busy frame calls more than that
+ * through pointers. Filled as functions are registered; each entry is the
+ * host function's 32-bit distance from ps3_indirect_call, 0 empty. Code above
+ * it (the PRX modules) keeps going through the cache. g_ppu_icall_flat = 0
+ * (DOD3_AB=icallflat) uses the cache for everything, as before. */
+#define PPU_ICALL_FLAT_END 0x02000000u
+static int32_t* g_icall_flat;
+extern "C" int g_ppu_icall_flat = 1;
+extern "C" void ps3_indirect_call(ppu_context* ctx);
+static void icall_flat_set(uint32_t a, ppu_fn fn)
+{
+    if (a >= PPU_ICALL_FLAT_END || (a & 3u)) return;
+    if (!g_icall_flat) g_icall_flat = (int32_t*)calloc(PPU_ICALL_FLAT_END / 4u, sizeof(int32_t));
+    if (!g_icall_flat) return;
+    const intptr_t d = fn ? (intptr_t)(void*)fn - (intptr_t)(void*)&ps3_indirect_call : 0;
+    __atomic_store_n(&g_icall_flat[a >> 2], d == (intptr_t)(int32_t)d ? (int32_t)d : 0, __ATOMIC_RELAXED);
+}
+
 extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
 {
     uint32_t a = (uint32_t)addr;
+    icall_flat_set(a, fn);
     uint32_t i = (a * 2654435761u) & PPU_HASH_MASK;
     /* Bounded probe: never loop past the whole table. A full table (function
      * count >= PPU_HASH_SIZE) would otherwise spin forever here at startup. */
@@ -2167,9 +2188,18 @@ extern "C" void ppu_register_function(uint64_t addr, ppu_fn fn)
  * Built lazily on first use (registration is boot-time-only). */
 static struct { void* host; uint32_t guest; } g_inv[PPU_HASH_SIZE];
 static uint32_t g_inv_n = 0;
+/* Built once, under a lock: the first reader can now be the profiler's
+ * thread or the crash handler as well as a guest thread. */
+extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+extern "C" uint32_t (*g_ppu_prof_resolve)(void* ra);   /* sys_ppu_thread.c */
+static const struct ProfResolveHook { ProfResolveHook() { g_ppu_prof_resolve = ppu_prof_resolve_host; } } s_prof_resolve_hook;
+static SRWLOCK g_inv_lock = SRWLOCK_INIT;
+static volatile LONG g_inv_ready;
 extern "C" uint32_t ppu_prof_resolve_host(void* ra)
 {
-    if (!g_inv_n) {
+    if (!__atomic_load_n(&g_inv_ready, __ATOMIC_ACQUIRE)) {
+        AcquireSRWLockExclusive(&g_inv_lock);
+        if (!g_inv_ready && !g_inv_n) {
         for (uint32_t i = 0; i < PPU_HASH_SIZE; i++)
             if (g_fn[i]) { g_inv[g_inv_n].host = (void*)g_fn[i]; g_inv[g_inv_n].guest = g_addr[i]; g_inv_n++; }
         /* insertion-sort-free: qsort by host ptr */
@@ -2179,6 +2209,9 @@ extern "C" uint32_t ppu_prof_resolve_host(void* ra)
                   const void* hb = ((decltype(&g_inv[0]))b)->host;
                   return ha < hb ? -1 : (ha > hb ? 1 : 0);
               });
+        }
+        if (g_inv_n) __atomic_store_n(&g_inv_ready, 1, __ATOMIC_RELEASE);
+        ReleaseSRWLockExclusive(&g_inv_lock);
         if (!g_inv_n) return 0;
     }
     /* greatest host fn <= ra */
@@ -2605,9 +2638,15 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
     { if (__builtin_expect(g_ppu_icall_full < 0, 0)) g_ppu_icall_full = icall_diag_armed();
       if (__builtin_expect(!g_ppu_icall_full, 1)) {
           const uint32_t addr = (uint32_t)ctx->ctr;
-          const uint64_t e = __atomic_load_n(&g_icall_cache[icall_cache_slot(addr)], __ATOMIC_RELAXED);
-          if (__builtin_expect((uint32_t)(e >> 32) == addr && e != 0 && s_icall_depth <= 4000, 1)) {
-              const ppu_fn fn = (ppu_fn)((intptr_t)(void*)&ps3_indirect_call + (int32_t)(uint32_t)e);
+          int32_t dist = 0;
+          if (addr < PPU_ICALL_FLAT_END && !(addr & 3u) && g_icall_flat && g_ppu_icall_flat) {
+              dist = __atomic_load_n(&g_icall_flat[addr >> 2], __ATOMIC_RELAXED);
+          } else {
+              const uint64_t e = __atomic_load_n(&g_icall_cache[icall_cache_slot(addr)], __ATOMIC_RELAXED);
+              if ((uint32_t)(e >> 32) == addr && e != 0) dist = (int32_t)(uint32_t)e;
+          }
+          if (__builtin_expect(dist != 0 && s_icall_depth <= 4000, 1)) {
+              const ppu_fn fn = (ppu_fn)((intptr_t)(void*)&ps3_indirect_call + dist);
               s_icall_depth++;
               fn(ctx);
               while (g_trampoline_fn) {
@@ -3241,6 +3280,7 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" void ppu_prof_stamp_ra(void* ctx, void* ra);
 extern "C" int ppu_waitprof_on(void);
 extern "C" uint64_t ppu_waitprof_now(void);
 extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
@@ -3280,13 +3320,16 @@ extern "C" void lv2_syscall(ppu_context* ctx)
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall
      * callsite (lr) in the runtime-side thread info. cia itself is the thread
      * entry OPD (load-bearing for the entry trampoline) -- do not touch it. */
-    const unsigned _site = ppu_prof_resolve_host(__builtin_return_address(0));
-    ppu_prof_stamp(ctx, _site);
+    /* The host return address, named only when a profiler reads it: naming
+     * it here was a binary search over every lifted function per syscall. */
+    ppu_prof_stamp_ra(ctx, __builtin_return_address(0));
     /* PPU_WAITPROF (ppu_hle.cpp): time inside this syscall, by call site. */
+    const int _wpo = ppu_waitprof_on();
+    const unsigned _site = _wpo ? ppu_prof_resolve_host(__builtin_return_address(0)) : 0;
     struct _WpGuard { unsigned tid, site, sc; uint64_t t0;
         ~_WpGuard() { if (t0) ppu_waitprof_add(tid, site, sc, nullptr, ppu_waitprof_now() - t0); }
     } _wg{ (unsigned)ctx->thread_id, _site ? _site : (unsigned)ctx->lr, (unsigned)num,
-           ppu_waitprof_on() ? ppu_waitprof_now() : 0 };
+           _wpo ? ppu_waitprof_now() : 0 };
     /* PS3_SCTRACE_TID: trace every lv2 syscall made by the loader/worker thread
      * (tid=1) so we can see what it does AFTER receiving its q=1 event and why
      * it never registers handlers / loads assets. */

@@ -179,6 +179,7 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+extern "C" void ppu_prof_stamp_ra(void* ctx, void* ra);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 
 /* ---- wait profiler -------------------------------------------------------
@@ -479,11 +480,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
-    const unsigned _site = ppu_prof_resolve_host(__builtin_return_address(0));
-    ppu_prof_stamp(ctx, _site);
+    /* The host return address, named only when a profiler reads it: naming
+     * it here was a binary search over every lifted function per call. */
+    ppu_prof_stamp_ra(ctx, __builtin_return_address(0));
     /* PPU_WAITPROF: nothing below touches the thread-local name when it is off
      * -- on macOS every thread-local access is a call, on every HLE call. */
     const int _wp_on = ppu_waitprof_on();
+    const unsigned _site = _wp_on ? ppu_prof_resolve_host(__builtin_return_address(0)) : 0;
     struct _WpGuard { unsigned tid, site; uint64_t t0; const char* prev; int on;
         ~_WpGuard() { if (!on) return;
                       ppu_waitprof_add(tid, site, 0, tl_wp_name ? tl_wp_name : "(hle)",

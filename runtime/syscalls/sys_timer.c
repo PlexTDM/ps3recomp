@@ -168,6 +168,10 @@ int (*g_lv2_usleep_hook)(uint32_t lr, uint64_t usec) = 0;
  * and shorten `*usec` by what that took. */
 void (*g_lv2_usleep_pre)(ppu_context* ctx, uint64_t* usec) = 0;
 
+/* Windows: sleeps from this many microseconds up to 1 ms wait on a timer
+ * and spin only their end (DOD3_AB=usleepspin moves it past 1000). */
+int g_usleep_spin_below = 500;
+
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
@@ -337,6 +341,29 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } else {
             Sleep((DWORD)(usec / 1000));
         }
+    } else if (usec > 0 && usec >= (uint64_t)g_usleep_spin_below) {
+        /* 0.5-1 ms: on the thread's high-resolution timer for all but the
+         * last 250 us, spinning only those. The audio system loop's 800 us
+         * polls spun two thirds of a core for their whole length, a core a
+         * 6-core machine's game, render and RSX threads need. Below
+         * g_usleep_spin_below (DOD3_AB=usleepspin sets it past 1000, the old
+         * all-spin behaviour) the spin below as before. */
+        ensure_qpc_init();
+        LARGE_INTEGER q0, qn;
+        QueryPerformanceCounter(&q0);
+        const int64_t deadline = q0.QuadPart + (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+        static __declspec(thread) HANDLE hr = NULL;
+        if (!hr) hr = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (hr) {
+            LARGE_INTEGER due;
+            due.QuadPart = -((LONGLONG)(usec - 250) * 10);
+            SetWaitableTimer(hr, &due, 0, NULL, NULL, FALSE);
+            WaitForSingleObject(hr, INFINITE);
+        }
+        do {
+            SwitchToThread();
+            QueryPerformanceCounter(&qn);
+        } while (qn.QuadPart < deadline);
     } else if (usec > 0) {
         /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
          * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies

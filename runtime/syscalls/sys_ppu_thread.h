@@ -52,6 +52,7 @@ typedef struct ppu_thread_info {
     uint64_t     entry_addr;   /* guest entry point */
     uint64_t     tls_addr;
     uint32_t     prof_pc;      /* last syscall/HLE callsite (sampling profiler) */
+    void*        prof_ra;      /* ...as the host return address, named when read */
     int          proc_out;     /* the host thread is past its last use of this slot
                                 * (set by the thread procedure, under the table lock) */
 
