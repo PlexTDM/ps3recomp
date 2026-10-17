@@ -126,7 +126,7 @@ static int rd(void* p, unsigned n)
 
 #ifdef _WIN32
 /* RSX_REPLAY_PROF=1: a sampling profiler over the replay thread. Every
- * millisecond the thread is suspended, its stack walked (16 frames) and
+ * millisecond the thread is suspended, its stack unwound (16 frames) and
  * resumed; a sample is kept only when the thread ran since the last one
  * (its cycle count moved), so GPU waits do not count. */
 #include <dbghelp.h>
@@ -152,16 +152,24 @@ static DWORD WINAPI prof_thread(LPVOID unused)
         if (SuspendThread(s_prof_target) == (DWORD)-1) continue;
         CONTEXT c; memset(&c, 0, sizeof c); c.ContextFlags = CONTEXT_FULL;
         if (GetThreadContext(s_prof_target, &c)) {
-            STACKFRAME64 f; memset(&f, 0, sizeof f);
-            f.AddrPC.Offset = c.Rip; f.AddrPC.Mode = AddrModeFlat;
-            f.AddrFrame.Offset = c.Rbp; f.AddrFrame.Mode = AddrModeFlat;
-            f.AddrStack.Offset = c.Rsp; f.AddrStack.Mode = AddrModeFlat;
+            /* The unwinder the system uses for exceptions, not dbghelp's
+             * StackWalk64: that one allocates, and with the thread suspended
+             * holding the heap's lock the sampler waited on it for good. */
             const LONG i = s_prof_n;
             int d = 0;
-            while (d < PROF_DEPTH && StackWalk64(IMAGE_FILE_MACHINE_AMD64, GetCurrentProcess(), s_prof_target, &f, &c,
-                                                 NULL, SymFunctionTableAccess64, SymGetModuleBase64, NULL)) {
-                if (!f.AddrPC.Offset) break;
-                s_prof_pc[i][d++] = f.AddrPC.Offset;
+            while (d < PROF_DEPTH && c.Rip) {
+                s_prof_pc[i][d++] = c.Rip;
+                DWORD64 image = 0;
+                PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(c.Rip, &image, NULL);
+                if (!fe) {   /* a leaf: the return address is on top of the stack */
+                    if (!c.Rsp) break;
+                    c.Rip = *(const DWORD64*)c.Rsp;
+                    c.Rsp += 8;
+                    continue;
+                }
+                void* handler_data = NULL;
+                DWORD64 frame = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, c.Rip, fe, &c, &handler_data, &frame, NULL);
             }
             if (d) { s_prof_depth[i] = (unsigned char)d; s_prof_n = i + 1; }
         }
