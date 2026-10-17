@@ -569,6 +569,12 @@ if(WIN32 AND ZLIB_FOUND)
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
     )
     set_target_properties(rsx_replay PROPERTIES LINKER_LANGUAGE CXX)
+    # A PDB when the runtime carries debug records: RSX_REPLAY_PROF names
+    # the engine's functions through it.
+    if(PS3RECOMP_DEBUG_INFO AND MSVC)
+        target_compile_options(rsx_replay PRIVATE /Z7)
+        target_link_options(rsx_replay PRIVATE /DEBUG)
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
