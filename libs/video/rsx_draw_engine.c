@@ -52,6 +52,10 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
 #define ENG_MAX_PIPELINES  8192
+/* Open-addressed indexes over the texture and pipeline caches (entry + 1, 0
+ * empty), at most half full. */
+#define ENG_TEX_INDEX      4096u
+#define ENG_PIPE_INDEX     16384u
 #define ENG_MAX_BATCHES    256
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
@@ -127,6 +131,8 @@ typedef struct {
     u32 watched;           /* every page under it was protected then              */
     u32 standin_gen;       /* s_standin_gen when the port was last asked          */
     const void* standin;   /* the stand-in's bytes it was uploaded from, or NULL  */
+    u32 span;              /* eng_texture_span for span_levels - 1 mip levels     */
+    u32 span_levels;       /* the levels it was worked out for, + 1; 0 none       */
 } eng_texture;
 
 struct eng_pipe_job;
@@ -156,6 +162,8 @@ static struct {
     u32 n_textures;
     eng_pipeline pipelines[ENG_MAX_PIPELINES];
     u32 n_pipelines;
+    u32 tex_index[ENG_TEX_INDEX];
+    u32 pipe_index[ENG_PIPE_INDEX];
     eng_display_buffer display_buffers[8];
 
     u32 frames;
@@ -231,6 +239,12 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
 {
     s_guest_reader = reader;
     s_guest_user = user;
+}
+
+static rsx_guest_watch_fn s_guest_watch;
+void rsx_draw_engine_set_guest_watch(rsx_guest_watch_fn fn)
+{
+    s_guest_watch = fn;
 }
 
 static const u8* eng_guest_ptr(void* user, u32 location, u32 offset,
@@ -803,6 +817,87 @@ static u32 eng_texture_span(u32 fmt, u32 w, u32 h, u32 levels, u32 pitch, int cu
     return lv[n - 1].offset + lv[n - 1].tl.face_bytes;
 }
 
+/* RSX_ENGINE_SLOW=1: the per-draw paths as they were before the indexes,
+ * the single fragment-program pass and the per-draw program memo -- for
+ * comparing the two in one build (rsx_replay --bench, DOD3_AB). */
+int g_rsx_eng_slow = -1;
+static inline int eng_slow(void)
+{
+    if (g_rsx_eng_slow < 0) g_rsx_eng_slow = getenv("RSX_ENGINE_SLOW") ? 1 : 0;
+    return g_rsx_eng_slow;
+}
+
+static inline u32 eng_tex_key_hash(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                   u32 pitch, u32 remap, u32 cube)
+{
+    const u64 a = ((u64)offset << 32) ^ ((u64)location << 28) ^ ((u64)cube << 27) ^ fmt;
+    const u64 b = ((u64)w << 48) ^ ((u64)h << 32) ^ ((u64)pitch << 20) ^ remap;
+    u64 x = a * 0x9E3779B97F4A7C15ull ^ b * 0xC2B2AE3D27D4EB4Full;
+    x ^= x >> 31;
+    return (u32)x;
+}
+
+static eng_texture* eng_tex_find(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+                                 u32 pitch, u32 remap, u32 cube)
+{
+    const u32 m = ENG_TEX_INDEX - 1u;
+    for (u32 i = eng_tex_key_hash(location, offset, fmt, w, h, pitch, remap, cube) & m;; i = (i + 1u) & m) {
+        const u32 v = g.tex_index[i];
+        if (!v) return NULL;
+        eng_texture* e = &g.textures[v - 1u];
+        if (e->location == location && e->offset == offset && e->format == fmt &&
+            e->width == w && e->height == h && e->pitch == pitch && e->remap == remap &&
+            e->cubemap == cube)
+            return e;
+    }
+}
+
+static void eng_tex_index_add(u32 index)
+{
+    const eng_texture* e = &g.textures[index];
+    const u32 m = ENG_TEX_INDEX - 1u;
+    u32 i = eng_tex_key_hash(e->location, e->offset, e->format, e->width, e->height,
+                             e->pitch, e->remap, e->cubemap) & m;
+    while (g.tex_index[i]) i = (i + 1u) & m;
+    g.tex_index[i] = index + 1u;
+}
+
+/* An evicted entry took another key: linear probing has no cheap delete, so
+ * the index is rebuilt (only when the cache is full and turning over). */
+static void eng_tex_index_rebuild(void)
+{
+    memset(g.tex_index, 0, sizeof g.tex_index);
+    for (u32 i = 0; i < g.n_textures; i++) eng_tex_index_add(i);
+}
+
+static inline u32 eng_pipe_key_slot(u64 key)
+{
+    return (u32)(key ^ (key >> 29) ^ (key >> 47)) & (ENG_PIPE_INDEX - 1u);
+}
+
+static eng_pipeline* eng_pipe_find(u64 key)
+{
+    for (u32 i = eng_pipe_key_slot(key);; i = (i + 1u) & (ENG_PIPE_INDEX - 1u)) {
+        const u32 v = g.pipe_index[i];
+        if (!v) return NULL;
+        if (g.pipelines[v - 1u].key == key) return &g.pipelines[v - 1u];
+    }
+}
+
+static void eng_pipe_index_add(u32 index)
+{
+    u32 i = eng_pipe_key_slot(g.pipelines[index].key);
+    while (g.pipe_index[i]) i = (i + 1u) & (ENG_PIPE_INDEX - 1u);
+    g.pipe_index[i] = index + 1u;
+}
+
+/* Fragment texture unit u is switched on (CONTROL0 bit 31): the loops over
+ * all sixteen units skip the others before decoding them. */
+static inline int eng_tex_unit_on(u32 u)
+{
+    return (int)(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31);
+}
+
 /* One hash per cached texture per presented frame. FNV-style over the whole
  * span is deliberately cheap: this is a mutation detector, not a content id
  * (rsx_live_draw.c:2002-2026). Eight independent lanes, folded at the end: a
@@ -1020,14 +1115,19 @@ int g_eng_tex_watch = -1;
 static unsigned long long s_tex_skips_total;   /* hashes the watch saved, for [frametime] */
 static int eng_tex_watch_on(void)
 {
-    if (g_eng_tex_watch < 0) g_eng_tex_watch = vm_watch_available() && !s_guest_reader ? 1 : 0;
+    if (g_eng_tex_watch < 0)
+        g_eng_tex_watch = s_guest_reader ? (s_guest_watch ? 1 : 0) : (vm_watch_available() ? 1 : 0);
     return g_eng_tex_watch > 0;
 }
 /* Arm the watch over a texture's bytes; 1 when the stamp can be trusted. */
 static int eng_tex_watch_arm(u32 location, u32 offset, u32 span, u64* stamp)
 {
-    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     u32 unwatched = 1;
+    if (s_guest_reader) {
+        *stamp = s_guest_watch ? s_guest_watch(s_guest_user, location, offset, span, &unwatched) : 0;
+        return s_guest_watch && unwatched == 0;
+    }
+    const u32 ea = cellGcmResolveLocated(location == RSX_LOCATION_LOCAL, offset);
     if (!ea) { *stamp = 0; return 0; }
     *stamp = vm_watch_arm(ea, span, &unwatched);
     return unwatched == 0;
@@ -1037,16 +1137,37 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                             u32 levels, u32 pitch, int cube, u32 remap)
 {
     if (!w || !h || w > ENG_MAX_TEX_DIM || h > ENG_MAX_TEX_DIM) return 0;
-    const u32 span = eng_texture_span(fmt, w, h, levels, pitch, cube);
-    if (!span) return 0;
+    const int slow = eng_slow();
+    u32 span = 0;
+    eng_texture* e = NULL;
+    if (slow) {
+        span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+        if (!span) return 0;
+        for (u32 i = 0; i < g.n_textures && !e; i++) {
+            eng_texture* c = &g.textures[i];
+            if (c->location == location && c->offset == offset &&
+                c->format == fmt && c->width == w && c->height == h &&
+                c->pitch == pitch && c->remap == remap &&
+                c->cubemap == (u32)(cube != 0))
+                e = c;
+        }
+    } else {
+        e = eng_tex_find(location, offset, fmt, w, h, pitch, remap, (u32)(cube != 0));
+        if (e) {
+            /* The span depends on the level count, which is not part of the
+             * key: work it out again only when that changes. */
+            if (e->span_levels != levels + 1u) {
+                e->span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+                e->span_levels = levels + 1u;
+            }
+            span = e->span;
+        } else {
+            span = eng_texture_span(fmt, w, h, levels, pitch, cube);
+        }
+        if (!span) return 0;
+    }
 
-    for (u32 i = 0; i < g.n_textures; i++) {
-        eng_texture* e = &g.textures[i];
-        if (e->location != location || e->offset != offset ||
-            e->format != fmt || e->width != w || e->height != h ||
-            e->pitch != pitch || e->remap != remap ||
-            e->cubemap != (u32)(cube != 0))
-            continue;
+    if (e) {
         /* The port's stand-ins changed: ask about this texture again, and
          * upload it again only if the answer is another one. */
         const u32 standin_gen = s_standin_gen;
@@ -1129,11 +1250,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
         evicted = g.textures[index].handle;
     }
 
+    {   /* the new entry: its own block, the hit's pointer above is NULL here */
     eng_texture e;
     memset(&e, 0, sizeof(e));
     e.location = location; e.offset = offset; e.format = fmt;
     e.width = w; e.height = h; e.pitch = pitch;
     e.remap = remap; e.cubemap = (u32)(cube != 0);
+    e.span = span; e.span_levels = levels + 1u;
     e.last_hash_frame = g.frames;
     e.last_use_serial = ++g.texture_use_serial;
     if (eng_tex_watch_on()) { u64 st = 0; e.watched = (u32)eng_tex_watch_arm(location, offset, span, &st); e.watch_stamp = st; }
@@ -1144,8 +1267,12 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                   cube, remap);
     e.standin = s_upload_standin;
     if (e.handle && evicted) g.be->texture_release(g.be->user, evicted);
-    if (e.handle || !evicted) g.textures[index] = e;
+    if (e.handle || !evicted) {
+        g.textures[index] = e;
+        if (evicted) eng_tex_index_rebuild(); else eng_tex_index_add(index);
+    }
     return e.handle;
+    }
 }
 
 /* SET_TEXTURE_FILTER's min field is [18:16] (1 NEAREST, 2 LINEAR, then 3..6,
@@ -1187,6 +1314,7 @@ static u32 eng_texel_ops(u32 ops[16])
     memset(ops, 0, 16 * sizeof ops[0]);
     if (off) return 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        if (!eng_tex_unit_on(u)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -1277,6 +1405,7 @@ static u32 eng_shadow_units(u8 funcs[16])
     memset(funcs, 0, 16);
     if (off) return 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+        if (!eng_tex_unit_on(u)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -1293,6 +1422,7 @@ static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+        if (!eng_tex_unit_on(u)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         /* A cube face is square by construction, so a non-square image
@@ -1331,8 +1461,34 @@ static int eng_vp_info_current(u32 start)
     return 0;
 }
 
+/* The answer for the draw being issued: the layout, the pipeline and the
+ * snapshot check each ask, and nothing a draw does changes it. s_draw_open
+ * is set by sink_end around the draw, so a question asked outside one is
+ * answered afresh. */
+static int s_draw_open;
+static struct { int valid, ret; const u8* vp; u32 vp_instrs; const u8* fp; u32 fp_size; } s_progs;
+
+static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
+                                       const u8** out_fp, u32* out_fp_size);
 static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                               const u8** out_fp, u32* out_fp_size)
+{
+    if (!s_draw_open || eng_slow())
+        return eng_guest_programs_uncached(out_vp, out_vp_instrs, out_fp, out_fp_size);
+    if (!s_progs.valid) {
+        s_progs.ret = eng_guest_programs_uncached(&s_progs.vp, &s_progs.vp_instrs,
+                                                  &s_progs.fp, &s_progs.fp_size);
+        s_progs.valid = 1;
+    }
+    if (out_vp) *out_vp = s_progs.vp;
+    if (out_vp_instrs) *out_vp_instrs = s_progs.vp_instrs;
+    if (out_fp) *out_fp = s_progs.fp;
+    if (out_fp_size) *out_fp_size = s_progs.fp_size;
+    return s_progs.ret;
+}
+
+static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
+                                       const u8** out_fp, u32* out_fp_size)
 {
     const u8* vp_uc = NULL;
     u32 vp_instrs = 0;
@@ -1698,14 +1854,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     memset(unnorm_dim, 0, sizeof unnorm_dim);
     { static int off = -1; if (off < 0) off = getenv("RSX_NO_UNNORM") ? 1 : 0;
       for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
+          if (!eng_tex_unit_on(u)) continue;
           rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
           if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((cube_mask >> u) & 1u)) continue;
           if (!t.width || !t.height) continue;
           unnorm_mask |= 1u << u; unnorm_dim[u][0] = t.width; unnorm_dim[u][1] = t.height;
       } }
 
-    memset(&g.fp_constants, 0, sizeof g.fp_constants);
-    if (!fixed && rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0)
+    const int slow = eng_slow();
+    u64 fp_key = 0;
+    g.fp_constants.count = 0;
+    if (!fixed && (slow ? rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants)
+                        : rsx_fp_scan(fp_uc, fp_size, &g.fp_constants, &fp_key)) < 0)
         return 0;
 
     /* Identity: the vertex program's own bytes, the fragment program's
@@ -1724,8 +1884,12 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             key = eng_fnv1a(vp_uc, vp_instrs * 16u, key);
             if (s_vpi.valid) { s_vpi.hash = key; s_vpi.hash_valid = 1; }
         }
-        key = rsx_fp_structural_hash(fp_uc, fp_size, key);
-        if (!key) return 0;
+        if (slow) {
+            key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+            if (!key) return 0;
+        } else {
+            key = eng_fnv1a(&fp_key, sizeof fp_key, key);
+        }
         const u32 fp_ctrl_key = fp_ctrl & 0x40u;
         key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
         key = eng_fnv1a(&cube_mask, sizeof cube_mask, key);
@@ -1751,11 +1915,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
 
-    for (u32 i = 0; i < g.n_pipelines; i++)
-        if (g.pipelines[i].key == key) {
-            *out_fixed = g.pipelines[i].fixed;
-            return eng_pipe_poll(&g.pipelines[i]);
+    if (slow) {
+        for (u32 i = 0; i < g.n_pipelines; i++)
+            if (g.pipelines[i].key == key) {
+                *out_fixed = g.pipelines[i].fixed;
+                return eng_pipe_poll(&g.pipelines[i]);
+            }
+    } else {
+        eng_pipeline* p = eng_pipe_find(key);
+        if (p) {
+            *out_fixed = p->fixed;
+            return eng_pipe_poll(p);
         }
+    }
     if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
 
     u32 handle = 0;
@@ -1863,6 +2035,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
           fprintf(stderr, "[pipe-slow] frame %u: new pipeline took %.1f ms (vp-hlsl %016llx fp-hlsl %016llx); %u built, %.0f ms in all\n",
                   g.frames, ms, (unsigned long long)g.pipelines[g.n_pipelines].vp_hlsl,
                   (unsigned long long)g.pipelines[g.n_pipelines].fp_hlsl, g.n_pipelines + 1, total_ms); }
+    eng_pipe_index_add(g.n_pipelines);
     g.n_pipelines++;
     *out_fixed = fixed;
     return handle;
@@ -2189,6 +2362,62 @@ static EngVCEntry* eng_vc_lookup(u64 key)
     e->watched = trusted;
     e->last_frame = g.frames;
     return e;
+}
+
+/* An entry reused (its second draw) and at least RSX_VCACHE_PROMOTE bytes
+ * (default 4 KB, 0 never) gets a buffer of its own then, as one of
+ * ENG_VC_GPU_MIN does when it is stored: from there on it is drawn in place
+ * instead of copied into the per-submit arena at every draw. Doing it at the
+ * second use leaves the entries drawn once as cheap as before. */
+#define ENG_VC_PROMOTE_MIN ((size_t)4 << 10)
+static size_t eng_vc_promote_min(void)
+{
+    static size_t v = (size_t)-1;
+    if (v == (size_t)-1) { const char* e = getenv("RSX_VCACHE_PROMOTE");
+                           v = e ? (size_t)strtoull(e, 0, 0) : ENG_VC_PROMOTE_MIN; }
+    return v;
+}
+static void eng_vc_promote(EngVCEntry* e)
+{
+    if (!g.be->buffer_wrap || !g.be->draw_buffer || !g.be->buffer_release) return;
+    const size_t vb = (size_t)e->n_verts * e->stride;
+    const size_t ib = e->indexed ? (size_t)e->n_draw * sizeof(u32) : 0;
+#ifdef _WIN32
+    const size_t page = 4096u;
+#else
+    const size_t page = (size_t)getpagesize();
+#endif
+    const u32 ib_off = (u32)((vb + 255u) & ~(size_t)255u);
+    const size_t total = ((size_t)ib_off + ib + page - 1u) & ~(page - 1u);
+    if (total > 0xFFFFFFFFu) return;
+    void* mem = NULL;
+#ifdef _WIN32
+    mem = _aligned_malloc(total, page);
+    if (!mem) return;
+#else
+    if (posix_memalign(&mem, page, total) != 0) return;
+#endif
+    memcpy(mem, e->verts, vb);
+    if (ib) memcpy((u8*)mem + ib_off, e->indices, ib);
+    const double t_wrap = eng_now_ms();
+    const u32 buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
+    s_fstat.vc_wrap_ms += eng_now_ms() - t_wrap;
+    if (!buf) {
+#ifdef _WIN32
+        _aligned_free(mem);
+#else
+        free(mem);
+#endif
+        return;
+    }
+    /* As eng_vc_store keeps them: the buffer's memory, which a backend that
+     * copies (D3D12) has already let go of -- nothing reads them for an
+     * entry with a buffer. */
+    free(e->verts); free(e->indices);
+    e->verts = (u8*)mem;
+    e->indices = ib ? (u32*)((u8*)mem + ib_off) : NULL;
+    e->buf = buf;
+    e->ib_off = ib_off;
 }
 
 static void eng_vc_free(EngVCEntry* e)
@@ -2874,7 +3103,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r);
 static void sink_end(void* user, const rsx_dispatch* r)
 {
     const double t0 = eng_now_ms();
+    s_progs.valid = 0;
+    s_draw_open = 1;
     sink_end_impl(user, r);
+    s_draw_open = 0;
     s_fstat.draws++; s_fstat.draw_ms += eng_now_ms() - t0;
     s_frame_draws++;
 }
@@ -2932,6 +3164,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     u32 n_draw = 0;
     if (vce) {
         s_vcstat.hit++;
+        if (!vce->buf && !eng_slow()) {
+            const size_t pm = eng_vc_promote_min();
+            if (pm && vce->bytes >= pm) eng_vc_promote(vce);
+        }
         dc.fetch_ok = 1;
         dc.n_verts = vce->n_verts;
         dc.n_source_refs = vce->n_source_refs;
@@ -3864,6 +4100,25 @@ void rsx_draw_engine_method(u32 method, u32 arg)
                 m == 0x17C8u ? "CLEAR_REPORT_VALUE" : m == 0x1800u ? "GET_REPORT" : "ZPASS_ENABLE", arg);
     rsx_dispatch_method(&g.rsx, m, arg);
     if (cap) rsx_capture_method(method, arg);
+}
+
+int rsx_draw_engine_upload_window(u32 method, u32 count)
+{
+    if (!count) return 0;
+    const u32 m = method & 0x1FFCu, end = m + count * 4u;
+    return (m >= 0x1F00u && end <= 0x1F80u) || (m >= 0x0B80u && end <= 0x0C00u);
+}
+
+void rsx_draw_engine_upload_run(u32 method, u32 count, const u8* be)
+{
+    if (!g.ready) return;
+    /* The capture records method by method, behind the pages it read. */
+    if (!g_rsx_capture_on && rsx_dispatch_upload_run(&g.rsx, method & 0x1FFCu, count, be)) return;
+    for (u32 i = 0; i < count; i++) {
+        const u8* p = be + i * 4u;
+        rsx_draw_engine_method(method + i * 4u,
+                               ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3]);
+    }
 }
 
 void cellGcm_set_report_value(u32 index, u32 value);   /* cellGcmSys.c */

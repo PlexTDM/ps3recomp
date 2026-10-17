@@ -318,7 +318,6 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
                     method, arg);
         return;
     }
-    rsx->seen[idx]++;
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))
@@ -446,6 +445,53 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     default:
         break;
     }
+}
+
+/* A run of consecutive words into the transform constant or transform
+ * program upload window, big-endian as the FIFO holds them: what
+ * rsx_dispatch_method does with each, in one call (the walker's bulk path --
+ * these windows are most of a frame's words). 0 when the run is not wholly
+ * inside one window, or RSX_CONST_LOG wants to see each word. */
+static inline u32 dsp_be32(const u8* p)
+{
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be)
+{
+    static int log = -1;
+    if (log < 0) log = getenv("RSX_CONST_LOG") ? 1 : 0;
+    if (log || !count) return 0;
+    const u32 end = method + count * 4u;
+    if (method >= M_VP_UPLOAD_CONST && end <= M_VP_UPLOAD_CONST + 32u * 4u) {
+        const u32 slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        u32 word = (method - M_VP_UPLOAD_CONST) >> 2, written = 0;
+        for (u32 i = 0; i < count; i++, word++) {
+            const u32 v = dsp_be32(be + i * 4u);
+            rsx->regs[(method >> 2) + i] = v;
+            const u32 slot = slot0 + (word >> 2);
+            if (slot < RSX_DSP_NUM_CONSTANTS) { rsx->constants[slot][word & 3] = v; written++; }
+        }
+        rsx->const_gen += written;
+        return 1;
+    }
+    if (method >= M_VP_UPLOAD_INST && end <= M_VP_UPLOAD_INST + 32u * 4u) {
+        u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        for (u32 i = 0; i < count; i++) {
+            const u32 m = method + i * 4u, v = dsp_be32(be + i * 4u);
+            rsx->regs[m >> 2] = v;
+            const u32 lane = ((m - M_VP_UPLOAD_INST) >> 2) & 3;
+            const u32 pos = *load * 4 + lane;
+            if (pos < RSX_DSP_VP_WORDS) {
+                rsx->vp[pos] = v;
+                rsx->vp_gen++;
+            }
+            if (lane == 3)
+                (*load)++;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 /* ---- getters ----------------------------------------------------------- */

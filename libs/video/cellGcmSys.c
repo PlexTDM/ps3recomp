@@ -1826,12 +1826,18 @@ static void gcm_fire_pos_flip(void)
     rsx_draw_engine_fifo_flip(s_current_display_buffer_id);
 }
 
+/* DOD3_AB=fifofast: 0 walks every method word by word through the old
+ * processor too, as before the walker's fast paths. */
+int g_gcm_fifo_fast = 1;
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
-      if (getenv("GCM_RATE")) {
+      static int rate = -1;
+      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
+      if (rate) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -1872,7 +1878,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * once at init; if the title repoints gCellGcmCurrentContext at a buffer of
      * its own, every field below moves with it and the FIFO the runtime walks
      * stops being the one the title fills. Reported on change, not per tick. */
-    if (getenv("GCM_CTXDBG") && s_gcm_ctx_out_ea) {
+    static int ctxdbg = -1;
+    if (ctxdbg < 0) ctxdbg = getenv("GCM_CTXDBG") ? 1 : 0;
+    if (ctxdbg && s_gcm_ctx_out_ea) {
         static u32 last_ptr = 0xFFFFFFFFu, last_cur = 0xFFFFFFFFu;
         u32 ptr = vm_read32(s_gcm_ctx_out_ea);
         u32 cur = ptr ? vm_read32(ptr + 0x8) : 0;
@@ -1888,7 +1896,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     u32 start_off = s_fifo_getoff;
-    if (getenv("GCM_DRAINDBG")) {
+    static int draindbg = -1;
+    if (draindbg < 0) draindbg = getenv("GCM_DRAINDBG") ? 1 : 0;
+    if (draindbg) {
         static int n = 0;
         if (n++ % 60 == 0)
             printf("[DRAIN] getoff=%08X put=%08X ref=%08X ctx.current=%08X\n",
@@ -1949,6 +1959,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    /* The fast paths below need the draw engine drawing, no old rsx_state
+     * backend (which would want every method), no live engine and none of
+     * the per-word diagnostics: then the old processor's only work left is
+     * the labels and the reference, and the upload windows' words go to the
+     * engine's register file in runs. g_gcm_fifo_fast = 0 (DOD3_AB=fifofast)
+     * walks word by word as before. */
+    static int fifo_diag = -1;
+    if (fifo_diag < 0)
+        fifo_diag = (getenv("GCM_SUBCH7") || getenv("GCM_OBJDBG") || getenv("GCM_SUBCH_GATE") ||
+                     getenv("GCM_VAL_WATCH") || getenv("GCM_SUBCH_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
+                     getenv("TCONST_FIFO") || getenv("RSX_TRACE") || getenv("GCM_ENGINE_ALL_SUBCH")) ? 1 : 0;
+    const int fifo_fast = g_gcm_fifo_fast && !fifo_diag && rsx_draw_engine_enabled() &&
+                          !rsx_live_draw_enabled() && rsx_get_backend() == NULL;
+    /* GCM_SUBCH1_2D, as the word loop reads it: subchannel 1 is 3D unless set
+     * (Drakengard 3 sets it). */
+    static int sub1_2d = -1;
+    if (sub1_2d < 0) { const char* e = getenv("GCM_SUBCH1_2D"); sub1_2d = e ? atoi(e) : 0; }
     if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
     while (s_fifo_getoff != put && budget-- > 0) {
         if (s_fifo_getoff == s_pos_flip_io) {
@@ -2217,6 +2244,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 s_fifo_getoff += 4 + count * 4;
                 continue;
             }
+            /* Transform constants and program words, the bulk of a frame (58-70%
+             * of Drakengard 3's): nothing but the engine's register file reads
+             * them, so a run inside one IO page goes over whole. */
+            if (fifo_fast && type == 0 && (subch == 0 || (subch == 1 && !sub1_2d)) &&
+                rsx_draw_engine_upload_window(method, count)) {
+                const u32 io0 = s_fifo_getoff + 4;
+                const u32 dea0 = gcm_io2ea(io0);
+                if (dea0 && (io0 & 0xFFFFFu) + count * 4u <= 0x100000u) {
+                    rsx_draw_engine_upload_run((subch << 13) | method, count, vm_ptr8(dea0));
+                    s_fifo_getoff += 4 + count * 4;
+                    continue;
+                }
+            }
             for (u32 i = 0; i < count; i++) {
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
@@ -2391,7 +2431,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     if (m == 0x1D70u || m == 0x1D74u) gcm_report_copies_flush();
-                    rsx_process_method(&s_state, m, vm_read32(dea));
+                    /* With the draw engine drawing, the old processor has no
+                     * backend: of what it does, only the labels and the
+                     * reference are still read. */
+                    if (!fifo_fast || m == 0x50u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u)
+                        rsx_process_method(&s_state, m, vm_read32(dea));
                     if ((m == 0x1D70u || m == 0x1D74u) && g_gcm_label_write_hook) g_gcm_label_write_hook();
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
                      * publication (gcm_ref_publish below) instead of letting a
@@ -2426,8 +2470,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                 vm_write32(rea + 12u, 0u);
                             } else { static int un = 0; if (un < 4 && ++un) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
                         } else {
+                            static int no_queries = -1;
+                            if (no_queries < 0) no_queries = getenv("RSX_NO_QUERIES") ? 1 : 0;
                             const int measured_query = (v >> 24) == 1u && s_zpass_query_open &&
-                                                       rsx_draw_engine_enabled() && !getenv("RSX_NO_QUERIES");
+                                                       rsx_draw_engine_enabled() && !no_queries;
                             s_zpass_query_open = 0;
                             if (idx < CELL_GCM_MAX_REPORT_COUNT && !(measured_query && s_report_measured[idx])) {
                                 s_report_data[idx].timestamp = get_timestamp_ns();
@@ -2549,7 +2595,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * per tick (gcm_ref_push/gcm_ref_publish_one above) so every SET_REFERENCE
      * value stays observable to equality-waiters. The wrap recycle path polls
      * the drained EA. */
-    if (getenv("GCM_DRAINDBG")) {
+    if (draindbg) {
         static int n2 = 0;
         if (n2++ % 60 == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",

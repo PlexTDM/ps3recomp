@@ -152,6 +152,11 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+/* `count` consecutive words of an incrementing method run starting at
+ * `method`, big-endian at `be`, all inside the transform constant or program
+ * upload window: rsx_dispatch_method on each, at once. 0 (nothing done) for
+ * a run it does not take. */
+int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* be);
 
 /* ---- decoded state getters -------------------------------------------- */
 

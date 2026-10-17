@@ -160,7 +160,9 @@ int rsx_fp_collect_constants(
 {
     if (!ucode || !out)
         return -1;
-    memset(out, 0, sizeof(*out));
+    /* Only count: every reader stops there, and clearing the whole 32 KB
+     * block twice a draw was a measurable share of the draw engine. */
+    out->count = 0;
 
     u32 off = 0;
     while (off + 16 <= max_bytes) {
@@ -182,6 +184,58 @@ int rsx_fp_collect_constants(
         }
         if (w0 & FP_END)
             return (int)out->count;
+    }
+    return -1;
+}
+
+/* The draw engine's per-draw pass over a program: its inline constants,
+ * exactly as rsx_fp_collect_constants collects them (and failing where it
+ * fails), and in the same walk a key for the program's structure -- every
+ * instruction word with the constant slots left out, and the counts. Not
+ * rsx_fp_structural_hash: that one's values name programs in per-title
+ * switches (RSX_FP_SAT_ALPHA) and stay as they are, at a dependent multiply
+ * per byte. This one only has to tell programs apart in a run's own pipeline
+ * cache, and folds a whole instruction per multiply. */
+static inline u64 fp_scan_mix(u64 a, u64 b)
+{
+    const __uint128_t r = (__uint128_t)a * b;
+    return (u64)r ^ (u64)(r >> 64);
+}
+
+int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64* key)
+{
+    if (!ucode || !out || !key)
+        return -1;
+    out->count = 0;
+    u64 h = 0x31535046u ^ 0xa0761d6478bd642full;   /* "FPS1" */
+    u32 off = 0, instructions = 0;
+    while (off + 16 <= max_bytes) {
+        u64 lo, hi;
+        memcpy(&lo, ucode + off, 8);
+        memcpy(&hi, ucode + off + 8, 8);
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        h = fp_scan_mix(lo ^ h ^ 0xe7037ed1a0b428dbull, hi ^ 0x8ebc6af09c88c6e3ull);
+        instructions++;
+        off += 16;
+        if (fp_instruction_has_constant(w1, w2, w3)) {
+            if (off + 16 > max_bytes ||
+                out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
+                return -1;
+            for (u32 component = 0; component < 4; ++component)
+                out->values[out->count][component] =
+                    rsx_fp_sanitize_constant_word(
+                        rsx_fp_read_word(ucode + off + component * 4));
+            out->count++;
+            off += 16;
+        }
+        if (w0 & FP_END) {
+            *key = fp_scan_mix(h ^ instructions ^ 0x589965cc75374cc3ull,
+                               ((u64)out->count << 32) ^ off ^ 0xa0761d6478bd642full);
+            return (int)out->count;
+        }
     }
     return -1;
 }

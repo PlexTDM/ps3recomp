@@ -265,6 +265,13 @@ void rsx_draw_engine_set_default(int on);
 
 /* A runner with its own RSX IO map supplies its address resolver before init.
  * NULL restores the toolkit's cellGcm mapping. */
+/* A host that serves guest memory through the reader can stand in for the
+ * page write-watch too (the replay does, from its page records): the stamp
+ * for [offset, offset+len) at that location changes whenever any byte of it
+ * has been written since, and *unwatched is the number of pages it cannot
+ * vouch for (a caller with any hashes as before). */
+typedef u64 (*rsx_guest_watch_fn)(void* user, u32 location, u32 offset, u32 len, u32* unwatched);
+void rsx_draw_engine_set_guest_watch(rsx_guest_watch_fn fn);
 void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user);
 
 /* Counts the uploads that are a decoded video's planes (8-bit, at least 256
@@ -310,6 +317,13 @@ void rsx_draw_engine_shutdown(void);
  * SPU-built command lists bind NV4097 to another subchannel would otherwise
  * write its state into the wrong register bank. */
 void rsx_draw_engine_method(u32 method, u32 arg);
+/* The FIFO walker's bulk path: an incrementing run of `count` words from
+ * `method` (subchannel bits allowed), big-endian at `be`, wholly inside the
+ * transform constant (0x1F00) or program (0x0B80) upload window --
+ * rsx_draw_engine_upload_window says whether it is. The same as calling
+ * rsx_draw_engine_method on each word. */
+int  rsx_draw_engine_upload_window(u32 method, u32 count);
+void rsx_draw_engine_upload_run(u32 method, u32 count, const u8* be);
 
 /* cellGcmSetDisplayBuffer, so the flip can resolve a buffer id to a surface
  * the engine has actually rendered rather than to whatever is bound. */

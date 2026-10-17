@@ -2612,8 +2612,12 @@ static void eng_gpu_time_collect(u32 slot)
     }
 }
 
+/* Bumped by every new command list: a caller that took descriptor tables
+ * can tell whether a flush started another list under it. */
+static u32 s_list_gen;
 static void eng_list_begin(void)
 {
+    s_list_gen++;
     eng_gpu_time_collect(s_slot);
     CALL0(s_alloc[s_slot], Reset);
     CALL(s_list, Reset, s_alloc[s_slot], NULL);
@@ -3124,6 +3128,42 @@ static void eng_encode_draw(const EngRecord* r)
     bar_flush();
     eng_use_main_rootsig();
 
+    /* The descriptor tables first: a full ring flushes the list
+     * (eng_hard_flush), and on the new one nothing is bound and the old
+     * tables' slots are reused -- so both are taken again until neither
+     * flushed, then everything is bound on the list that draws. */
+    D3D12_GPU_DESCRIPTOR_HANDLE st, sm;
+    int smp[ENG_SRV_TABLE];
+    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) smp[u] = r->samp[u];
+    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) smp[RSX_BE_MAX_TEXTURES + u] = r->vsamp[u];
+    for (int tries = 0;; tries++) {
+        const u32 gen = s_list_gen;
+        if (s_srv_last_valid && memcmp(s_srv_last_src, srv, sizeof srv) == 0) st = s_srv_last_gpu;
+        else {
+            st = eng_srv_table(srv, ENG_SRV_TABLE);
+            memcpy(s_srv_last_src, srv, sizeof srv); s_srv_last_gpu = st; s_srv_last_valid = 1;
+        }
+        sm = eng_smp_table(smp);
+        if (gen == s_list_gen || tries) break;
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE vt = st; vt.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_srv_step;
+    D3D12_GPU_DESCRIPTOR_HANDLE vsm = sm; vsm.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_smp_step;
+
+    /* What the previous draw left bound, so a draw sets only what differs.
+     * Everything that binds outside this function clears s_cur_targets_valid
+     * (helper passes, root signature switches, a new list), and that clears
+     * this too. RSX_D3D12_REBIND=1 sets everything on every draw. */
+    static struct {
+        int valid;
+        D3D12_VIEWPORT vp; D3D12_RECT sc; u32 sref;
+        D3D12_VERTEX_BUFFER_VIEW vbv; D3D12_INDEX_BUFFER_VIEW ibv;
+        D3D12_GPU_VIRTUAL_ADDRESS cb0, cb4;
+        UINT64 t1, t2, t3, t5;
+    } b;
+    static int rebind = -1;
+    if (rebind < 0) rebind = getenv("RSX_D3D12_REBIND") ? 1 : 0;
+    if (!s_cur_targets_valid || rebind) b.valid = 0;
+
     static int s_cur_ms;
     int same_targets = s_cur_targets_valid && s_cur_nrt == nrt && s_cur_depth == depth && s_cur_ms == ms;
     for (u32 k = 0; same_targets && k < nrt; k++) same_targets = s_cur_rt[k] == r->rt[k];
@@ -3140,54 +3180,28 @@ static void eng_encode_draw(const EngRecord* r)
 
     D3D12_VIEWPORT vp; D3D12_RECT sc;
     eng_vp_sc(r, scaled, tw, th, &vp, &sc);
-    CALL(s_list, RSSetViewports, 1, &vp);
-    CALL(s_list, RSSetScissorRects, 1, &sc);
-    CALL(s_list, OMSetStencilRef, r->stencil_ref);
+    if (!b.valid || memcmp(&vp, &b.vp, sizeof vp)) { CALL(s_list, RSSetViewports, 1, &vp); b.vp = vp; }
+    if (!b.valid || memcmp(&sc, &b.sc, sizeof sc)) { CALL(s_list, RSSetScissorRects, 1, &sc); b.sc = sc; }
+    if (!b.valid || r->stencil_ref != b.sref) { CALL(s_list, OMSetStencilRef, r->stencil_ref); b.sref = r->stencil_ref; }
 
     D3D12_GPU_VIRTUAL_ADDRESS vb_va, ib_va; u32 vleft;
-    if (!eng_draw_buffers(r, &vb_va, &ib_va, &vleft)) return;
+    if (!eng_draw_buffers(r, &vb_va, &ib_va, &vleft)) { b.valid = 0; return; }
     D3D12_VERTEX_BUFFER_VIEW vbv = { vb_va, vleft, r->stride };
     if (vbv.SizeInBytes > (u64)r->vertex_count * r->stride && !r->index_count) vbv.SizeInBytes = r->vertex_count * r->stride;
-    CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
+    if (!b.valid || memcmp(&vbv, &b.vbv, sizeof vbv)) { CALL(s_list, IASetVertexBuffers, 0, 1, &vbv); b.vbv = vbv; }
     if (r->index_count) {
         D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT };
-        CALL(s_list, IASetIndexBuffer, &ibv);
+        if (!b.valid || memcmp(&ibv, &b.ibv, sizeof ibv)) { CALL(s_list, IASetIndexBuffer, &ibv); b.ibv = ibv; }
     }
-    const D3D12_GPU_VIRTUAL_ADDRESS zero_va = CALL0(s_zero_cb, GetGPUVirtualAddress);
-    CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
-    CALL(s_list, SetGraphicsRootConstantBufferView, 4, eng_cb_va(r->ps_cb_off, r->ps_cb_bytes));
-
-    D3D12_GPU_DESCRIPTOR_HANDLE st;
-    if (s_srv_last_valid && memcmp(s_srv_last_src, srv, sizeof srv) == 0) st = s_srv_last_gpu;
-    else {
-        st = eng_srv_table(srv, ENG_SRV_TABLE);
-        memcpy(s_srv_last_src, srv, sizeof srv); s_srv_last_gpu = st; s_srv_last_valid = 1;
-        /* A hard flush inside eng_srv_table rebound everything. */
-        if (s_cur_pso != pso) {
-            CALL(s_list, SetPipelineState, pso); s_cur_pso = pso;
-            D3D12_CPU_DESCRIPTOR_HANDLE dsv = ms ? obj_dsv_ms(depth) : obj_dsv(depth);
-            CALL(s_list, OMSetRenderTargets, nrt, nrt ? rtv : NULL, FALSE, &dsv);
-            for (u32 k = 0; k < RSX_BE_MAX_COLOR_TARGETS; k++) s_cur_rt[k] = k < nrt ? r->rt[k] : 0;
-            s_cur_nrt = nrt; s_cur_depth = depth; s_cur_targets_valid = 1;
-            CALL(s_list, IASetPrimitiveTopology, topo); s_cur_topo = topo;
-            CALL(s_list, RSSetViewports, 1, &vp); CALL(s_list, RSSetScissorRects, 1, &sc);
-            CALL(s_list, OMSetStencilRef, r->stencil_ref);
-            CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
-            if (r->index_count) { D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT }; CALL(s_list, IASetIndexBuffer, &ibv); }
-            CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
-            CALL(s_list, SetGraphicsRootConstantBufferView, 4, eng_cb_va(r->ps_cb_off, r->ps_cb_bytes));
-        }
-    }
-    D3D12_GPU_DESCRIPTOR_HANDLE vt = st; vt.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_srv_step;
-    CALL(s_list, SetGraphicsRootDescriptorTable, 1, st);
-    CALL(s_list, SetGraphicsRootDescriptorTable, 3, vt);
-    int smp[ENG_SRV_TABLE];
-    for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) smp[u] = r->samp[u];
-    for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) smp[RSX_BE_MAX_TEXTURES + u] = r->vsamp[u];
-    D3D12_GPU_DESCRIPTOR_HANDLE sm = eng_smp_table(smp);
-    D3D12_GPU_DESCRIPTOR_HANDLE vsm = sm; vsm.ptr += (UINT64)RSX_BE_MAX_TEXTURES * s_smp_step;
-    CALL(s_list, SetGraphicsRootDescriptorTable, 2, sm);
-    CALL(s_list, SetGraphicsRootDescriptorTable, 5, vsm);
+    const D3D12_GPU_VIRTUAL_ADDRESS cb0 = eng_cb_va(r->vs_cb_off, r->vs_cb_bytes);
+    const D3D12_GPU_VIRTUAL_ADDRESS cb4 = eng_cb_va(r->ps_cb_off, r->ps_cb_bytes);
+    if (!b.valid || cb0 != b.cb0) { CALL(s_list, SetGraphicsRootConstantBufferView, 0, cb0); b.cb0 = cb0; }
+    if (!b.valid || cb4 != b.cb4) { CALL(s_list, SetGraphicsRootConstantBufferView, 4, cb4); b.cb4 = cb4; }
+    if (!b.valid || st.ptr != b.t1)  { CALL(s_list, SetGraphicsRootDescriptorTable, 1, st);  b.t1 = st.ptr; }
+    if (!b.valid || vt.ptr != b.t3)  { CALL(s_list, SetGraphicsRootDescriptorTable, 3, vt);  b.t3 = vt.ptr; }
+    if (!b.valid || sm.ptr != b.t2)  { CALL(s_list, SetGraphicsRootDescriptorTable, 2, sm);  b.t2 = sm.ptr; }
+    if (!b.valid || vsm.ptr != b.t5) { CALL(s_list, SetGraphicsRootDescriptorTable, 5, vsm); b.t5 = vsm.ptr; }
+    b.valid = 1;
 
     const int query = s_qheap && r->vis && s_q_used < ENG_QUERIES_PER_SLOT;
     const u32 qi = s_slot * ENG_QUERIES_PER_SLOT + s_q_used;
