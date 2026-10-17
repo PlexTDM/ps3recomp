@@ -3281,6 +3281,12 @@ extern "C" int lv2_try_syscall(ppu_context* ctx);
  * numbers fall through to the return-CELL_OK stub. */
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" void ppu_prof_stamp_ra(void* ctx, void* ra);
+/* cellGcmSys.c. Not weak, as ppu_hle.cpp declares it: a second weak external
+ * of one symbol is a duplicate to lld-link, and this file is only built into
+ * a title, which always has the GCM library. */
+extern "C" void ppu_gcm_pump(void);
+/* DOD3_AB=pumpsleep: 0 delivers GCM callbacks at HLE calls only, as before. */
+extern "C" int g_ppu_pump_at_sleep = 1;
 extern "C" int ppu_waitprof_on(void);
 extern "C" uint64_t ppu_waitprof_now(void);
 extern "C" void ppu_waitprof_add(unsigned tid, unsigned site, unsigned sc,
@@ -3301,6 +3307,14 @@ extern "C" void lv2_syscall(ppu_context* ctx)
           const char* e = getenv("PPU_GUARD_EA");
           if (e && *e) ppu_guard_page((uint32_t)strtoul(e, 0, 16)); } }
     uint64_t num = ctx->gpr[11];
+    /* Deliver pending GCM vblank/flip/user callbacks at the timer sleeps too,
+     * not only at HLE imports (ppu_hle.cpp): on hardware they fire
+     * asynchronously, and a guest thread that polls with usleep alone would
+     * otherwise never see the handler it is waiting for (upstream #353, for
+     * inFAMOUS 2, which hung on it). Drakengard 3's user handler patches the
+     * park the FIFO waits on; it now runs at the next sleep as well as at the
+     * next HLE call. */
+    if ((num == 141 || num == 142) && g_ppu_pump_at_sleep) ppu_gcm_pump();
     /* Milestone: which lv2 calls this title makes, in first-occurrence order.
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
