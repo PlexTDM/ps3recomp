@@ -22,6 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* This fork's rsx_dispatch.c reads it for RSX_CONST_LOG; rsx_draw_engine.c,
+ * not linked here, defines it. */
+uint32_t g_rsx_engine_frame;
+
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; if (fails <= 20) { \
     printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } } while (0)
