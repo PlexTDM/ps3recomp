@@ -202,13 +202,14 @@ static inline u64 fp_scan_mix(u64 a, u64 b)
     return (u64)r ^ (u64)(r >> 64);
 }
 
-int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64* key)
+int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64* key, u32* tex)
 {
     if (!ucode || !out || !key)
         return -1;
     out->count = 0;
     u64 h = 0x31535046u ^ 0xa0761d6478bd642full;   /* "FPS1" */
-    u32 off = 0, instructions = 0;
+    u32 off = 0, instructions = 0, units = 0;
+    int branch = 0;
     while (off + 16 <= max_bytes) {
         u64 lo, hi;
         memcpy(&lo, ucode + off, 8);
@@ -220,6 +221,16 @@ int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64*
         h = fp_scan_mix(lo ^ h ^ 0xe7037ed1a0b428dbull, hi ^ 0x8ebc6af09c88c6e3ull);
         instructions++;
         off += 16;
+        /* The units it samples, as rsx_fp_texture_mask counts them. That
+         * walk leaves a branch's constant bits alone where this one takes a
+         * slot, so a program with a branch is left to it (*tex = ~0u). */
+        if (w2 & FP_BRANCH) branch = 1;
+        else {
+            const u32 op = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+            if (op == OP_TEX || op == OP_TXP || op == OP_TXD || op == OP_TXL || op == OP_TXB ||
+                op == 0x32u || op == 0x33u)
+                units |= 1u << ((w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT);
+        }
         if (fp_instruction_has_constant(w1, w2, w3)) {
             if (off + 16 > max_bytes ||
                 out->count >= RSX_FP_MAX_INLINE_CONSTANTS)
@@ -234,6 +245,7 @@ int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64*
         if (w0 & FP_END) {
             *key = fp_scan_mix(h ^ instructions ^ 0x589965cc75374cc3ull,
                                ((u64)out->count << 32) ^ off ^ 0xa0761d6478bd642full);
+            if (tex) *tex = branch ? ~0u : units;
             return (int)out->count;
         }
     }

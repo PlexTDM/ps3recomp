@@ -891,11 +891,13 @@ static void eng_pipe_index_add(u32 index)
     g.pipe_index[i] = index + 1u;
 }
 
-/* Fragment texture unit u is switched on (CONTROL0 bit 31): the loops over
- * all sixteen units skip the others before decoding them. */
-static inline int eng_tex_unit_on(u32 u)
+/* Fragment texture unit u is switched on (CONTROL0 bit 31) and the draw's
+ * fragment program samples it (eng_fp_reads, below): the loops over all
+ * sixteen units skip the others before decoding them. */
+static u32 eng_fp_reads(void);
+static inline int eng_tex_unit_on(u32 u, u32 reads)
 {
-    return (int)(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31);
+    return (int)(rsx_dsp_reg(&g.rsx, 0x1A00u + u * 0x20u + 0x0Cu) >> 31) & (int)((reads >> u) & 1u);
 }
 
 /* One hash per cached texture per presented frame. FNV-style over the whole
@@ -1313,8 +1315,9 @@ static u32 eng_texel_ops(u32 ops[16])
     u32 mask = 0;
     memset(ops, 0, 16 * sizeof ops[0]);
     if (off) return 0;
+    const u32 reads = eng_fp_reads();
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
-        if (!eng_tex_unit_on(u)) continue;
+        if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -1404,8 +1407,9 @@ static u32 eng_shadow_units(u8 funcs[16])
     u32 mask = 0;
     memset(funcs, 0, 16);
     if (off) return 0;
+    const u32 reads = eng_fp_reads();
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
-        if (!eng_tex_unit_on(u)) continue;
+        if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -1421,8 +1425,9 @@ static u32 eng_shadow_units(u8 funcs[16])
 static u32 eng_cube_mask(void)
 {
     u32 mask = 0;
+    const u32 reads = eng_fp_reads();
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
-        if (!eng_tex_unit_on(u)) continue;
+        if (!eng_tex_unit_on(u, reads)) continue;
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         /* A cube face is square by construction, so a non-square image
@@ -1466,7 +1471,9 @@ static int eng_vp_info_current(u32 start)
  * is set by sink_end around the draw, so a question asked outside one is
  * answered afresh. */
 static int s_draw_open;
-static struct { int valid, ret; const u8* vp; u32 vp_instrs; const u8* fp; u32 fp_size; } s_progs;
+static struct { int valid, ret; const u8* vp; u32 vp_instrs; const u8* fp; u32 fp_size;
+                int tex_valid; u32 tex;
+                int scanned, scan_ok; u64 fp_key; } s_progs;
 
 static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
                                        const u8** out_fp, u32* out_fp_size);
@@ -1479,12 +1486,45 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
         s_progs.ret = eng_guest_programs_uncached(&s_progs.vp, &s_progs.vp_instrs,
                                                   &s_progs.fp, &s_progs.fp_size);
         s_progs.valid = 1;
+        /* The fragment program's one pass, here where the draw first asks:
+         * its constants (into g.fp_constants, which only this draw reads),
+         * its pipeline key and the units it samples. */
+        s_progs.scanned = 0;
+        if (s_progs.fp && s_progs.fp_size) {
+            u32 tex = ~0u;
+            s_progs.scan_ok = rsx_fp_scan(s_progs.fp, s_progs.fp_size, &g.fp_constants, &s_progs.fp_key, &tex) >= 0;
+            s_progs.scanned = 1;
+            if (tex != ~0u) { s_progs.tex = tex; s_progs.tex_valid = 1; }
+        }
     }
     if (out_vp) *out_vp = s_progs.vp;
     if (out_vp_instrs) *out_vp_instrs = s_progs.vp_instrs;
     if (out_fp) *out_fp = s_progs.fp;
     if (out_fp_size) *out_fp_size = s_progs.fp_size;
     return s_progs.ret;
+}
+
+/* The texture units the draw's fragment program samples. A unit can stay
+ * switched on with a stale binding from an earlier pass (a shadow pass keeps
+ * its map bound); binding it anyway cost a cache check and a hash or an
+ * upload, a depth target's resolve on an MSAA run, and a pipeline variant
+ * for its type. Units not sampled are left unbound and out of the program's
+ * texture masks. The built-in program, and RSX_BIND_UNREAD=1 or
+ * RSX_ENGINE_SLOW=1, take every unit that is on, as before. */
+int g_rsx_bind_unread = -1;   /* DOD3_AB=texreads switches it in a run */
+static u32 eng_fp_reads(void)
+{
+    if (g_rsx_bind_unread < 0) g_rsx_bind_unread = getenv("RSX_BIND_UNREAD") ? 1 : 0;
+    if (g_rsx_bind_unread || eng_slow()) return 0xFFFFu;
+    if (s_draw_open && s_progs.tex_valid) return s_progs.tex;
+    const u8* vp = NULL; const u8* fp = NULL; u32 vn = 0, fs = 0;
+    if (s_draw_open) {   /* the lookup's scan may have answered */
+        eng_guest_programs(&vp, &vn, &fp, &fs);
+        if (s_progs.tex_valid) return s_progs.tex;
+    }
+    const u32 m = eng_guest_programs(&vp, &vn, &fp, &fs) && fp ? rsx_fp_texture_mask(fp, fs) : 0xFFFFu;
+    if (s_draw_open) { s_progs.tex = m; s_progs.tex_valid = 1; }
+    return m;
 }
 
 static int eng_guest_programs_uncached(const u8** out_vp, u32* out_vp_instrs,
@@ -1853,8 +1893,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 unnorm_mask = 0, unnorm_dim[16][2];
     memset(unnorm_dim, 0, sizeof unnorm_dim);
     { static int off = -1; if (off < 0) off = getenv("RSX_NO_UNNORM") ? 1 : 0;
+      const u32 reads = eng_fp_reads();
       for (u32 u = 0; !off && u < RSX_DSP_NUM_TEXTURES && u < 16; u++) {
-          if (!eng_tex_unit_on(u)) continue;
+          if (!eng_tex_unit_on(u, reads)) continue;
           rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
           if (!t.enabled || !(t.format & RSX_TEX_FMT_UNNORM) || ((cube_mask >> u) & 1u)) continue;
           if (!t.width || !t.height) continue;
@@ -1863,10 +1904,18 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
 
     const int slow = eng_slow();
     u64 fp_key = 0;
-    g.fp_constants.count = 0;
-    if (!fixed && (slow ? rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants)
-                        : rsx_fp_scan(fp_uc, fp_size, &g.fp_constants, &fp_key)) < 0)
-        return 0;
+    if (fixed) g.fp_constants.count = 0;   /* a guest program's are already in (the lookup's scan) */
+    if (!fixed) {
+        if (slow) {
+            if (rsx_fp_collect_constants(fp_uc, fp_size, &g.fp_constants) < 0) return 0;
+        } else if (s_draw_open && s_progs.valid && s_progs.scanned && s_progs.fp == fp_uc &&
+                   s_progs.fp_size == fp_size) {
+            if (!s_progs.scan_ok) return 0;
+            fp_key = s_progs.fp_key;
+        } else if (rsx_fp_scan(fp_uc, fp_size, &g.fp_constants, &fp_key, NULL) < 0) {
+            return 0;
+        }
+    }
 
     /* Identity: the vertex program's own bytes, the fragment program's
      * STRUCTURE (its inline constants are hoisted into the buffered block, so
@@ -2773,7 +2822,9 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                               rsx_be_sampler_desc samplers[RSX_BE_MAX_TEXTURES])
 {
     u32 mask = 0;
+    const u32 reads = eng_fp_reads();
     for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
+        if (!eng_tex_unit_on(u, reads)) continue;   /* off, or not sampled */
         rsx_dsp_texture t;
         rsx_dsp_get_texture(&g.rsx, u, &t);
         if (!t.enabled) continue;
@@ -3104,6 +3155,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
 {
     const double t0 = eng_now_ms();
     s_progs.valid = 0;
+    s_progs.tex_valid = 0;
     s_draw_open = 1;
     sink_end_impl(user, r);
     s_draw_open = 0;

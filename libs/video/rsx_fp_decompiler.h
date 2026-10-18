@@ -148,9 +148,11 @@ int rsx_fp_collect_constants(
     const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out);
 /* rsx_fp_collect_constants plus, in the same pass, a key for the program's
  * structure (instruction words without the constant slots) for a pipeline
- * cache. Not rsx_fp_structural_hash's values. Returns the constant count or
- * -1 where rsx_fp_collect_constants would. */
-int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64* key);
+ * cache -- not rsx_fp_structural_hash's values -- and, when `tex` is given,
+ * the texture units it samples as rsx_fp_texture_mask counts them (~0u for a
+ * program with a branch, which that function walks differently). Returns the
+ * constant count or -1 where rsx_fp_collect_constants would. */
+int rsx_fp_scan(const u8* ucode, u32 max_bytes, rsx_fp_constant_block* out, u64* key, u32* tex);
 
 /* Canonical structural fragment-program hash. Instruction bytes and their
  * order are hashed; inline CONST payload bytes are skipped. Returns zero for
