@@ -73,6 +73,17 @@ static inline uint8x16_t spu__iota(void) {
     static const uint8_t k[16] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
     return vld1q_u8(k);
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+#include <smmintrin.h>
+/* SSE4.1 forms of some hot integer ops (selb, rotqbyi, shlqbyi); the scalar
+ * definitions stay as spu_X_ref (tests/test_spu_sse_ops.c compares them). */
+static inline __m128i spu__xi_ld(u128 a) { __m128i v; memcpy(&v, &a, 16); return v; }
+static inline u128 spu__xi_st(__m128i v) { u128 r; memcpy(&r, &v, 16); return r; }
+/* Host-order pshufb control for an SPU-order byte rotate/shift: result SPU
+ * byte i takes SPU byte i + sh, SPU byte P sits at host byte P ^ 3. */
+static inline __m128i spu__xi_spu_index(void) {     /* host byte h -> SPU byte h ^ 3 */
+    return _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+}
 #endif
 
 /* Integer ops with a NEON form further down (end of file); the scalar definitions are
@@ -355,6 +366,11 @@ static inline u128 spu_selb_ref(u128 a, u128 b, u128 c) {
 static inline u128 spu_selb(u128 a, u128 b, u128 c) {
     return spu__st(vbslq_u32(spu__ld(c), spu__ld(b), spu__ld(a)));
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_selb(u128 a, u128 b, u128 c) {
+    const __m128i C = spu__xi_ld(c);
+    return spu__xi_st(_mm_or_si128(_mm_andnot_si128(C, spu__xi_ld(a)), _mm_and_si128(spu__xi_ld(b), C)));
+}
 #else
 static inline u128 spu_selb(u128 a, u128 b, u128 c) { return spu_selb_ref(a, b, c); }
 #endif
@@ -390,21 +406,22 @@ static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
 #if defined(__SSE4_1__)
 #include <smmintrin.h>
 /* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
- * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
- * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+ * as the byte loop). It works in the host layout, where SPU byte P is host
+ * byte P^3 (SPU_W). Result host byte j is SPU byte j^3, whose control is host
+ * byte j of c, and the SPU source byte s it names is host byte (s&15)^3 of a
+ * or b. So no operand needs swapping into SPU order: the selector's low four
+ * bits xor 3 index both sources, bit 4 (moved to bit 7) picks between them,
+ * and the top three bits pick the special values from a table. 10 ops where
+ * the version that swapped a, b, c and the result took 20 (JonathanDC64's
+ * fork of ps3recomp). */
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
-    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
     __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
-    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
-    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
-    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
-    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
-    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
-    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
-    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
-    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0F)), _mm_set1_epi8(0x03));
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), _mm_slli_epi16(C, 3));
+    /* Special selectors by the top nibble: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+    const __m128i lut = _mm_setr_epi8(0,0,0,0, 0,0,0,0, 0,0,0,0, (char)0xFF,(char)0xFF,(char)0x80,(char)0x80);
+    const __m128i special = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0F)));
+    r = _mm_blendv_epi8(r, special, C);
     u128 out; memcpy(&out, &r, 16); return out;
 }
 #elif defined(__aarch64__) || defined(__ARM_NEON)
@@ -444,6 +461,14 @@ static inline u128 spu_shlqbyi_ref(u128 a, int sh) { u128 r=spu_zero(); sh&=0x1F
 static inline u128 spu_shlqbyi(u128 a, int sh) {
     return spu__perm(a, vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)(sh & 0x1F))));
 }
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_shlqbyi(u128 a, int sh) {
+    /* source SPU byte i + sh, zero past 15 (pshufb zeroes on bit 7) */
+    const __m128i s = _mm_add_epi8(spu__xi_spu_index(), _mm_set1_epi8((char)(sh & 0x1F)));
+    const __m128i past = _mm_cmpgt_epi8(s, _mm_set1_epi8(15));
+    const __m128i ctl = _mm_or_si128(_mm_xor_si128(s, _mm_set1_epi8(3)), past);
+    return spu__xi_st(_mm_shuffle_epi8(spu__xi_ld(a), ctl));
+}
 #else
 static inline u128 spu_shlqbyi(u128 a, int sh) { return spu_shlqbyi_ref(a, sh); }
 #endif
@@ -451,6 +476,11 @@ static inline u128 spu_rotqbyi_ref(u128 a, int sh) { u128 r; sh&=0x0F; for(int i
 #if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
 static inline u128 spu_rotqbyi(u128 a, int sh) {
     return spu__perm(a, vandq_u8(vaddq_u8(spu__iota(), vdupq_n_u8((uint8_t)sh)), vdupq_n_u8(15)));
+}
+#elif defined(__SSE4_1__) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_SCALAR_INT)
+static inline u128 spu_rotqbyi(u128 a, int sh) {
+    const __m128i s = _mm_and_si128(_mm_add_epi8(spu__xi_spu_index(), _mm_set1_epi8((char)sh)), _mm_set1_epi8(15));
+    return spu__xi_st(_mm_shuffle_epi8(spu__xi_ld(a), _mm_xor_si128(s, _mm_set1_epi8(3))));
 }
 #else
 static inline u128 spu_rotqbyi(u128 a, int sh) { return spu_rotqbyi_ref(a, sh); }
