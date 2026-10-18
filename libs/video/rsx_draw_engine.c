@@ -1922,7 +1922,36 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * a constant change must not be a new pipeline), the export-width bit of
      * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
      * and the structural render state. */
-    u64 key = 1469598103934665603ull;
+    /* Consecutive draws nearly always repeat every input of the key: reuse
+     * the last key while they all compare equal (after NoahBPeterson's fork,
+     * where hashing them was 2.7% of the RSX thread). The render state is
+     * zeroed before it is decoded, so comparing its bytes compares fields;
+     * the arrays are zeroed before they are filled. */
+    static struct {
+        int valid, fixed;
+        u64 vp_key, fp_key;
+        u32 fp_ctrl, cube_mask, vtex_mask, shadow_mask, unnorm_mask, texop_mask;
+        u8 shadow_funcs[16]; u32 unnorm_dim[16][2]; u32 texel_ops[16];
+        u32 layout_mask, layout_stride, rt_count;
+        rsx_be_format rt_fmt;
+        rsx_be_render_state rs;
+        u64 key;
+    } km;
+    u64 key;
+    const u64 in_vp = fixed ? 0 : (s_vpi.valid && s_vpi.hash_valid ? s_vpi.hash : 0);
+    const int memo = !slow && !fixed && in_vp && fp_key;
+    if (memo && km.valid && !km.fixed && km.vp_key == in_vp && km.fp_key == fp_key &&
+        km.fp_ctrl == (fp_ctrl & 0x40u) && km.cube_mask == cube_mask && km.vtex_mask == vtex_mask &&
+        km.shadow_mask == shadow_mask && km.unnorm_mask == unnorm_mask && km.texop_mask == texop_mask &&
+        !memcmp(km.shadow_funcs, shadow_funcs, sizeof km.shadow_funcs) &&
+        !memcmp(km.unnorm_dim, unnorm_dim, sizeof km.unnorm_dim) &&
+        !memcmp(km.texel_ops, texel_ops, sizeof km.texel_ops) &&
+        km.layout_mask == layout->mask && km.layout_stride == layout->stride &&
+        km.rt_count == rt_count && km.rt_fmt == rt_fmt && !memcmp(&km.rs, rs, sizeof *rs)) {
+        key = km.key;
+        goto key_done;
+    }
+    key = 1469598103934665603ull;
     if (fixed) {
         static const u32 fixed_tag = 0x4E464958u;   /* "XIFN" */
         key = eng_fnv1a(&fixed_tag, sizeof fixed_tag, key);
@@ -1963,6 +1992,19 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      * a host API matches the two against each other. */
     key = eng_fnv1a(&rt_count, sizeof rt_count, key);
     key = rsx_draw_engine_hash_render_state(rs, key);
+    km.valid = memo;
+    if (memo) {
+        km.fixed = 0; km.vp_key = in_vp; km.fp_key = fp_key; km.fp_ctrl = fp_ctrl & 0x40u;
+        km.cube_mask = cube_mask; km.vtex_mask = vtex_mask; km.shadow_mask = shadow_mask;
+        km.unnorm_mask = unnorm_mask; km.texop_mask = texop_mask;
+        memcpy(km.shadow_funcs, shadow_funcs, sizeof km.shadow_funcs);
+        memcpy(km.unnorm_dim, unnorm_dim, sizeof km.unnorm_dim);
+        memcpy(km.texel_ops, texel_ops, sizeof km.texel_ops);
+        km.layout_mask = layout->mask; km.layout_stride = layout->stride;
+        km.rt_count = rt_count; km.rt_fmt = rt_fmt; memcpy(&km.rs, rs, sizeof *rs);
+        km.key = key;
+    }
+key_done:;
 
     if (slow) {
         for (u32 i = 0; i < g.n_pipelines; i++)
@@ -2102,6 +2144,57 @@ static void dc_reset(void)
     dc.inl = NULL;
     dc.inl_bytes = 0;
 }
+
+/* Room for `need` references in dc.refs, grown as dc_push_ref grows it. */
+static int dc_reserve_refs(u64 need)
+{
+    if (need <= dc.cap_refs) return 1;
+    if (need > 0xFFFFFFFFull) return 0;
+    u32 next = dc.cap_refs ? dc.cap_refs : 4096u;
+    while (next < need) next = next * 2u > next ? next * 2u : (u32)need;
+    rsx_vertex_ref* r = (rsx_vertex_ref*)realloc(dc.refs, (size_t)next * sizeof(*r));
+    if (!r) return 0;
+    dc.refs = r;
+    dc.cap_refs = next;
+    return 1;
+}
+
+/* A mapped run of big-endian indices into dc.refs (room reserved), a restart
+ * index becoming a cut at the reference position it falls on. Out of line
+ * and one loop per width and restart mode: inlined into the fetch, the width
+ * was tested and each index assembled a byte at a time on every index (after
+ * NoahBPeterson's fork of ps3recomp, where it was 11.6% of the RSX thread). */
+#define DC_DECODE(T, BSWAP, RESTART)                                              \
+    for (u32 i = 0; i < count; i++) {                                             \
+        T raw; memcpy(&raw, run + (size_t)i * sizeof(T), sizeof(T));             \
+        const u32 index = (u32)BSWAP(raw);                                        \
+        if (RESTART && index == restart_val) {                                    \
+            if (!rsx_restart_cut_push(&dc.cuts, &dc.n_cuts, &dc.cap_cuts, n)) {   \
+                dc.n_refs = n; return 0;                                          \
+            }                                                                     \
+            continue;                                                             \
+        }                                                                         \
+        out[n].vertex_id = index;                                                 \
+        out[n].base_index = base_index;                                           \
+        n++;                                                                      \
+    }
+static __attribute__((noinline)) int dc_decode_indices(const u8* run, u32 count, int is_u32,
+                                                       int restart_en, u32 restart_val,
+                                                       u32 base_index)
+{
+    rsx_vertex_ref* const out = dc.refs;
+    u32 n = dc.n_refs;
+    if (is_u32) {
+        if (restart_en) { DC_DECODE(u32, __builtin_bswap32, 1) }
+        else            { DC_DECODE(u32, __builtin_bswap32, 0) }
+    } else {
+        if (restart_en) { DC_DECODE(u16, __builtin_bswap16, 1) }
+        else            { DC_DECODE(u16, __builtin_bswap16, 0) }
+    }
+    dc.n_refs = n;
+    return 1;
+}
+#undef DC_DECODE
 
 static int dc_push_ref(u32 vertex_id, u32 base_index)
 {
@@ -2650,6 +2743,12 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap,
             if (count && start <= 0xFFFFFFFFull && bytes <= 0xFFFFFFFFull &&
                 start + bytes <= 0x100000000ull)
                 run = eng_guest_ptr(NULL, ia_loc, (u32)start, (u32)bytes);
+            if (run && count && !eng_slow()) {
+                if (!dc_reserve_refs((u64)dc.n_refs + count) ||
+                    !dc_decode_indices(run, count, ia.is_u32, restart_en, restart_val, base_index))
+                    dc.fetch_ok = 0;
+                continue;
+            }
             for (u32 i = 0; i < count && dc.fetch_ok; i++) {
                 const u8* p = run ? run + (size_t)i * esz
                     : eng_guest_ptr(NULL, ia_loc, ia.offset + (first + i) * esz, esz);
