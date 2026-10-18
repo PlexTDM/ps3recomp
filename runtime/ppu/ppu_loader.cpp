@@ -2191,7 +2191,13 @@ static uint32_t g_inv_n = 0;
 /* Built once, under a lock: the first reader can now be the profiler's
  * thread or the crash handler as well as a guest thread. */
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
-extern "C" uint32_t (*g_ppu_prof_resolve)(void* ra);   /* sys_ppu_thread.c */
+/* The pointer sys_ppu_thread.c's readers name a call site through; defined
+ * mergeably in both files (see there), so either links without the other. */
+#if defined(_MSC_VER)
+extern "C" __declspec(selectany) uint32_t (*g_ppu_prof_resolve)(void* ra) = nullptr;
+#else
+extern "C" __attribute__((weak)) uint32_t (*g_ppu_prof_resolve)(void* ra) = nullptr;
+#endif
 static const struct ProfResolveHook { ProfResolveHook() { g_ppu_prof_resolve = ppu_prof_resolve_host; } } s_prof_resolve_hook;
 static SRWLOCK g_inv_lock = SRWLOCK_INIT;
 static volatile LONG g_inv_ready;

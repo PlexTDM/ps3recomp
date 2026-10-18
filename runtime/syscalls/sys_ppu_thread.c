@@ -401,8 +401,15 @@ unsigned long long ppu_thread_cpu_us(unsigned tid)
 #endif
 }
 /* ppu_prof_resolve_host, set by ppu_loader.cpp where it is linked in (the
- * replay and the runtime's tests have no lifted code to name). */
-uint32_t (*g_ppu_prof_resolve)(void* ra);
+ * replay and the runtime's tests have no lifted code to name). Defined here
+ * and in ppu_loader.cpp as one mergeable definition, so a program with
+ * either file alone links: the replay has no ppu_loader.cpp, the lifter's
+ * tests no sys_ppu_thread.c. */
+#if defined(_MSC_VER)
+__declspec(selectany) uint32_t (*g_ppu_prof_resolve)(void* ra) = 0;
+#else
+__attribute__((weak)) uint32_t (*g_ppu_prof_resolve)(void* ra) = 0;
+#endif
 static unsigned prof_site(void* ra, unsigned fallback)
 {
     return ra && g_ppu_prof_resolve ? (unsigned)g_ppu_prof_resolve(ra) : fallback;
