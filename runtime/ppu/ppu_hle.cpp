@@ -32,10 +32,35 @@ static ps3_nid_entry  g_hle_storage[HLE_NID_CAP];
 static ps3_nid_table  g_hle_nids;
 static int            g_hle_inited = 0;
 
+/* An open-addressed index over the table (entry + 1, 0 empty), for
+ * ps3_hle_call: it found a NID by scanning every registered function, over a
+ * thousand, on every call a title makes. The first registration of a NID
+ * stays the one found, as the scan found it. Registration is at start-up,
+ * before guest threads call. */
+#define HLE_NID_INDEX (2u * HLE_NID_CAP)
+static uint16_t g_hle_index[HLE_NID_INDEX];
+static inline uint32_t hle_nid_slot(uint32_t nid) { return (nid * 2654435761u) >> 19; }   /* 13 bits */
+/* g_ppu_hle_index = 0 (DOD3_AB=hleindex): the scans, as before. */
+extern "C" int g_ppu_hle_index = 1;
+static ps3_nid_entry* hle_nid_find(uint32_t nid)
+{
+    if (!g_ppu_hle_index) return ps3_nid_table_find(&g_hle_nids, nid);
+    for (uint32_t i = hle_nid_slot(nid);; i = (i + 1) & (HLE_NID_INDEX - 1)) {
+        const uint32_t v = g_hle_index[i];
+        if (!v) return nullptr;
+        if (g_hle_storage[v - 1].nid == nid) return &g_hle_storage[v - 1];
+    }
+}
+
 extern "C" void ps3_hle_register(uint32_t nid, const char* name, void* handler)
 {
     if (!g_hle_inited) { ps3_nid_table_init(&g_hle_nids, g_hle_storage, HLE_NID_CAP); g_hle_inited = 1; }
-    ps3_nid_table_add(&g_hle_nids, nid, name, handler);
+    const uint32_t at = g_hle_nids.count;
+    if (ps3_nid_table_add(&g_hle_nids, nid, name, handler) != 0) return;
+    if (hle_nid_find(nid)) return;   /* an earlier registration stays first */
+    uint32_t i = hle_nid_slot(nid);
+    while (g_hle_index[i]) i = (i + 1) & (HLE_NID_INDEX - 1);
+    g_hle_index[i] = (uint16_t)(at + 1);
 }
 
 extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count : 0; }
@@ -47,12 +72,33 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 #define HLE_CTX_CAP 256
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
+/* ...and an index over these, scanned before the table on every call. */
+#define HLE_CTX_INDEX 512u
+static uint16_t g_ctx_index[HLE_CTX_INDEX];
+static inline uint32_t hle_ctx_slot(uint32_t nid) { return (nid * 2654435761u) >> 23; }   /* 9 bits */
+static int hle_ctx_find(uint32_t nid)
+{
+    if (!g_ppu_hle_index) {
+        for (uint32_t i = 0; i < g_ctx_count; i++) if (g_ctx[i].nid == nid) return (int)i;
+        return -1;
+    }
+    for (uint32_t i = hle_ctx_slot(nid);; i = (i + 1) & (HLE_CTX_INDEX - 1)) {
+        const uint32_t v = g_ctx_index[i];
+        if (!v) return -1;
+        if (g_ctx[v - 1].nid == nid) return (int)(v - 1);
+    }
+}
 
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
     if (g_ctx_count < HLE_CTX_CAP) {
         g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
+        if (hle_ctx_find(nid) < 0) {   /* the first one registered is the one called */
+            uint32_t i = hle_ctx_slot(nid);
+            while (g_ctx_index[i]) i = (i + 1) & (HLE_CTX_INDEX - 1);
+            g_ctx_index[i] = (uint16_t)(g_ctx_count + 1);
+        }
         g_ctx_count++;
     }
 }
@@ -872,8 +918,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
+    for (int i = hle_ctx_find(nid); i >= 0; i = -1)
+        {
             ps3_msf("hle:%s", g_ctx[i].name);
             /* Record the name here too. This loop dispatches every
              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
@@ -896,7 +942,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = g_hle_inited ? hle_nid_find(nid) : nullptr;
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
