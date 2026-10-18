@@ -2149,13 +2149,16 @@ static inline uint32_t icall_cache_slot(uint32_t a)
 #define PPU_ICALL_FLAT_END 0x02000000u
 static int32_t* g_icall_flat;
 extern "C" int g_ppu_icall_flat = 1;
-extern "C" void ps3_indirect_call(ppu_context* ctx);
+/* The flat table's distances are from this, not from ps3_indirect_call: a
+ * program that registers functions without calling through pointers (the
+ * lifter's tests) then links without the call path and what it needs. */
+static __attribute__((noinline)) void icall_flat_anchor(void) {}
 static void icall_flat_set(uint32_t a, ppu_fn fn)
 {
     if (a >= PPU_ICALL_FLAT_END || (a & 3u)) return;
     if (!g_icall_flat) g_icall_flat = (int32_t*)calloc(PPU_ICALL_FLAT_END / 4u, sizeof(int32_t));
     if (!g_icall_flat) return;
-    const intptr_t d = fn ? (intptr_t)(void*)fn - (intptr_t)(void*)&ps3_indirect_call : 0;
+    const intptr_t d = fn ? (intptr_t)(void*)fn - (intptr_t)(void*)&icall_flat_anchor : 0;
     __atomic_store_n(&g_icall_flat[a >> 2], d == (intptr_t)(int32_t)d ? (int32_t)d : 0, __ATOMIC_RELAXED);
 }
 
@@ -2645,14 +2648,16 @@ extern "C" void ps3_indirect_call(ppu_context* ctx)
       if (__builtin_expect(!g_ppu_icall_full, 1)) {
           const uint32_t addr = (uint32_t)ctx->ctr;
           int32_t dist = 0;
+          intptr_t base = (intptr_t)(void*)&ps3_indirect_call;
           if (addr < PPU_ICALL_FLAT_END && !(addr & 3u) && g_icall_flat && g_ppu_icall_flat) {
               dist = __atomic_load_n(&g_icall_flat[addr >> 2], __ATOMIC_RELAXED);
+              base = (intptr_t)(void*)&icall_flat_anchor;
           } else {
               const uint64_t e = __atomic_load_n(&g_icall_cache[icall_cache_slot(addr)], __ATOMIC_RELAXED);
               if ((uint32_t)(e >> 32) == addr && e != 0) dist = (int32_t)(uint32_t)e;
           }
           if (__builtin_expect(dist != 0 && s_icall_depth <= 4000, 1)) {
-              const ppu_fn fn = (ppu_fn)((intptr_t)(void*)&ps3_indirect_call + dist);
+              const ppu_fn fn = (ppu_fn)(base + dist);
               s_icall_depth++;
               fn(ctx);
               while (g_trampoline_fn) {
