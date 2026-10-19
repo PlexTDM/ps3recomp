@@ -279,16 +279,19 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
 extern volatile unsigned g_rsx_video_plane_uploads;
 
 /* Where the presented frame goes in the window. The title's frame is 16:9; a
- * host that has the title letterbox its view to a wider ratio says so
- * (rsx_present_set_content_aspect; 0, or 16:9 and narrower: the whole frame).
- * A window wider than 16:9 is then shown the middle of the frame -- as much
- * of the letterboxed view as its shape takes, the bars above and below cut
- * away. Whatever the window's shape, the part shown keeps its proportions,
- * with black bars beside or above it where the shapes differ (a frame used
- * to be stretched over the window). A frame with no scene in it (fewer than
- * 300 draws: a loading screen, a menu) and a movie (its planes uploaded within
- * the last few presents) are shown whole. Any thread. */
+ * host that has the title box its view to another ratio says so, for the
+ * frames that have it (rsx_present_set_content_aspect; 0, or 16:9: the whole
+ * frame), and that view is shown without the bars. A host also names the shape of the screen
+ * the player has (rsx_present_set_screen_aspect; 0: the window's own): the
+ * frame is shown in a rectangle of that shape in the middle of the window,
+ * the view filling it, anything 16:9 -- the whole frame -- as big as it
+ * takes in its middle. So a 16:9 window set to 21:9 shows what a 21:9 one
+ * would, with bars above and below. Whatever the shapes, what is shown keeps
+ * its proportions, with black bars where they differ (a frame used to be
+ * stretched over the window). A movie (its planes uploaded within the last
+ * few presents) is shown whole. Any thread. */
 void rsx_present_set_content_aspect(float aspect);
+void rsx_present_set_screen_aspect(float aspect);
 
 /* The window's width over its height, as the last present found it; 0 before
  * the first. Any thread. */

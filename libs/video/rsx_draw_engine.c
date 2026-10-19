@@ -959,12 +959,21 @@ volatile unsigned g_rsx_video_plane_uploads;
  * screen or a movie, hundreds and up with a scene on screen. */
 volatile unsigned g_rsx_frame_draws;
 
-/* rsx_present_layout (rsx_draw_engine.h). A frame without a scene -- fewer
- * than 300 draws: a loading screen, a menu -- is shown whole as well. */
-static volatile float s_content_aspect, s_window_aspect;
+/* rsx_present_layout (rsx_draw_engine.h). */
+static volatile float s_content_aspect, s_screen_aspect, s_window_aspect;
 static unsigned s_frame_draws;   /* the frame's so far */
 void rsx_present_set_content_aspect(float aspect) { s_content_aspect = aspect; }
+void rsx_present_set_screen_aspect(float aspect) { s_screen_aspect = aspect; }
 float rsx_present_window_aspect(void) { return s_window_aspect; }
+
+/* The largest a-shaped rectangle in (x, y, w, h), in its middle. */
+static void present_fit(float a, float x, float y, float w, float h, float r[4])
+{
+    if (w > h * a) { r[2] = h * a; r[3] = h; }
+    else { r[2] = w; r[3] = w / a; }
+    r[0] = x + (w - r[2]) * 0.5f;
+    r[1] = y + (h - r[3]) * 0.5f;
+}
 
 int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
 {
@@ -977,18 +986,24 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
     else if (quiet < 1000) quiet++;
     const float fa = (float)fw / (float)fh, wa = (float)ww / (float)wh;
     s_window_aspect = wa;
+    /* The screen: the shape the player has, in the middle of the window. */
+    const float sa = s_screen_aspect > 0.0f ? s_screen_aspect : wa;
+    float scr[4];
+    present_fit(sa, 0.0f, 0.0f, (float)ww, (float)wh, scr);
+    /* The picture: the view the title boxed to the content's shape, its
+     * bars left out, or the whole frame ... */
     float ca = s_content_aspect;
-    if (!(ca > fa) || quiet < 8 || s_frame_draws < 300) ca = fa;
-    /* The part shown: the window's ratio, within the frame's and the view's. */
-    const float ra = wa < fa ? fa : wa > ca ? ca : wa;
-    float dw, dh;
-    if (wa >= ra) { dh = (float)wh; dw = dh * ra; }
-    else { dw = (float)ww; dh = dw / ra; }
-    const float dx = ((float)ww - dw) * 0.5f, dy = ((float)wh - dh) * 0.5f;
-    /* The whole frame, as wide as that part; its bars reach past it. */
-    vp[0] = dx; vp[2] = dw; vp[3] = dw / fa; vp[1] = dy - (vp[3] - dh) * 0.5f;
-    rect[0] = (int)(dx + 0.5f); rect[1] = (int)(dy + 0.5f);
-    rect[2] = (int)(dx + dw + 0.5f) - rect[0]; rect[3] = (int)(dy + dh + 0.5f) - rect[1];
+    const float cr = ca / fa;
+    if (!(ca > 0.0f) || (cr > 0.99f && cr < 1.01f) || quiet < 8) ca = fa;
+    float pic[4], dst[4];
+    present_fit(ca, 0.0f, 0.0f, (float)fw, (float)fh, pic);
+    /* ... as big as the screen takes it, in its middle. */
+    present_fit(ca, scr[0], scr[1], scr[2], scr[3], dst);
+    const float k = dst[2] / pic[2];
+    vp[0] = dst[0] - pic[0] * k; vp[1] = dst[1] - pic[1] * k;
+    vp[2] = (float)fw * k; vp[3] = (float)fh * k;
+    rect[0] = (int)(dst[0] + 0.5f); rect[1] = (int)(dst[1] + 0.5f);
+    rect[2] = (int)(dst[0] + dst[2] + 0.5f) - rect[0]; rect[3] = (int)(dst[1] + dst[3] + 0.5f) - rect[1];
     if (rect[2] > (int)ww) rect[2] = (int)ww;
     if (rect[3] > (int)wh) rect[3] = (int)wh;
     return rect[0] || rect[1] || rect[2] != (int)ww || rect[3] != (int)wh;
