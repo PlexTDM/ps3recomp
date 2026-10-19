@@ -28,17 +28,25 @@ extern "C" {
 #define VMX_INL static inline
 
 /* On x86-64 with AVX2 and FMA (the x86-64-v3 the lifted code is built for)
- * the float arithmetic, the float compares and the word shifts have vector
- * forms at the end of this file, with the same results bit for bit: the same
- * IEEE operations, the same NaN, VSCR[NJ] and saturation rules. The scalar
- * forms stay, as name_ref, for tests/test_ppu_vmx_x86.c to hold the vector
- * ones to. PPU_VMX_SCALAR builds the scalar forms alone. */
+ * and on arm64 (NEON) the float arithmetic, the float compares and the word
+ * shifts have vector forms at the end of this file, with the same results bit
+ * for bit: the same IEEE operations, the same NaN, VSCR[NJ] and saturation
+ * rules. The scalar forms stay, as name_ref, for tests/test_ppu_vmx_vec.c to
+ * hold the vector ones to. PPU_VMX_SCALAR builds the scalar forms alone. */
 #if (defined(__x86_64__) || defined(_M_X64)) && defined(__AVX2__) && defined(__FMA__) && \
     !defined(PPU_VMX_SCALAR)
 #define VMX_X86 1
-#define VMX_REF(name) name##_ref
 #else
 #define VMX_X86 0
+#endif
+#if defined(__aarch64__) && !defined(PPU_VMX_SCALAR)
+#define VMX_NEON 1
+#else
+#define VMX_NEON 0
+#endif
+#if VMX_X86 || VMX_NEON
+#define VMX_REF(name) name##_ref
+#else
 #define VMX_REF(name) name
 #endif
 
@@ -490,6 +498,112 @@ VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) {
     return vmx_x_cmp(d_, _mm_cmpgt_ps(vmx_x_f(vmx_x_ld(a_)), vmx_x_f(vmx_x_ld(b_))));
 }
 #endif /* VMX_X86 */
+
+#if VMX_NEON
+/* ======================================================================
+ * arm64 (NEON) forms, as the x86-64-v3 ones: one rev32 puts a register's
+ * big-endian words in host order in the lanes, element i in lane i, and back.
+ * Each form is its scalar twin above step for step. Threads run with FPCR.FZ
+ * and FPCR.DN clear (macOS's and Linux's default), so a denormal is computed
+ * here as the scalar code computes it; VSCR[NJ] flushing and the NaN rules
+ * are done on the bits, as there.
+ * ==================================================================== */
+#include <arm_neon.h>
+#define VMX_N static inline __attribute__((always_inline))
+VMX_N uint32x4_t vmx_n_ld(const void* p) {
+    return vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8((const uint8_t*)p)));
+}
+VMX_N void vmx_n_st(void* p, uint32x4_t v) { vst1q_u8((uint8_t*)p, vrev32q_u8(vreinterpretq_u8_u32(v))); }
+VMX_N float32x4_t vmx_n_f(uint32x4_t v) { return vreinterpretq_f32_u32(v); }
+VMX_N uint32x4_t vmx_n_u(float32x4_t v) { return vreinterpretq_u32_f32(v); }
+/* vmx_flush: with NJ, a zero exponent (zero or denormal) keeps only its sign */
+VMX_N uint32x4_t vmx_n_flush(uint32x4_t v, uint32_t vscr) {
+    if (!(vscr & VMX_NJ)) return v;
+    const uint32x4_t z = vceqq_u32(vandq_u32(v, vdupq_n_u32(0x7F800000u)), vdupq_n_u32(0));
+    return vbicq_u32(v, vandq_u32(z, vdupq_n_u32(0x7FFFFFFFu)));
+}
+VMX_N uint32x4_t vmx_n_isnan(uint32x4_t v) {
+    return vcgtq_u32(vandq_u32(v, vdupq_n_u32(0x7FFFFFFFu)), vdupq_n_u32(0x7F800000u));
+}
+VMX_N uint32x4_t vmx_n_fix(uint32x4_t r) { return vbslq_u32(vmx_n_isnan(r), vdupq_n_u32(0x7FC00000u), r); }
+/* vmx_vnan2 / vmx_vnan1: A's NaN quieted, else B's, else the fixed result */
+VMX_N uint32x4_t vmx_n_nan1(uint32x4_t r, uint32x4_t b) {
+    return vbslq_u32(vmx_n_isnan(b), vorrq_u32(b, vdupq_n_u32(0x7FC00000u)), vmx_n_fix(r));
+}
+VMX_N uint32x4_t vmx_n_nan2(uint32x4_t r, uint32x4_t a, uint32x4_t b) {
+    return vbslq_u32(vmx_n_isnan(a), vorrq_u32(a, vdupq_n_u32(0x7FC00000u)), vmx_n_nan1(r, b));
+}
+
+/* the count is the low 5 bits of B's word; USHL/SSHL shift right by a negative one */
+VMX_N int32x4_t vmx_n_count(const void* b_) {
+    return vreinterpretq_s32_u32(vandq_u32(vmx_n_ld(b_), vdupq_n_u32(31)));
+}
+VMX_INL void vmx_vslw(VMX_D, VMX_A, VMX_B) { vmx_n_st(d_, vshlq_u32(vmx_n_ld(a_), vmx_n_count(b_))); }
+VMX_INL void vmx_vsrw(VMX_D, VMX_A, VMX_B) { vmx_n_st(d_, vshlq_u32(vmx_n_ld(a_), vnegq_s32(vmx_n_count(b_)))); }
+VMX_INL void vmx_vsraw(VMX_D, VMX_A, VMX_B) {
+    vmx_n_st(d_, vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(vmx_n_ld(a_)), vnegq_s32(vmx_n_count(b_)))));
+}
+
+VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_flush(vmx_n_ld(a_), vscr), y = vmx_n_flush(vmx_n_ld(b_), vscr);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan2(vmx_n_u(vaddq_f32(vmx_n_f(x), vmx_n_f(y))), x, y), vscr));
+}
+VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_flush(vmx_n_ld(a_), vscr), y = vmx_n_flush(vmx_n_ld(b_), vscr);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan2(vmx_n_u(vsubq_f32(vmx_n_f(x), vmx_n_f(y))), x, y), vscr));
+}
+/* FMAX/FMIN order +0 above -0, as vmx_maxf/vmx_minf do; vmx_n_nan2 decides the NaN lanes */
+VMX_INL void vmx_vmaxfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_ld(a_), y = vmx_n_ld(b_);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan2(vmx_n_u(vmaxq_f32(vmx_n_f(x), vmx_n_f(y))), x, y), vscr));
+}
+VMX_INL void vmx_vminfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_ld(a_), y = vmx_n_ld(b_);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan2(vmx_n_u(vminq_f32(vmx_n_f(x), vmx_n_f(y))), x, y), vscr));
+}
+/* fmaf(x, z, y), and fmaf(x, z, -y) with the sign flipped as bits; one rounding each */
+VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_flush(vmx_n_ld(a_), vscr), y = vmx_n_flush(vmx_n_ld(b_), vscr),
+                     z = vmx_n_flush(vmx_n_ld(c_), vscr);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_fix(vmx_n_u(vfmaq_f32(vmx_n_f(y), vmx_n_f(x), vmx_n_f(z)))), vscr));
+}
+VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) {
+    const uint32x4_t x = vmx_n_flush(vmx_n_ld(a_), vscr), y = vmx_n_flush(vmx_n_ld(b_), vscr),
+                     z = vmx_n_flush(vmx_n_ld(c_), vscr);
+    const uint32x4_t r = veorq_u32(vmx_n_u(vfmaq_f32(vnegq_f32(vmx_n_f(y)), vmx_n_f(x), vmx_n_f(z))),
+                                   vdupq_n_u32(0x80000000u));
+    vmx_n_st(d_, vmx_n_flush(vmx_n_fix(r), vscr));
+}
+/* IEEE division and square root, as 1.0f / f and 1.0f / sqrtf(f) (not FRECPE/FRSQRTE) */
+VMX_INL void vmx_vrefp(VMX_D, VMX_B, uint32_t vscr) {
+    const uint32x4_t y = vmx_n_flush(vmx_n_ld(b_), vscr);
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan1(vmx_n_u(vdivq_f32(vdupq_n_f32(1.0f), vmx_n_f(y))), y), vscr));
+}
+VMX_INL void vmx_vrsqrtefp(VMX_D, VMX_B, uint32_t vscr) {
+    const uint32x4_t y = vmx_n_flush(vmx_n_ld(b_), vscr);
+    const float32x4_t q = vdivq_f32(vdupq_n_f32(1.0f), vsqrtq_f32(vmx_n_f(y)));
+    vmx_n_st(d_, vmx_n_flush(vmx_n_nan1(vmx_n_u(q), y), vscr));
+}
+/* (float)(int32_t)w * 2^-uimm: the conversion rounds once (to nearest), the scale is exact */
+VMX_INL void vmx_vcfsx(VMX_D, VMX_B, unsigned uimm) {
+    const float32x4_t f = vcvtq_f32_s32(vreinterpretq_s32_u32(vmx_n_ld(b_)));
+    vmx_n_st(d_, vmx_n_u(vmulq_n_f32(f, ldexpf(1.0f, -(int)(uimm & 31u)))));
+}
+/* ordered compares: a NaN lane is false, as in C */
+VMX_N uint32_t vmx_n_cmp(void* d_, uint32x4_t m) {
+    vmx_n_st(d_, m);
+    return (uint32_t)((vminvq_u32(m) != 0) << 3 | (vmaxvq_u32(m) == 0) << 1);
+}
+VMX_INL uint32_t vmx_vcmpeqfp(VMX_D, VMX_A, VMX_B) {
+    return vmx_n_cmp(d_, vceqq_f32(vmx_n_f(vmx_n_ld(a_)), vmx_n_f(vmx_n_ld(b_))));
+}
+VMX_INL uint32_t vmx_vcmpgefp(VMX_D, VMX_A, VMX_B) {
+    return vmx_n_cmp(d_, vcgeq_f32(vmx_n_f(vmx_n_ld(a_)), vmx_n_f(vmx_n_ld(b_))));
+}
+VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) {
+    return vmx_n_cmp(d_, vcgtq_f32(vmx_n_f(vmx_n_ld(a_)), vmx_n_f(vmx_n_ld(b_))));
+}
+#endif /* VMX_NEON */
 
 #ifdef __cplusplus
 }

@@ -1,15 +1,16 @@
-/* The x86-64-v3 forms of ppu_vmx.h's helpers against their scalar twins
- * (name_ref): bit-identical results and return values, VSCR[NJ] off and on,
- * over random words and the special ones -- zeros, denormals, infinities,
- * NaNs quiet and signalling, the extremes. Build with -march=x86-64-v3 (or
- * -mavx2 -mfma); tools/test_ppu_vmx_x86.py does. */
+/* The vector forms of ppu_vmx.h's helpers (x86-64-v3, arm64 NEON) against
+ * their scalar twins (name_ref): bit-identical results and return values,
+ * VSCR[NJ] off and on, over random words and the special ones -- zeros,
+ * denormals, infinities, NaNs quiet and signalling, the extremes. On x86-64
+ * build with -march=x86-64-v3 (or -mavx2 -mfma); tools/test_ppu_vmx_vec.py
+ * does. */
 #include "../ppu_vmx.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#if !VMX_X86
-int main(void) { printf("skip: no x86-64-v3 forms in this build\n"); return 0; }
+#if !(VMX_X86 || VMX_NEON)
+int main(void) { printf("skip: no vector forms in this build\n"); return 0; }
 #else
 static uint64_t s_rng = 0x9E3779B97F4A7C15ull;
 static uint32_t rnd(void)
@@ -102,7 +103,7 @@ int main(void)
             if (memcmp(g, w, 16)) report("vmx_vcfsx", a, b, c, g, w, u);
         }
     }
-    printf("ppu_vmx x86 forms: %d checks, %d failed\n", g_runs, g_fail);
+    printf("ppu_vmx %s forms: %d checks, %d failed\n", VMX_X86 ? "x86-64-v3" : "NEON", g_runs, g_fail);
     return g_fail ? 1 : 0;
 }
 #endif
