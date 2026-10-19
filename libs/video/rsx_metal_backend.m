@@ -4995,9 +4995,16 @@ static id<MTLTexture> eng_fxaa(id<MTLCommandBuffer> cb, id<MTLTexture> src)
 
 /* Put a surface on the drawable. A straight blit would need matching formats
  * and sizes; a full-screen sample needs neither, and the guest's surfaces are
- * routinely a different size from the window. */
+ * routinely a different size from the window.
+ *
+ * A window is placed by rsx_present_layout (rsx_draw_engine.h), passed in as
+ * lvp/lrect/part: the whole frame drawn to lvp -- past the window's edges where
+ * the title's bars are cut away; Metal takes a viewport larger than its target
+ * and clips it -- scissored to lrect, the rest of the window black when part
+ * is set. Without one (headless: the replay references, frame dumps) the frame
+ * keeps its shape over the whole target, as it always has. */
 static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
-                                id<MTLTexture> dst)
+                                id<MTLTexture> dst, const float* lvp, const int* lrect, int part)
 {
     if (!src || !dst || !s_eng_helper_lib) return;
     src = eng_fxaa(cb, src);
@@ -5015,35 +5022,52 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
         }
         s_eng_blit_pso_fmt = [dst pixelFormat];
     }
-    /* The picture keeps its shape: a window or display of another aspect
-     * (a 16:10 Mac screen, a resized window) gets black bars rather than a
-     * stretched 16:9 image. The surface's guest size gives the shape -- a
-     * scaled surface has the same one. */
-    const double sw = [src width], sh = [src height];
     const double dw = [dst width], dh = [dst height];
-    double vw = dw, vh = dh;
-    if (sw > 0 && sh > 0) {
-        if (dw * sh > dh * sw) vw = dh * sw / sh;   /* wider: bars left and right */
-        else                   vh = dw * sh / sw;   /* taller: bars top and bottom */
+    double vx = 0.0, vy = 0.0, vw = dw, vh = dh;
+    int clear = 0, draw = 1;
+    MTLScissorRect sc = { 0, 0, (NSUInteger)dw, (NSUInteger)dh };
+    if (lvp && lrect) {
+        vx = lvp[0]; vy = lvp[1]; vw = lvp[2]; vh = lvp[3];
+        /* the scissor has to lie inside the target */
+        const long x0 = lrect[0] > 0 ? lrect[0] : 0, y0 = lrect[1] > 0 ? lrect[1] : 0;
+        long x1 = (long)lrect[0] + lrect[2], y1 = (long)lrect[1] + lrect[3];
+        if (x1 > (long)dw) x1 = (long)dw;
+        if (y1 > (long)dh) y1 = (long)dh;
+        clear = part;
+        if (x1 <= x0 || y1 <= y0 || vw < 1.0 || vh < 1.0) { clear = 1; draw = 0; }
+        else sc = (MTLScissorRect){ (NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0) };
+    } else {
+        /* The picture keeps its shape: a target of another aspect gets black
+         * bars rather than a stretched 16:9 image. The surface's guest size
+         * gives the shape -- a scaled surface has the same one. */
+        const double sw = [src width], sh = [src height];
+        if (sw > 0 && sh > 0) {
+            if (dw * sh > dh * sw) vw = dh * sw / sh;   /* wider: bars left and right */
+            else                   vh = dw * sh / sw;   /* taller: bars top and bottom */
+        }
+        if (vw >= dw - 0.5 && vh >= dh - 0.5) { vw = dw; vh = dh; }
+        else {
+            clear = 1;
+            vx = floor((dw - vw) * 0.5); vy = floor((dh - vh) * 0.5);
+            vw = floor(vw + 0.5); vh = floor(vh + 0.5);
+        }
     }
-    const int full = vw >= dw - 0.5 && vh >= dh - 0.5;
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = dst;
-    rp.colorAttachments[0].loadAction  = full ? MTLLoadActionDontCare : MTLLoadActionClear;
+    rp.colorAttachments[0].loadAction  = clear ? MTLLoadActionClear : MTLLoadActionDontCare;
     rp.colorAttachments[0].clearColor  = MTLClearColorMake(0, 0, 0, 1);
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
     if (!e) return;
-    if (!full) {
-        const double x = floor((dw - vw) * 0.5), y = floor((dh - vh) * 0.5);
-        [e setViewport:(MTLViewport){ x, y, floor(vw + 0.5), floor(vh + 0.5), 0.0, 1.0 }];
-    }
+    if (!draw) { [e endEncoding]; return; }
+    [e setViewport:(MTLViewport){ vx, vy, vw, vh, 0.0, 1.0 }];
+    [e setScissorRect:sc];
     /* Texel for texel when the sizes match (headless dumps, a 1x surface in
      * a 1280x720 drawable); filtered when the surface is scaled to a window
      * of another size -- and scaling down (an internal resolution above the
      * window's), averaged over each window pixel's footprint, so the higher
      * resolution is real supersampling. */
-    const int same = [src width] == [dst width] && [src height] == [dst height];
+    const int same = (double)[src width] == vw && (double)[src height] == vh && vx == floor(vx) && vy == floor(vy);
     const int down = (double)[src width] > vw + 0.5 || (double)[src height] > vh + 0.5;
     id<MTLRenderPipelineState> area = (down && s_eng_linear_sampler)
         ? eng_present_pso(@"eng_blit_area_fs", [dst pixelFormat], &s_eng_blit_area_pso, &s_eng_blit_area_fmt) : nil;
@@ -5053,6 +5077,66 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
                        atIndex:0];
     [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [e endEncoding];
+}
+
+/* PS3RECOMP_METAL_WINDOW_GRAB=<prefix>: the window as presented, on request.
+ * When <prefix>.req exists, the next windowed present is drawn a second time
+ * into a texture of the drawable's size and written to <prefix>.ppm (via a
+ * rename, so a reader never sees half a file), and the request removed.
+ * PS3RECOMP_METAL_FRAME_GRAB has the title's frame; this has what the window
+ * shows -- its size, the bars, where the frame sits in it. */
+static const char* eng_window_grab_prefix(void)
+{
+    static const char* pre = (const char*)1;
+    if (pre == (const char*)1) { pre = getenv("PS3RECOMP_METAL_WINDOW_GRAB"); if (pre && !*pre) pre = NULL; }
+    return pre;
+}
+
+static id<MTLTexture> eng_window_grab_target(id<MTLTexture> like)
+{
+    const char* pre = eng_window_grab_prefix();
+    if (!pre || !like || s_headless) return nil;
+    char req[1024];
+    snprintf(req, sizeof req, "%s.req", pre);
+    if (access(req, F_OK) != 0) return nil;
+    if ([like pixelFormat] != MTLPixelFormatBGRA8Unorm && [like pixelFormat] != MTLPixelFormatRGBA8Unorm) return nil;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[like pixelFormat]
+                                    width:[like width] height:[like height] mipmapped:NO];
+    td.usage = MTLTextureUsageRenderTarget;
+    td.storageMode = MTLStorageModeShared;
+    return [s_dev newTextureWithDescriptor:td];
+}
+
+/* From the command buffer's completion: the grab is drawn by then. */
+static void eng_window_grab_write(id<MTLTexture> t)
+{
+    const char* pre = eng_window_grab_prefix();
+    const size_t w = [t width], h = [t height];
+    unsigned char* px = (unsigned char*)malloc(w * h * 4);
+    unsigned char* rgb = (unsigned char*)malloc(w * h * 3);
+    if (pre && px && rgb) {
+        [t getBytes:px bytesPerRow:w * 4 fromRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0];
+        const int bgra = [t pixelFormat] == MTLPixelFormatBGRA8Unorm;
+        for (size_t p = 0; p < w * h; ++p) {
+            rgb[p*3 + 0] = px[p*4 + (bgra ? 2 : 0)];
+            rgb[p*3 + 1] = px[p*4 + 1];
+            rgb[p*3 + 2] = px[p*4 + (bgra ? 0 : 2)];
+        }
+        char req[1024], tmp[1024], out[1024];
+        snprintf(req, sizeof req, "%s.req", pre);
+        snprintf(tmp, sizeof tmp, "%s.ppm.tmp", pre);
+        snprintf(out, sizeof out, "%s.ppm", pre);
+        FILE* f = fopen(tmp, "wb");
+        if (f) {
+            fprintf(f, "P6\n%zu %zu\n255\n", w, h);
+            fwrite(rgb, 1, w * h * 3, f);
+            fclose(f);
+            rename(tmp, out);
+            unlink(req);
+        }
+    }
+    free(px);
+    free(rgb);
 }
 
 /* Encode everything recorded so far and commit it.
@@ -5209,7 +5293,18 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
             }
             s_vis_npending = 0;
         }
-        if (present_dst && dst) eng_blit_to_display(cb, present_dst, dst);
+        if (present_dst && dst) {
+            float lvp[4]; int lrect[4], part = 0;
+            if (!s_headless)
+                part = rsx_present_layout((u32)[present_dst width], (u32)[present_dst height],
+                                          (u32)[dst width], (u32)[dst height], lvp, lrect);
+            eng_blit_to_display(cb, present_dst, dst, s_headless ? NULL : lvp, lrect, part);
+            id<MTLTexture> grab = eng_window_grab_target(dst);
+            if (grab) {
+                eng_blit_to_display(cb, present_dst, grab, lvp, lrect, part);
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> _unused) { (void)_unused; eng_window_grab_write(grab); }];
+            }
+        }
         if (drawable) [cb presentDrawable:drawable];
         if (windowed_present) {
             dispatch_semaphore_t sem = s_inflight;
