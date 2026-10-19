@@ -87,6 +87,11 @@ extern "C" {
 
 typedef struct rsx_dispatch rsx_dispatch;
 
+/* A constant's bit pattern that marks a host's draws (0: none): its upload
+ * is noted in rsx_dispatch.canvas_mark_at, and an overwrite of that word
+ * clears it (rsx_canvas_remap_set, rsx_draw_engine.h). */
+extern volatile u32 g_rsx_canvas_mark;
+
 /* Execution sink: what the dispatcher calls when a method DOES something.
  * All state (clear color, primitive, attrib layout, ...) is read back from
  * the dispatcher via the getters below. Any callback may be NULL. */
@@ -120,6 +125,8 @@ struct rsx_dispatch {
     u32 current_primitive;
     u32 const_gen;                    /* bumped on every constants[] write  */
     u32 vp_gen;                       /* bumped on every vp[] write         */
+    u32 canvas_mark_at;               /* where g_rsx_canvas_mark sits in constants[]:
+                                         slot * 4 + component + 1; 0 nowhere */
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */

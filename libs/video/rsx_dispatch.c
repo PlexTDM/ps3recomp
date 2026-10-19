@@ -245,6 +245,16 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
     rsx->vp_gen++;
 }
 
+volatile u32 g_rsx_canvas_mark;
+
+/* A constant word written: is it the mark, or the word that held it? */
+static inline void dsp_canvas_mark(rsx_dispatch* rsx, u32 slot, u32 c, u32 v)
+{
+    const u32 at = slot * 4u + c + 1u;
+    if (v == g_rsx_canvas_mark) rsx->canvas_mark_at = at;
+    else if (rsx->canvas_mark_at == at) rsx->canvas_mark_at = 0;
+}
+
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
 {
     const u32 max_words = RSX_DSP_NUM_CONSTANTS * 4;
@@ -252,6 +262,9 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
     rsx->const_gen++;
+    rsx->canvas_mark_at = 0;
+    if (g_rsx_canvas_mark)
+        for (u32 i = 0; i < count; i++) dsp_canvas_mark(rsx, i >> 2, i & 3u, words[i]);
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -348,6 +361,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
             rsx->const_gen++;
+            if (g_rsx_canvas_mark) dsp_canvas_mark(rsx, slot, word & 3, arg);
         }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
@@ -465,12 +479,17 @@ int rsx_dispatch_upload_run(rsx_dispatch* rsx, u32 method, u32 count, const u8* 
     const u32 end = method + count * 4u;
     if (method >= M_VP_UPLOAD_CONST && end <= M_VP_UPLOAD_CONST + 32u * 4u) {
         const u32 slot0 = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        const u32 mark = g_rsx_canvas_mark;
         u32 word = (method - M_VP_UPLOAD_CONST) >> 2, written = 0;
         for (u32 i = 0; i < count; i++, word++) {
             const u32 v = dsp_be32(be + i * 4u);
             rsx->regs[(method >> 2) + i] = v;
             const u32 slot = slot0 + (word >> 2);
-            if (slot < RSX_DSP_NUM_CONSTANTS) { rsx->constants[slot][word & 3] = v; written++; }
+            if (slot < RSX_DSP_NUM_CONSTANTS) {
+                rsx->constants[slot][word & 3] = v;
+                written++;
+                if (mark) dsp_canvas_mark(rsx, slot, word & 3, v);
+            }
         }
         rsx->const_gen += written;
         return 1;

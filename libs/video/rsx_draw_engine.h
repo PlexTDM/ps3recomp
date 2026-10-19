@@ -281,17 +281,30 @@ extern volatile unsigned g_rsx_video_plane_uploads;
 /* Where the presented frame goes in the window. The title's frame is 16:9; a
  * host that has the title box its view to another ratio says so, for the
  * frames that have it (rsx_present_set_content_aspect; 0, or 16:9: the whole
- * frame), and that view is shown without the bars. A host also names the shape of the screen
+ * frame, as while a movie plays over it), and that view is shown without the
+ * bars. A host also names the shape of the screen
  * the player has (rsx_present_set_screen_aspect; 0: the window's own): the
  * frame is shown in a rectangle of that shape in the middle of the window,
  * the view filling it, anything 16:9 -- the whole frame -- as big as it
  * takes in its middle. So a 16:9 window set to 21:9 shows what a 21:9 one
  * would, with bars above and below. Whatever the shapes, what is shown keeps
  * its proportions, with black bars where they differ (a frame used to be
- * stretched over the window). A movie (its planes uploaded within the last
- * few presents) is shown whole. Any thread. */
+ * stretched over the window). A frame with a movie's picture in it (a quad
+ * sampling its 8-bit planes) is shown whole. RSX_PRESENT_LAYOUT_LOG=1 logs
+ * each change of what is shown. Any thread. */
 void rsx_present_set_content_aspect(float aspect);
 void rsx_present_set_screen_aspect(float aspect);
+
+/* Draws a host marks to be moved on the target, with nothing else their
+ * programs compute changed: a draw whose transform constants hold the bit
+ * pattern mark (in any word; 0 turns it off) has its window coordinates
+ * scaled by k and moved by (x, y), in the target's pixels. For a canvas whose
+ * shaders read their own screen position (a material masking itself at a
+ * place on the screen): the host draws it where it was made to be, and the
+ * draw lands where the host wants it, the shaders none the wiser. Until the
+ * next flip, while the word holding the mark is not written again. Any
+ * thread. */
+void rsx_canvas_remap_set(u32 mark, float k, float x, float y);
 
 /* The window's width over its height, as the last present found it; 0 before
  * the first. Any thread. */

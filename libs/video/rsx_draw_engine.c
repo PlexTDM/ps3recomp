@@ -959,9 +959,21 @@ volatile unsigned g_rsx_video_plane_uploads;
  * screen or a movie, hundreds and up with a scene on screen. */
 volatile unsigned g_rsx_frame_draws;
 
+/* rsx_canvas_remap_set (rsx_draw_engine.h): the scale and move for the
+ * marked draws, in the target's pixels. */
+static volatile float s_canvas_remap[3];
+void rsx_canvas_remap_set(u32 mark, float k, float x, float y)
+{
+    s_canvas_remap[0] = k;
+    s_canvas_remap[1] = x;
+    s_canvas_remap[2] = y;
+    g_rsx_canvas_mark = mark;
+}
+
 /* rsx_present_layout (rsx_draw_engine.h). */
 static volatile float s_content_aspect, s_screen_aspect, s_window_aspect;
 static unsigned s_frame_draws;   /* the frame's so far */
+static int s_frame_video;        /* the frame has drawn a movie's picture */
 void rsx_present_set_content_aspect(float aspect) { s_content_aspect = aspect; }
 void rsx_present_set_screen_aspect(float aspect) { s_screen_aspect = aspect; }
 float rsx_present_window_aspect(void) { return s_window_aspect; }
@@ -977,13 +989,9 @@ static void present_fit(float a, float x, float y, float w, float h, float r[4])
 
 int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
 {
-    static unsigned planes_seen, quiet = 1000;   /* presents since a video plane was uploaded */
     vp[0] = vp[1] = 0.0f; vp[2] = (float)ww; vp[3] = (float)wh;
     rect[0] = rect[1] = 0; rect[2] = (int)ww; rect[3] = (int)wh;
     if (!fw || !fh || !ww || !wh) return 0;
-    const unsigned planes = g_rsx_video_plane_uploads;
-    if (planes != planes_seen) { planes_seen = planes; quiet = 0; }
-    else if (quiet < 1000) quiet++;
     const float fa = (float)fw / (float)fh, wa = (float)ww / (float)wh;
     s_window_aspect = wa;
     /* The screen: the shape the player has, in the middle of the window. */
@@ -994,7 +1002,18 @@ int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
      * bars left out, or the whole frame ... */
     float ca = s_content_aspect;
     const float cr = ca / fa;
-    if (!(ca > 0.0f) || (cr > 0.99f && cr < 1.01f) || quiet < 8) ca = fa;
+    if (!(ca > 0.0f) || (cr > 0.99f && cr < 1.01f) || s_frame_video) ca = fa;
+    { /* RSX_PRESENT_LAYOUT_LOG=1: each change of what is shown */
+        static int log = -1;
+        static float last_ca = -1.0f, last_sa = -1.0f;
+        static unsigned n;
+        if (log < 0) log = getenv("RSX_PRESENT_LAYOUT_LOG") ? 1 : 0;
+        n++;
+        if (log && (ca != last_ca || sa != last_sa))
+            fprintf(stderr, "[present] #%u: showing %.4f (content %.4f, movie %d), screen %.4f, window %ux%u\n",
+                    n, ca, s_content_aspect, s_frame_video, sa, ww, wh);
+        last_ca = ca; last_sa = sa;
+    }
     float pic[4], dst[4];
     present_fit(ca, 0.0f, 0.0f, (float)fw, (float)fh, pic);
     /* ... as big as the screen takes it, in its middle. */
@@ -3541,6 +3560,17 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         xf[4] = (vp.translate[0] - W * 0.5f) / (W * 0.5f);
         xf[5] = -((vp.translate[1] - H * 0.5f) / (H * 0.5f));
         xf[6] = vp.translate[2];
+        /* A draw a host marked (rsx_canvas_remap_set): its window
+         * coordinates scaled by k and moved, and nothing else the program
+         * computes changed. */
+        const u32 mark = g_rsx_canvas_mark, at = g.rsx.canvas_mark_at;
+        if (mark && at && g.rsx.constants[(at - 1u) >> 2][(at - 1u) & 3u] == mark) {
+            const float k = s_canvas_remap[0], mx = s_canvas_remap[1], my = s_canvas_remap[2];
+            xf[0] = k * vp.scale[0] / (W * 0.5f);
+            xf[1] = -(k * vp.scale[1] / (H * 0.5f));
+            xf[4] = (mx + k * vp.translate[0] - W * 0.5f) / (W * 0.5f);
+            xf[5] = -((my + k * vp.translate[1] - H * 0.5f) / (H * 0.5f));
+        }
     }
     /* The 8 KB block is copied and staged again only when a constant or the
      * viewport changed since the last draw; otherwise the backend rebinds
@@ -3618,6 +3648,19 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
     g.be->bind_vertex_textures(g.be->user, vtextures, vsamplers, vtex_mask);
     g.be->set_viewport(g.be->user, 0.0f, 0.0f, W, H);
+    /* A movie's picture: a quad sampling two or more of its planes (8-bit,
+     * 256 wide and up, as g_rsx_video_plane_uploads counts them). The
+     * present shows the frame it is in whole (rsx_present_layout). */
+    if (!s_frame_video && tex_mask && dc.n_verts && dc.n_verts <= 8) {
+        u32 planes = 0;
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+            if (!(tex_mask & (1u << u))) continue;
+            rsx_dsp_texture t;
+            rsx_dsp_get_texture(&g.rsx, u, &t);
+            if ((t.format & 0x9Fu) == 0x81u && t.width >= 256) planes++;
+        }
+        if (planes >= 2) s_frame_video = 1;
+    }
 
     /* The guest scissor intersected with the surface. The nv40 reset is a
      * full 4096x4096 window and a never-written register reads 0 here, which
@@ -3947,6 +3990,7 @@ static void eng_present(u32 buffer_id)
     g.last_present_surface = target;
     g.be->present(g.be->user, g.surfaces[target].handle);
     g_rsx_frame_draws = s_frame_draws; s_frame_draws = 0;
+    s_frame_video = 0;
     /* DOD3_STUTTER_MS=<n>: a frame longer than n ms says what the walker did
      * in it -- texture uploads, vertex conversions stored, pipelines built --
      * beside the guest threads' report ([stutter], ppu_hle.cpp). */
@@ -4128,6 +4172,7 @@ static void eng_present(u32 buffer_id)
 static void sink_flip(void* user, const rsx_dispatch* r, u32 arg)
 {
     (void)user; (void)r;
+    g.rsx.canvas_mark_at = 0;   /* a mark the frame's last draws left: not the next frame's */
     g.last_flip_buffer = arg & 7u;
     g.sink_flips++;
     s_present_src = "fifo";
