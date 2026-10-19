@@ -2694,13 +2694,19 @@ static D3D12_GPU_DESCRIPTOR_HANDLE eng_smp_table(const int* slots)
 }
 
 /* A helper pass over a whole colour target: dst bound, src sampled at t0. */
-static void eng_fullscreen_pass(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h,
-                                D3D12_CPU_DESCRIPTOR_HANDLE src_srv)
+/* The source drawn over a w x h target; or, with at (rsx_present_layout's
+ * viewport and rectangle), over that viewport and only within that rectangle. */
+static void eng_fullscreen_pass_at(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h,
+                                   D3D12_CPU_DESCRIPTOR_HANDLE src_srv, const float* at_vp, const int* at_rect)
 {
     eng_use_helper_rootsig();
     CALL(s_list, OMSetRenderTargets, 1, &rtv, FALSE, NULL);
     D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
     D3D12_RECT sc = { 0, 0, (LONG)w, (LONG)h };
+    if (at_vp && at_rect) {
+        vp.TopLeftX = at_vp[0]; vp.TopLeftY = at_vp[1]; vp.Width = at_vp[2]; vp.Height = at_vp[3];
+        sc.left = at_rect[0]; sc.top = at_rect[1]; sc.right = at_rect[0] + at_rect[2]; sc.bottom = at_rect[1] + at_rect[3];
+    }
     CALL(s_list, RSSetViewports, 1, &vp);
     CALL(s_list, RSSetScissorRects, 1, &sc);
     CALL(s_list, SetPipelineState, pso);
@@ -2709,6 +2715,12 @@ static void eng_fullscreen_pass(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_H
     CALL(s_list, SetGraphicsRootDescriptorTable, 0, eng_srv_table(&src_srv, 1));
     CALL(s_list, DrawInstanced, 3, 1, 0, 0);
     s_cur_pso = NULL; s_cur_targets_valid = 0;
+}
+
+static void eng_fullscreen_pass(ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE rtv, u32 w, u32 h,
+                                D3D12_CPU_DESCRIPTOR_HANDLE src_srv)
+{
+    eng_fullscreen_pass_at(pso, rtv, w, h, src_srv, NULL, NULL);
 }
 
 /* A record's viewport and scissor (guest pixels) for a target of tw x th
@@ -4009,9 +4021,16 @@ static void eng_submit(u32 present_surface, int wait)
             res_transition(dst, &st, D3D12_RESOURCE_STATE_RENDER_TARGET);
             res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             bar_flush();
-            /* The area-filtered blit for the window; the headless target
-             * keeps the plain one, which the replay references were made with. */
-            eng_fullscreen_pass(s_present_pso && !s_headless ? s_present_pso : s_blit_pso, rtv, s_win_w, s_win_h, obj_srv(shown));
+            /* The area-filtered blit for the window, placed by
+             * rsx_present_layout; the headless target keeps the plain one
+             * over the whole of it, which the replay references were made with. */
+            float lvp[4]; int lrect[4];
+            if (!s_headless && rsx_present_layout(src->w, src->h, s_win_w, s_win_h, lvp, lrect)) {
+                const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+                CALL(s_list, ClearRenderTargetView, rtv, black, 0, NULL);
+            }
+            eng_fullscreen_pass_at(s_present_pso && !s_headless ? s_present_pso : s_blit_pso, rtv, s_win_w, s_win_h,
+                                   obj_srv(shown), s_headless ? NULL : lvp, s_headless ? NULL : lrect);
             if (windowed) res_transition(dst, &st, D3D12_RESOURCE_STATE_PRESENT);
             else s_offscreen_state = st;
             bar_flush();

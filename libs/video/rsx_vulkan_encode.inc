@@ -762,9 +762,17 @@ static void eng_submit(u32 present_surface, int wait)
                     const u32 aa = eng_present_target(&s_aa_obj, src->w, src->h);
                     if (aa) { eng_present_pass(s_fxaa_pso, shown, aa); shown = aa; }
                 }
-                if (s_area_pso && (src->w > s_swap_ext.width + s_swap_ext.width / 4 ||
-                                   src->h > s_swap_ext.height + s_swap_ext.height / 4)) {
-                    const u32 ar2 = eng_present_target(&s_area_obj, s_swap_ext.width, s_swap_ext.height);
+                /* Where the frame goes (rsx_present_layout): the whole of it
+                 * at lvp's size, the part in lrect shown. Scaling down, the
+                 * area-filtered pass makes it at that size first. */
+                float lvp[4]; int lrect[4];
+                const int part = rsx_present_layout(src->w, src->h, s_swap_ext.width, s_swap_ext.height, lvp, lrect);
+                u32 vw = (u32)(lvp[2] + 0.5f), vh = (u32)(lvp[3] + 0.5f);
+                if (vw < 1) vw = 1;
+                if (vh < 1) vh = 1;
+                if (s_area_pso && vw <= 16384 && vh <= 16384 &&
+                    (src->w > vw + vw / 4 || src->h > vh + vh / 4)) {
+                    const u32 ar2 = eng_present_target(&s_area_obj, vw, vh);
                     if (ar2) { eng_present_pass(s_area_pso, shown, ar2); shown = ar2; }
                 }
                 if (shown != present_surface) src = eng_obj(shown);
@@ -772,11 +780,23 @@ static void eng_submit(u32 present_surface, int wait)
                 VkImageLayout sl = VK_IMAGE_LAYOUT_UNDEFINED;
                 img_layout(s_swap_img[img_index], &sl, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
                 bar_flush();
+                if (part) {
+                    const VkClearColorValue black = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+                    const VkImageSubresourceRange all = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vkCmdClearColorImage(s_cmd, s_swap_img[img_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+                }
+                /* lrect, in the source's pixels */
+                const float kx = (float)src->w / lvp[2], ky = (float)src->h / lvp[3];
                 VkImageBlit bl = {0};
                 bl.srcSubresource.aspectMask = bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 bl.srcSubresource.layerCount = bl.dstSubresource.layerCount = 1;
-                bl.srcOffsets[1].x = (int32_t)src->w; bl.srcOffsets[1].y = (int32_t)src->h; bl.srcOffsets[1].z = 1;
-                bl.dstOffsets[1].x = (int32_t)s_swap_ext.width; bl.dstOffsets[1].y = (int32_t)s_swap_ext.height; bl.dstOffsets[1].z = 1;
+                bl.srcOffsets[0].x = (int32_t)((lrect[0] - lvp[0]) * kx + 0.5f);
+                bl.srcOffsets[0].y = (int32_t)((lrect[1] - lvp[1]) * ky + 0.5f);
+                bl.srcOffsets[1].x = (int32_t)((lrect[0] + lrect[2] - lvp[0]) * kx + 0.5f);
+                bl.srcOffsets[1].y = (int32_t)((lrect[1] + lrect[3] - lvp[1]) * ky + 0.5f);
+                bl.srcOffsets[1].z = 1;
+                bl.dstOffsets[0].x = lrect[0]; bl.dstOffsets[0].y = lrect[1];
+                bl.dstOffsets[1].x = lrect[0] + lrect[2]; bl.dstOffsets[1].y = lrect[1] + lrect[3]; bl.dstOffsets[1].z = 1;
                 vkCmdBlitImage(s_cmd, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s_swap_img[img_index],
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
                 img_layout(s_swap_img[img_index], &sl, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);

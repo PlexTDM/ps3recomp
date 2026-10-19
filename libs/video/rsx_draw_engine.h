@@ -278,6 +278,31 @@ void rsx_draw_engine_set_guest_memory(rsx_vertex_guest_ptr_fn reader, void* user
  * wide): it moves while a movie plays. */
 extern volatile unsigned g_rsx_video_plane_uploads;
 
+/* Where the presented frame goes in the window. The title's frame is 16:9; a
+ * host that has the title letterbox its view to a wider ratio says so
+ * (rsx_present_set_content_aspect; 0, or 16:9 and narrower: the whole frame).
+ * A window wider than 16:9 is then shown the middle of the frame -- as much
+ * of the letterboxed view as its shape takes, the bars above and below cut
+ * away. Whatever the window's shape, the part shown keeps its proportions,
+ * with black bars beside or above it where the shapes differ (a frame used
+ * to be stretched over the window). A frame with no scene in it (fewer than
+ * 300 draws: a loading screen, a menu) and a movie (its planes uploaded within
+ * the last few presents) are shown whole. Any thread. */
+void rsx_present_set_content_aspect(float aspect);
+
+/* The window's width over its height, as the last present found it; 0 before
+ * the first. Any thread. */
+float rsx_present_window_aspect(void);
+
+/* For a backend's present of a fw x fh frame into a ww x wh window: vp, the
+ * rectangle (x, y, w, h, window pixels) the whole frame is drawn to -- taller
+ * than the window when the bars are cut away -- and rect, the part of the
+ * window it is shown in; the rest of the window is black. Returns 1 when that
+ * part is not the whole window (the backend clears the window first). The
+ * viewport is not the window's whenever the bars are cut away, whatever it
+ * returns. */
+int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4]);
+
 /* The draws of the last frame presented. */
 extern volatile unsigned g_rsx_frame_draws;
 

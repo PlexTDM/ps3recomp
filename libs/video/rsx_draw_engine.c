@@ -958,7 +958,41 @@ volatile unsigned g_rsx_video_plane_uploads;
 /* The draws of the last frame presented: a few dozen for a menu, a loading
  * screen or a movie, hundreds and up with a scene on screen. */
 volatile unsigned g_rsx_frame_draws;
-static unsigned s_frame_draws;
+
+/* rsx_present_layout (rsx_draw_engine.h). A frame without a scene -- fewer
+ * than 300 draws: a loading screen, a menu -- is shown whole as well. */
+static volatile float s_content_aspect, s_window_aspect;
+static unsigned s_frame_draws;   /* the frame's so far */
+void rsx_present_set_content_aspect(float aspect) { s_content_aspect = aspect; }
+float rsx_present_window_aspect(void) { return s_window_aspect; }
+
+int rsx_present_layout(u32 fw, u32 fh, u32 ww, u32 wh, float vp[4], int rect[4])
+{
+    static unsigned planes_seen, quiet = 1000;   /* presents since a video plane was uploaded */
+    vp[0] = vp[1] = 0.0f; vp[2] = (float)ww; vp[3] = (float)wh;
+    rect[0] = rect[1] = 0; rect[2] = (int)ww; rect[3] = (int)wh;
+    if (!fw || !fh || !ww || !wh) return 0;
+    const unsigned planes = g_rsx_video_plane_uploads;
+    if (planes != planes_seen) { planes_seen = planes; quiet = 0; }
+    else if (quiet < 1000) quiet++;
+    const float fa = (float)fw / (float)fh, wa = (float)ww / (float)wh;
+    s_window_aspect = wa;
+    float ca = s_content_aspect;
+    if (!(ca > fa) || quiet < 8 || s_frame_draws < 300) ca = fa;
+    /* The part shown: the window's ratio, within the frame's and the view's. */
+    const float ra = wa < fa ? fa : wa > ca ? ca : wa;
+    float dw, dh;
+    if (wa >= ra) { dh = (float)wh; dw = dh * ra; }
+    else { dw = (float)ww; dh = dw / ra; }
+    const float dx = ((float)ww - dw) * 0.5f, dy = ((float)wh - dh) * 0.5f;
+    /* The whole frame, as wide as that part; its bars reach past it. */
+    vp[0] = dx; vp[2] = dw; vp[3] = dw / fa; vp[1] = dy - (vp[3] - dh) * 0.5f;
+    rect[0] = (int)(dx + 0.5f); rect[1] = (int)(dy + 0.5f);
+    rect[2] = (int)(dx + dw + 0.5f) - rect[0]; rect[3] = (int)(dy + dh + 0.5f) - rect[1];
+    if (rect[2] > (int)ww) rect[2] = (int)ww;
+    if (rect[3] > (int)wh) rect[3] = (int)wh;
+    return rect[0] || rect[1] || rect[2] != (int)ww || rect[3] != (int)wh;
+}
 
 /* The port's stand-ins for the title's textures (rsx_draw_engine.h). */
 static rsx_texture_standin_fn s_standin_fn;
