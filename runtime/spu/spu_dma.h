@@ -31,6 +31,14 @@ extern "C" {
 
 extern uint8_t* vm_base;
 
+/* Per-host-thread PUT recorder, a diagnostic (spu_channels.c). */
+#if defined(_MSC_VER)
+#  define SPU_PUT_TLS __declspec(thread)
+#else
+#  define SPU_PUT_TLS __thread
+#endif
+extern SPU_PUT_TLS void (*t_spu_put_rec)(uint32_t ea, uint32_t size);
+
 /* Guard against a guest DMA whose effective address lands in reserved-but-
  * uncommitted guest memory (the 4 GB VM is MEM_RESERVE; only main mem / RSX /
  * SPU / lv2-heap / stack pages are committed). A garbage EA must be treated
@@ -726,7 +734,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * buffer the RSX is actually bound to. The GCM layer installs this to
          * find the pushbuffer; NULL for every title that does not. */
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
-          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+          if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size);
+          if (t_spu_put_rec) t_spu_put_rec((uint32_t)ea, size); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;

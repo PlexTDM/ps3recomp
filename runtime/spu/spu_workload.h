@@ -91,6 +91,10 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size);
 
+/* The CellSpurs instance and SPU number the next job run on this thread sees
+ * in its kernel context (LS 0x1C0 and 0x1C8). spurs_ea 0 leaves them out. */
+void spurs_job_set_kernel(uint32_t spurs_ea, uint32_t spu_num);
+
 /* Fingerprint `image`, look up its lifted entry, and run it as a SPURS jobchain
  * job via spu_run_spurs_job. Runs SYNCHRONOUSLY on the caller's thread: a job
  * is not persistent (it runs to completion and returns to the manager), and a

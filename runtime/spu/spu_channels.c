@@ -178,6 +178,9 @@ void (*g_spu_out_mbox_hook)(uint32_t group_id, uint32_t spu_id,
  * stream is, so the only evidence is the DMA that writes it. NULL until
  * installed, so a title with no SPU-built FIFO pays nothing. */
 void (*g_spu_put_hook)(uint32_t ea, uint32_t size) = 0;
+/* The same, for this host thread only: a diagnostic set around one SPU run
+ * (SPURS_JOB_TRACE_AT_S in spurs_job.c records what a job wrote). */
+SPU_PUT_TLS void (*t_spu_put_rec)(uint32_t ea, uint32_t size) = 0;
 
 void spu_halt(spu_context* ctx)
 {

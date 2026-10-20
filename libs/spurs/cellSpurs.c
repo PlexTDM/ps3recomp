@@ -2337,6 +2337,7 @@ enum {
 static struct {
     u32 jc_ea;        /* CellSpursJobChain EA (0 = free) */
     u32 entry_ea;     /* first command word EA */
+    u32 spurs_ea;     /* the CellSpurs it was created on */
     u16 size_desc;
     u16 max_grab;
     int run_count;
@@ -2421,13 +2422,14 @@ s32 cellSpursJobChainAttributeSetHaltOnError(u64 attr_ea)
 }
 
 /* Register (or re-register) a job chain handle. Shared by both Create forms. */
-static s32 jc_register(u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
+static s32 jc_register(u32 spurs_ea, u32 jc_ea, u32 entry_ea, u16 size_desc, u16 max_grab,
                        const char* who)
 {
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (!s_jobchains[i].jc_ea || s_jobchains[i].jc_ea == jc_ea) {
             s_jobchains[i].jc_ea     = jc_ea;
             s_jobchains[i].entry_ea  = entry_ea;
+            s_jobchains[i].spurs_ea  = spurs_ea;
             s_jobchains[i].resume_pc = 0;
             s_jobchains[i].size_desc = size_desc;
             s_jobchains[i].max_grab  = max_grab;
@@ -2465,7 +2467,7 @@ s32 cellSpursCreateJobChainWithAttribute(u64 spurs_ea, u64 jc_ea, u64 attr_ea)
            (u32)jc_ea, entry, sd_mg >> 16, sd_mg & 0xFFFFu,
            name_ea ? (const char*)(vm_base + name_ea) : "-");
 
-    return jc_register((u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
+    return jc_register((u32)spurs_ea, (u32)jc_ea, entry, (u16)(sd_mg >> 16), (u16)(sd_mg & 0xFFFFu),
                        "CreateJobChainWithAttribute");
 }
 
@@ -2488,7 +2490,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
                             u64 prio_ea, u32 maxContention,
                             u32 autoRequestSpuCount)
 {
-    (void)spurs_ea; (void)prio_ea;
+    (void)prio_ea;
     if (!jc_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
     static int _n = 0;
@@ -2500,7 +2502,7 @@ s32 cellSpursCreateJobChain(u64 spurs_ea, u64 jc_ea, u64 entry_ea,
         if (entry_ea && (u32)entry_ea < 0x10000000u)
             jc_dump_commands("CreateJobChain", (u32)entry_ea, 16);
     }
-    return jc_register((u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
+    return jc_register((u32)spurs_ea, (u32)jc_ea, (u32)entry_ea, (u16)sizeJobDescriptor,
                        (u16)maxGrabbedJob, "CreateJobChain");
 }
 
@@ -2529,7 +2531,15 @@ enum {                              /* CellSpursJobHeader (48 B) */
     JH_SIZE          = 0x30,
 };
 
-static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+/* The SPU a job runs on, as the kernel context tells it: each job-pool
+ * worker is its own SPU, a chain walker running a job itself is SPU 0. */
+#if defined(_MSC_VER)
+static __declspec(thread) u32 t_jc_spu;
+#else
+static __thread u32 t_jc_spu;
+#endif
+
+static void jc_run_one_job(u32 jc_ea, u32 job_ea, int idx, u32 size_desc)
 {
     u64 ea_bin_raw = vm_read64(job_ea + JH_EA_BINARY);
     u32 ea_bin     = (u32)(ea_bin_raw & ~7ull);          /* low 3 bits = flags */
@@ -2562,6 +2572,12 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * DMA traffic at all. spu_workload_dispatch_job reproduces jm2's staging.
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
+    { u32 spurs = 0;
+      for (int i = 0; i < MAX_JOBCHAINS; i++)
+          if (s_jobchains[i].jc_ea == jc_ea) { spurs = s_jobchains[i].spurs_ea; break; }
+      const struct SpursInst* si = spurs ? spurs_inst_find(spurs) : NULL;
+      const u32 nspus = (si && si->nspus) ? si->nspus : 1;
+      spurs_job_set_kernel(spurs, t_jc_spu % nspus); }
     spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
     /* The job may have filled a command-stream hole the FIFO is parked on. */
     { extern void cellGcm_fifo_kick(void); cellGcm_fifo_kick(); }
@@ -2930,7 +2946,7 @@ static void jc_execute(int slot)
               if (jl >= 2) fprintf(stderr, "[jc]   job[%d] pc=0x%08X ea=0x%08X\n", jobs, pc, (u32)(cmd & ~7ull)); }
             { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
             int idx = jobs++;
-            jc_run_one_job((u32)(cmd & ~7ull), idx, size_desc);
+            jc_run_one_job(jc_ea, (u32)(cmd & ~7ull), idx, size_desc);
             idle = 0;                    /* real work: the chain is healthy */
             /* Signal per JOB, not per lap. The application waits once for each
              * unit of work it queued -- this title notified the guard 7 times
@@ -2968,7 +2984,7 @@ static void jc_execute(int slot)
                   if (jl >= 2) fprintf(stderr, "[jc] %.1f ms: list job[%d] %u/%u ea=0x%08X bin=0x%08X chain 0x%08X\n",
                                        jc_now_ms(), idx, k, n, list + k * stride,
                                        (u32)(vm_read64(list + k * stride) & ~7ull), jc_ea); }
-                jc_run_one_job(list + k * stride, idx, stride);
+                jc_run_one_job(jc_ea, list + k * stride, idx, stride);
                 jc_signal_done(jc_ea, idx);
             }
             if (n) idle = 0;
@@ -3040,7 +3056,7 @@ static struct {
     int         inited;
 } s_jcpool;
 
-static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc);
+static void jc_run_one_job(u32 jc_ea, u32 job_ea, int idx, u32 size_desc);
 
 #ifdef _WIN32
 static DWORD WINAPI jc_pool_worker(LPVOID arg)
@@ -3048,7 +3064,7 @@ static DWORD WINAPI jc_pool_worker(LPVOID arg)
 static void* jc_pool_worker(void* arg)
 #endif
 {
-    (void)arg;
+    t_jc_spu = (u32)(uintptr_t)arg;     /* this worker's SPU number */
     for (;;) {
         JC_LOCK(&s_jcpool.m);
         while (s_jcpool.head == s_jcpool.tail) JC_WAIT(&s_jcpool.cv_work, &s_jcpool.m);
@@ -3056,7 +3072,7 @@ static void* jc_pool_worker(void* arg)
         JC_UNLOCK(&s_jcpool.m);
 
         { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = it.jc_ea; }
-        jc_run_one_job(it.job_ea, it.idx, it.size_desc);
+        jc_run_one_job(it.jc_ea, it.job_ea, it.idx, it.size_desc);
         jc_signal_done(it.jc_ea, it.idx);       /* per job, as the inline walk does */
 
         JC_LOCK(&s_jcpool.m);
@@ -3098,7 +3114,7 @@ static void jc_pool_init(int workers)
     JC_COND_INIT(&s_jcpool.cv_done);
     if (workers < 1) workers = 1;
     if (workers > 16) workers = 16;
-    for (int i = 0; i < workers; i++) jc_spawn(jc_pool_worker, NULL, "job worker");
+    for (int i = 0; i < workers; i++) jc_spawn(jc_pool_worker, (void*)(uintptr_t)i, "job worker");
     printf("[cellSpurs] job pool: %d worker thread(s)\n", workers);
 }
 

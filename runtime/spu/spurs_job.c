@@ -201,6 +201,25 @@ static uint64_t sj_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 #endif
+/* The PUTs of the job being traced on this thread (SPURS_JOB_TRACE_AT_S). */
+extern SPURS_JOB_TLS void (*t_spu_put_rec)(uint32_t ea, uint32_t size);   /* spu_dma.h */
+static SPURS_JOB_TLS struct { uint32_t n; uint32_t ea[32], sz[32]; } t_puts;
+static void spurs_job_trace_put(uint32_t ea, uint32_t size)
+{
+    if (t_puts.n < 32) { t_puts.ea[t_puts.n] = ea; t_puts.sz[t_puts.n] = size; }
+    t_puts.n++;
+}
+
+/* The SPURS kernel context fields a job can read, for the job about to run on
+ * this thread (spurs_job_set_kernel). 0 = not set: leave the store alone. */
+static SPURS_JOB_TLS uint32_t t_kern_spurs, t_kern_spu;
+
+void spurs_job_set_kernel(uint32_t spurs_ea, uint32_t spu_num)
+{
+    t_kern_spurs = spurs_ea;
+    t_kern_spu   = spu_num;
+}
+
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {
@@ -273,6 +292,22 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- binary at LS 0 (PIC, so delta 0 keeps the lifted addresses) ---- */
     memcpy(ls, vm_base + ea_bin, size_bin);
+
+    /* ---- the kernel context a job reads ----------------------------------
+     * Under jm2 the SPURS kernel's context sits at LS 0x100 and the job far
+     * above it, and cellSpursGetCurrentSpuId() is a load of its spuNum at LS
+     * 0x1C8 (the CellSpurs EA is the u64 at 0x1C0). Here the job is at LS 0,
+     * so that load returned one of the job's own instruction words. Edge
+     * geometry indexes its per-SPU ring buffers by it: Bleach: Soul
+     * Resurreccion's jobs fall back to them once the frame's 1 MB shared
+     * output buffer is full, looked for buffer 0x4020007F, and dropped every
+     * later segment -- the player character among them. The words written
+     * over are code, which lifted code does not fetch from the store. */
+    if (t_kern_spurs && size_bin >= 0x1D0) {
+        ls32(ls, 0x1C0, 0);
+        ls32(ls, 0x1C4, t_kern_spurs);
+        ls32(ls, 0x1C8, t_kern_spu);
+    }
 
     /* ---- regions, following _cellSpursCheckJob's own arithmetic --------- */
     uint32_t p         = ALIGN1024(size_bin);
@@ -466,7 +501,97 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
      * and trips its parameter guard, which HALTS -- ending the run. So the
      * HALT-ASSERT heqi 0x1650 seen once per jm2 job is NORMAL COMPLETION
      * noise, not a failure: the job's real work finished before the jump. */
+    /* SPURS_JOB_TRACE_AT_S=<s>: from that many seconds after the first job,
+     * trace SPURS_JOB_TRACE_N jobs (default 400; SPURS_JOB_TRACE_BIN=<ea>
+     * keeps one binary): the descriptor, the head of each input, and every
+     * PUT the job made with the first words it wrote. One record per job, so
+     * pool workers do not interleave. */
+    static double s_tr_at = -2.0; static volatile long s_tr_left;
+    static uint32_t s_tr_bin;
+    if (s_tr_at == -2.0) {
+        const char* e = getenv("SPURS_JOB_TRACE_AT_S");
+        s_tr_at = e ? atof(e) : -1.0;
+        e = getenv("SPURS_JOB_TRACE_N"); s_tr_left = e ? atol(e) : 400;
+        e = getenv("SPURS_JOB_TRACE_BIN"); s_tr_bin = e ? (uint32_t)strtoul(e, 0, 0) : 0;
+    }
+    int traced = 0;
+    uint32_t tr_user = 0, tr_user_before[16];
+    static uint64_t s_tr_t0;
+    if (s_tr_at >= 0.0 && !s_tr_t0) s_tr_t0 = sj_now_ns();   /* the first job of any kind */
+    if (s_tr_at >= 0.0 && s_tr_left > 0 && (!s_tr_bin || s_tr_bin == ea_bin)) {
+        const uint64_t now = sj_now_ns(), t0 = s_tr_t0;
+#ifdef _WIN32
+        if ((double)(now - t0) * 1e-9 >= s_tr_at && InterlockedDecrement(&s_tr_left) >= 0) {
+#else
+        if ((double)(now - t0) * 1e-9 >= s_tr_at && __sync_sub_and_fetch(&s_tr_left, 1) >= 0) {
+#endif
+            traced = 1;
+            t_puts.n = 0;
+            t_spu_put_rec = spurs_job_trace_put;
+            /* The first user-data word past the DMA lists, when it is an
+             * address: Edge's output buffer info, before the run. */
+            tr_user = g32(job_ea + JH_SIZE + n_dma * 8u + n_cache * 8u);
+            if (tr_user >= 0x10000u && tr_user < 0xD0000000u)
+                for (int i = 0; i < 16; i++) tr_user_before[i] = g32(tr_user + 4u * (uint32_t)i);
+            /* SPURS_JOB_TRACE_DIR=<dir>: also write what the job reads, the
+             * descriptor then its input buffer as it is in local store (each
+             * entry 16-byte aligned), to <dir>/job_<n>_<ea>.bin. */
+            static const char* dir = (const char*)1;
+            if (dir == (const char*)1) dir = getenv("SPURS_JOB_TRACE_DIR");
+            if (dir) {
+                static volatile long seq;
+#ifdef _WIN32
+                const long n = InterlockedIncrement(&seq);
+#else
+                const long n = __sync_add_and_fetch(&seq, 1);
+#endif
+                char path[512];
+                snprintf(path, sizeof path, "%s/job_%04ld_%08X.bin", dir, n, job_ea);
+                FILE* f = fopen(path, "wb");
+                if (f) {
+                    fwrite(ls + desc_ls, 1, dsz, f);
+                    fwrite(ls + io_ls, 1, io_used, f);
+                    fclose(f);
+                }
+            }
+        }
+    }
     spu_run_with_halt(entry, ctx);
+    if (traced) {
+        t_spu_put_rec = 0;
+        char* b = (char*)malloc(16384); size_t k = 0;
+        if (b) {
+            #define TP(...) k += (size_t)snprintf(b + k, k < 16000 ? 16000 - k : 0, __VA_ARGS__)
+            TP("[jobtr] job 0x%08X bin 0x%08X io=%u out=%u scr=%u dma=%u cache=%u\n",
+               job_ea, ea_bin, size_io, size_out, size_scr, n_dma, n_cache);
+            TP("[jobtr]  desc:");
+            for (uint32_t o = 0; o < dsz && o < 256; o += 4) TP(" %08X", g32(job_ea + o));
+            TP("\n");
+            for (uint32_t i = 0; i < n_dma && i < 16; i++) {
+                const uint64_t e = g64(dma_base + i * 8u);
+                const uint32_t sz = (uint32_t)((e >> 32) & 0x7FFFu), eal = (uint32_t)e;
+                TP("[jobtr]  in%u %u@0x%08X:", i, sz, eal);
+                for (uint32_t o = 0; sz && eal && o < sz && o < 32; o += 4) TP(" %08X", g32(eal + o));
+                TP("\n");
+            }
+            for (uint32_t i = 0; i < t_puts.n && i < 32; i++) {
+                TP("[jobtr]  put %u@0x%08X:", t_puts.sz[i], t_puts.ea[i]);
+                for (uint32_t o = 0; o < t_puts.sz[i] && o < 32; o += 4) TP(" %08X", g32(t_puts.ea[i] + o));
+                TP("\n");
+            }
+            if (t_puts.n > 32) TP("[jobtr]  ... %u puts\n", t_puts.n);
+            if (tr_user >= 0x10000u && tr_user < 0xD0000000u) {
+                TP("[jobtr]  user0 @0x%08X before:", tr_user);
+                for (int i = 0; i < 16; i++) TP(" %08X", tr_user_before[i]);
+                TP("\n[jobtr]  user0 @0x%08X after: ", tr_user);
+                for (int i = 0; i < 16; i++) TP(" %08X", g32(tr_user + 4u * (uint32_t)i));
+                TP("\n");
+            }
+            #undef TP
+            fputs(b, stderr);
+            free(b);
+        }
+    }
 
     /* Capture the job's outbound mailbox. These are LS POINTERS TO STRINGS for
      * the SPU printf service, NOT query results -- value 0x83C0 from the sound
