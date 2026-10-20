@@ -441,6 +441,13 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
 
     /* ---- enter the job -------------------------------------------------- */
     ctx->gpr[1]._u32[0] = (stack_top - 16u) & ~15u;   /* SPU stack grows down */
+    /* Word 1 of r1 is the stack space left (the SPU ABI's "available stack"),
+     * which every frame's `ai $1,$1,-n` decrements along with the pointer. A
+     * job built with stack checking halts as soon as it goes negative
+     * (xswd + heqi -1): Bleach: Soul Resurreccion's geometry job did on its
+     * first frame, with this left at 0, and drew nothing. The stack is what
+     * lies above the scratch area. */
+    ctx->gpr[1]._u32[1] = ((stack_top - 16u) & ~15u) - (s_ls + size_scr);
     /* Link register: where the job returns when it is done. The job manager
      * would pass an address inside itself; 0 makes the job re-enter its own
      * entry at LS 0 and run a bogus second lap. */
