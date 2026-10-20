@@ -253,6 +253,10 @@ u32 cellGcmGetFlipStatus(void);
  * syscalls, so no cellGcm* import ever runs. These let the syscall layer drive
  * the same state the HLE path sets up. */
 u32  cellGcm_syscall_bringup(u32 local_size);   /* -> RSX local memory base */
+
+/* The local memory size cellGcmGetConfiguration reports (0: the whole
+ * 256 MB; a retail console reports 0x0F900000). Call before cellGcmInit. */
+void cellGcm_set_local_size(u32 size);
 u32  cellGcm_control_guest_addr(void);          /* put/get/ref triple EA */
 void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size);
 void cellGcm_syscall_iounmap(u32 io, u32 size);

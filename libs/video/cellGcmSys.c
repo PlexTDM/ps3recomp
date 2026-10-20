@@ -167,6 +167,14 @@ static u16 s_ea_address_table[65536];
 /* Local memory bump allocator */
 static u32 s_local_mem_allocated = 0;  /* next free offset in local memory */
 
+/* The local memory size cellGcmGetConfiguration reports; 0 keeps the whole
+ * 256 MB. A retail console reports 0x0F900000 (249 MB: the system keeps the
+ * rest), and a title can depend on that value: Bleach: Soul Resurreccion
+ * hands localSize to an allocator whose block sizes are 28-bit fields, so
+ * 0x10000000 reads back as a zero-sized heap. Set before cellGcmInit. */
+static u32 s_local_size_override = 0;
+void cellGcm_set_local_size(u32 size) { s_local_size_override = size; }
+
 /* IO memory mapping table */
 typedef struct IoMapping {
     u32 ea;         /* effective address in main memory */
@@ -516,7 +524,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      * In a real implementation these would reflect actual allocated memory.
      */
     s_config.localAddress    = 0xC0000000;  /* typical RSX local mem base */
-    s_config.localSize       = 256 * 1024 * 1024;  /* 256 MB */
+    s_config.localSize       = s_local_size_override ? s_local_size_override
+                                                     : 256 * 1024 * 1024;  /* 256 MB */
     s_config.ioAddress       = ioAddress;
     s_config.ioSize          = ioSize;
     s_config.memoryFrequency = 650000000;   /* 650 MHz */
