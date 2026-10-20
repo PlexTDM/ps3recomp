@@ -174,8 +174,15 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     return CELL_OK;
 }
 
-s32 cellRescSetConvertAndFlip(s32 index)
+/* cellRescSetConvertAndFlip(CellGcmContextData* con, s32 idx): the SDK's
+ * signature. It used to be read as (idx) alone, so the index was the
+ * caller's command-buffer context address (0x0F800000 from Bleach: Soul
+ * Resurreccion), and a title that picks among its RESC sources presented
+ * whichever surface happened to be current. The context is where libresc
+ * writes its conversion draw and flip; here the flip is requested directly. */
+s32 cellRescSetConvertAndFlip(u32 con, s32 index)
 {
+    (void)con;
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
@@ -385,6 +392,7 @@ s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMod
 
 /* Makes the command buffer wait for the previous flip. Flips complete as
  * they are asked for here, so there is nothing to wait for. */
-void cellRescSetWaitFlip(void)
+void cellRescSetWaitFlip(u32 con)
 {
+    (void)con;
 }

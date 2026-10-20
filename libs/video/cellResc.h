@@ -99,7 +99,7 @@ s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
 
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
-s32 cellRescSetConvertAndFlip(s32 index);
+s32 cellRescSetConvertAndFlip(u32 con, s32 index);   /* con: CellGcmContextData* (guest) */
 
 s32 cellRescSetFlipHandler(void (*handler)(u32));
 s32 cellRescSetVBlankHandler(void (*handler)(u32));
@@ -116,7 +116,7 @@ s32 cellRescAdjustAspectRatio(float horizontal, float vertical);
 /* gcmSurface is a CellGcmSurface (guest, big-endian), rescSrc a CellRescSrc. */
 s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, CellRescSrc* rescSrc);
 s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode);
-void cellRescSetWaitFlip(void);
+void cellRescSetWaitFlip(u32 con);   /* con: CellGcmContextData* (guest) */
 
 #ifdef __cplusplus
 }
