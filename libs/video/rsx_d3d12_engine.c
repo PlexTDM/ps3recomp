@@ -242,7 +242,8 @@ typedef struct { u32 surface, remap, format, view; } EngView;
 
 typedef enum {
     ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
-    ENG_REC_COLOR_COPY, ENG_REC_CLEAR_DS_RECT, ENG_REC_UPLOAD
+    ENG_REC_COLOR_COPY, ENG_REC_CLEAR_DS_RECT, ENG_REC_UPLOAD,
+    ENG_REC_COLOR_SUBCOPY       /* depth = target, resolve_dst = copy, clear_rect[2..3] = box */
 } EngRecKind;
 
 typedef struct {
@@ -1890,6 +1891,55 @@ static u32 eng_color_snapshot(void* user, u32 surface)
     r->kind = ENG_REC_COLOR_COPY;
     r->depth = surface;
     r->resolve_dst = dst;
+    return dst;
+}
+
+/* The top-left w x h guest pixels of a colour target, as a texture of that
+ * size, copied at this point in the stream (rsx_be.color_subrect_snapshot).
+ * A small LRU pool per (target, size); an evicted copy is retired, so a
+ * submitted list that still names it keeps it until the GPU is done. */
+static void eng_obj_release(void* user, u32 handle);
+static u32 eng_color_subrect_snapshot(void* user, u32 surface, u32 w, u32 h)
+{
+    (void)user;
+    EngObj* t = eng_obj(surface);
+    if (!t || !t->res || !w || !h || w > t->gw || h > t->gh) return 0;
+    if (s_rec_count >= ENG_MAX_RECORDS) { s_dropped++; return 0; }
+    u32 sw = eng_obj_scaled(surface) ? sc_dim(w) : w, sh = eng_obj_scaled(surface) ? sc_dim(h) : h;
+    if (sw > t->w) sw = t->w;
+    if (sh > t->h) sh = t->h;
+    enum { N = 64 };
+    static struct { u32 surface, w, h, snap; u64 used; } pool[N]; static u64 tick;
+    u32 slot = N, dst = 0;
+    for (u32 i = 0; i < N; i++)
+        if (pool[i].snap && pool[i].surface == surface && pool[i].w == w && pool[i].h == h) { slot = i; break; }
+    if (slot < N) {
+        EngObj* d = eng_obj(pool[slot].snap);
+        if (d && d->res && d->fmt == t->fmt && d->w == sw && d->h == sh) dst = pool[slot].snap;
+    } else {
+        slot = 0;
+        for (u32 i = 0; i < N; i++) {
+            if (!pool[i].snap) { slot = i; break; }
+            if (pool[i].used < pool[slot].used) slot = i;
+        }
+    }
+    if (!dst) {
+        if (pool[slot].snap) { eng_obj_release(NULL, pool[slot].snap); pool[slot].snap = 0; }
+        ID3D12Resource* r = make_texture(t->fmt, sw, sh, 1, 1, D3D12_RESOURCE_FLAG_NONE,
+                                         D3D12_RESOURCE_STATE_COPY_DEST, NULL);
+        dst = eng_obj_add(r, OBJ_SNAPSHOT, t->fmt, sw, sh, 1, 1, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!dst) return 0;
+        s_obj[dst - 1].gw = w; s_obj[dst - 1].gh = h;
+        eng_write_srv(dst, r, t->fmt, 1, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+        pool[slot].surface = surface; pool[slot].w = w; pool[slot].h = h; pool[slot].snap = dst;
+    }
+    pool[slot].used = ++tick;
+    EngRecord* r = &s_rec[s_rec_count++];
+    memset(r, 0, sizeof *r);
+    r->kind = ENG_REC_COLOR_SUBCOPY;
+    r->depth = surface;
+    r->resolve_dst = dst;
+    r->clear_rect[2] = sw; r->clear_rect[3] = sh;
     return dst;
 }
 
@@ -3580,6 +3630,19 @@ static void eng_encode_records(void)
             bar_flush();
             CALL(s_list, CopyResource, dst->res, src->res);
             break; }
+        case ENG_REC_COLOR_SUBCOPY: {
+            EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
+            if (!src || !dst) break;
+            if (src->ms && src->ms_dirty) eng_ms_resolve((u32)(src - s_obj) + 1);
+            res_transition(src->res, &src->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            res_transition(dst->res, &dst->state, D3D12_RESOURCE_STATE_COPY_DEST);
+            bar_flush();
+            D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
+            dl.pResource = dst->res; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sl.pResource = src->res; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_BOX box = { 0, 0, 0, r->clear_rect[2], r->clear_rect[3], 1 };
+            CALL(s_list, CopyTextureRegion, &dl, 0, 0, 0, &sl, &box);
+            break; }
         case ENG_REC_DEPTH_RESOLVE: {
             EngObj* src = eng_owner(r->depth); EngObj* dst = eng_owner(r->resolve_dst);
             ID3D12PipelineState* pso = r->resolve_packed ? s_depth_pack_pso : s_depth_pso;
@@ -4243,6 +4306,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_snapshot       = eng_depth_snapshot,
     .depth_snapshot_rgba8 = eng_depth_snapshot_rgba8,
     .color_snapshot       = eng_color_snapshot,
+    .color_subrect_snapshot = eng_color_subrect_snapshot,
     .query_begin          = eng_query_begin,
     .query_set            = eng_query_set,
     .query_report         = eng_query_report,

@@ -224,6 +224,18 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_16BIT, hlsl, sizeof(hlsl));
         check_absent("mrt_16bit_single", hlsl, "PSOutput");
         check("mrt_16bit_h0", hlsl, "float4 _o = h[0];");
+
+        /* A logic op emulated by blending: the output becomes 1.0, after an
+         * alpha test that still discards on the program's own alpha. */
+        check_true("one_alpha_patched",
+                   rsx_fp_apply_alpha_test_buffered(hlsl, sizeof(hlsl), 0x205u) == 1);
+        check_true("one_patched", rsx_fp_apply_output_one(hlsl, sizeof(hlsl)) == 1);
+        check("one_discard", hlsl, "if (!(_rsx_out.a != _rsx_alpha_ref)) discard;\n"
+                                   "    return (float4)1.0;\n}\n");
+        check_absent("one_old_return", hlsl, "return _rsx_out;");
+        /* Not for several targets. */
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_true("one_mrt_refused", rsx_fp_apply_output_one(hlsl, sizeof(hlsl)) == -1);
     }
 
     /* Test 8: all four exports, and the highest written one decides how many

@@ -83,6 +83,10 @@ typedef struct rsx_be_render_state {
     u32 stencil_enable, stencil_two_sided;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
+    /* A logic op the blend fields above emulate whose result ignores the
+     * fragment (INVERT, SET): the program's output is replaced by 1.0, which
+     * the emulating blend then turns into 1 - dst or 1. 0 = none. */
+    u32 logic_op;
 } rsx_be_render_state;
 
 /* submit_and_wait reasons, for a backend that wants to log or count them. */
@@ -158,6 +162,12 @@ typedef struct rsx_draw_backend {
      * when the backend cannot. The engine binds the copy, with the unit's
      * crossbar, in place of the live target. */
     u32  (*color_snapshot)(void* user, u32 surface);
+    /* Optional: the top-left w x h guest pixels of a colour target, copied at
+     * this point in the stream into a texture of exactly that size. A texture
+     * unit naming a target's address with a smaller size and the target's
+     * pitch samples that sub-rectangle on the hardware, not the whole target.
+     * NULL: the whole target is bound, as before. */
+    u32  (*color_subrect_snapshot)(void* user, u32 surface, u32 w, u32 h);
     /* Occlusion queries (NV4097 ZPASS reports). query_begin returns a fresh
      * zeroed sample counter (0 when the backend has none); query_set routes
      * the samples that pass the depth/stencil tests in the following draws

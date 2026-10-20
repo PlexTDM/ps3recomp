@@ -163,6 +163,10 @@ u64 rsx_fp_literal_source_hash(
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
 
+/* Replace the final return with 1.0 in every channel (a logic op emulated by
+ * blending, rsx_be_render_state.logic_op). 1 = done, -1 = not possible. */
+int rsx_fp_apply_output_one(char* hlsl, u32 out_size);
+
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
  * -1 when one allocation can never fit. */

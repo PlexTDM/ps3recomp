@@ -1367,6 +1367,31 @@ int rsx_fp_apply_alpha_test_buffered(
     return 1;
 }
 
+/* The program's final return replaced by 1.0 in every channel: the fragment a
+ * logic op's blend emulation needs (rsx_be_render_state.logic_op). Runs after
+ * rsx_fp_apply_alpha_test*, whose discard still tests the real output. A
+ * multiple-target program is left alone (-1). */
+int rsx_fp_apply_output_one(char* hlsl, u32 out_size)
+{
+    if (!hlsl || out_size == 0 || fp_returns_struct(hlsl))
+        return -1;
+    char* marker = NULL;
+    for (char* p = strstr(hlsl, "    return "); p;
+         p = strstr(p + 1, "    return "))
+        marker = p;
+    if (!marker)
+        return -1;
+    char* terminator = strstr(marker, ";\n}\n");
+    if (!terminator)
+        return -1;
+    static const char suffix[] = "    return (float4)1.0;\n}\n";
+    const size_t prefix = (size_t)(marker - hlsl);
+    if (prefix + sizeof suffix > out_size)
+        return -1;
+    memcpy(marker, suffix, sizeof suffix);
+    return 1;
+}
+
 /* --- kept from this tree when adopting the newer decompiler ---------------
  * rsx_d3d12_backend.c calls both of these: extract_consts feeds the per-draw
  * fp_k[] slots, code_hash keys the PSO cache on the ucode rather than the

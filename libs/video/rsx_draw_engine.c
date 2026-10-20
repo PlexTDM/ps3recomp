@@ -306,6 +306,37 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rs->bs_fail      = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_FAIL);
     rs->bs_zfail     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZFAIL);
     rs->bs_zpass     = rsx_dsp_reg(rsx, M_BACK_STENCIL_OP_ZPASS);
+    /* NV4097_SET_LOGIC_OP_ENABLE (0x0374) / SET_LOGIC_OP (0x0378). Ignored
+     * before, so the draw blended instead. libfontGcm (Bleach: Soul
+     * Resurreccion's text) fills each glyph's coverage with an INVERT pass
+     * over triangle fans -- even-odd by toggling alpha -- and with the blend
+     * in its place only the anti-aliased outline reached the glyph, so all
+     * text came out as faint outlines. D3D12 and Metal logic ops need integer
+     * targets; the ops whose result does not combine the fragment with the
+     * target are blends instead (the hardware disables blending under a
+     * logic op): CLEAR, COPY, NOOP, and INVERT and SET with the fragment
+     * forced to 1. Float targets take no logic op on NV40. */
+    if ((rsx_dsp_reg(rsx, 0x0374) & 1) && !rs->rt_fp16) {
+        const u32 op = rsx_dsp_reg(rsx, 0x0378);
+        u32 sf = 0, df = 0; int on = 1;
+        switch (op) {
+        case 0x1500: sf = 0x0000; df = 0x0000; break;          /* CLEAR: 0 */
+        case 0x1503: on = 0; break;                            /* COPY: s */
+        case 0x1505: sf = 0x0000; df = 0x0001; break;          /* NOOP: d */
+        case 0x150A: sf = 0x0307; df = 0x0000; rs->logic_op = op; break; /* INVERT: 1 - d */
+        case 0x150F: sf = 0x0001; df = 0x0000; rs->logic_op = op; break; /* SET: 1 */
+        default: { static int n = 0; if (n < 4 && ++n)
+                       fprintf(stderr, "[rsx engine] logic op 0x%04X not emulated (blending as set)\n", op); }
+                 on = -1; break;
+        }
+        if (on == 0) rs->blend_enable = 0;
+        else if (on == 1) {
+            rs->blend_enable = 1;
+            rs->sf_rgb = sf; rs->df_rgb = df;
+            rs->sf_a = sf == 0x0307 ? 0x0305 : sf; rs->df_a = df;
+            rs->eq_rgb = rs->eq_a = 0x8006;                    /* FUNC_ADD */
+        }
+    }
     /* RSX_FORCE=<list>: experiment overrides. "nostencil" disables the
      * stencil test, "alpharef0" zeroes the alpha-test reference, "noalpha"
      * disables the alpha test. */
@@ -352,6 +383,8 @@ u64 rsx_draw_engine_hash_render_state(const rsx_be_render_state* rs, u64 hash)
     ENG_HASH_FIELD(bs_fail);
     ENG_HASH_FIELD(bs_zfail);
     ENG_HASH_FIELD(bs_zpass);
+    /* Only when set, so the keys of every pipeline without one are unchanged. */
+    if (rs->logic_op) ENG_HASH_FIELD(logic_op);
 #undef ENG_HASH_FIELD
     return hash;
 }
@@ -1791,6 +1824,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
                                              rs->alpha_func) < 0)
             fi = -1;
+        /* After the alpha test, which still sees the program's own alpha. */
+        if (fi > 0 && rs->logic_op &&
+            rsx_fp_apply_output_one(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
+            fi = -1;
     }
     struct eng_pipe_job* job = NULL;
 #if defined(__APPLE__) || defined(_WIN32)
@@ -2607,11 +2644,25 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
         if (unused_own) continue;   /* bound to nothing: the program never reads it */
         if (textures[u]) continue;
         if (sampled >= 0) {
+            /* A smaller texture over the target, row for row (its pitch spans
+             * a whole target row): the top-left sub-rectangle, which bound as
+             * the whole target came out shrunk into its corner. libfontGcm
+             * renders each glyph into the corner of one 96x96 target and
+             * draws it as a texture of the glyph's own size. RSX_NO_SUBRECT=1
+             * binds the whole target. */
+            u32 src = g.surfaces[sampled].handle;
+            { static int off = -1; if (off < 0) off = getenv("RSX_NO_SUBRECT") ? 1 : 0;
+              const eng_surface* ss = &g.surfaces[sampled];
+              if (!off && g.be->color_subrect_snapshot && ss->fmt == RSX_BE_FMT_R8G8B8A8 &&
+                  t.width && t.height && (t.width < ss->w || t.height < ss->h) &&
+                  t.width <= ss->w && t.height <= ss->h && t.pitch >= ss->w * 4u) {
+                  const u32 sub = g.be->color_subrect_snapshot(g.be->user, ss->handle, t.width, t.height);
+                  if (sub) src = sub;
+              } }
             const u32 view = g.be->surface_view
-                ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
-                                     t.remap & 0xFFFFu, t.format)
+                ? g.be->surface_view(g.be->user, src, t.remap & 0xFFFFu, t.format)
                 : 0;
-            textures[u] = view ? view : g.surfaces[sampled].handle;
+            textures[u] = view ? view : src;
             continue;
         }
         const u32 base_fmt = t.format & RSX_TEX_FMT_BASE_MASK & ~(u32)RSX_TEX_FMT_UNNORM;
@@ -2806,7 +2857,9 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             trs.cull_enable, trs.color_mask);
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
-    if (dc.n_verts && dc.n_verts <= 8 && dc.out_verts && dc.layout.stride) {
+    /* RSX_TRACE_VERTS=<n>: every vertex of draws up to n vertices (default 8). */
+    static long tv_max = -1; if (tv_max < 0) { const char* e = getenv("RSX_TRACE_VERTS"); tv_max = e ? atol(e) : 8; }
+    if (dc.n_verts && dc.n_verts <= (u32)tv_max && dc.out_verts && dc.layout.stride) {
         /* Every vertex of a small draw, first 8 floats each: a quad's four
          * corners and colours say whether it covers the frame and with what. */
         for (u32 n = 0; n < dc.n_verts; n++) {
@@ -2816,6 +2869,37 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             fprintf(stderr, "]");
         }
     }
+    fprintf(stderr, " logic=%u/%X", rsx_dsp_reg(&g.rsx, 0x0374), rsx_dsp_reg(&g.rsx, 0x0378));
+    /* RSX_TRACE_FPCONST=1: the draw's fragment constants (the ones inlined in
+     * its program, which a title patches in place between draws). */
+    { static int fc = -1; if (fc < 0) fc = getenv("RSX_TRACE_FPCONST") ? 1 : 0;
+      if (fc) {
+          u32 floc = 0; const u32 foff = rsx_dsp_fragment_program(&g.rsx, &floc);
+          const u8* fu = eng_guest_ptr(NULL, floc, foff, 16);
+          const u32 fsz = fu ? rsx_fp_program_size(fu, ENG_FP_MAX_BYTES) : 0;
+          if (fsz) fu = eng_guest_ptr(NULL, floc, foff, fsz);
+          fprintf(stderr, " fp=L%u/0x%08X/%u [", floc, foff, fsz);
+          for (u32 k = 0; fu && k < fsz / 4 && k < 24; k++)
+              fprintf(stderr, "%s%08X", k ? " " : "", ((u32)fu[4*k] << 24) | ((u32)fu[4*k+1] << 16) | ((u32)fu[4*k+2] << 8) | fu[4*k+3]);
+          fprintf(stderr, "] fpconst(%u):", g.fp_constants.count);
+          for (u32 k = 0; k < g.fp_constants.count && k < 4; k++) {
+              const float* c = (const float*)g.fp_constants.values[k];
+              fprintf(stderr, " (%.4g %.4g %.4g %.4g)", c[0], c[1], c[2], c[3]); }
+          /* RSX_TRACE_VPC=<first>-<last>: those vertex program constants. */
+          { static int vlo = -2, vhi = -1;
+            if (vlo == -2) { const char* e = getenv("RSX_TRACE_VPC");
+                             vlo = -1; if (e) sscanf(e, "%d-%d", &vlo, &vhi); }
+            for (int k = vlo; k >= 0 && k <= vhi && k < RSX_DSP_NUM_CONSTANTS; k++) {
+                const float* c = (const float*)g.rsx.constants[k];
+                fprintf(stderr, " c[%d]=(%.4g %.4g %.4g %.4g)", k, c[0], c[1], c[2], c[3]); } }
+          /* The immediate values the attributes without an array read. */
+          fprintf(stderr, " imm:");
+          for (u32 i = 0; i < 16; i++) {
+              rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a);
+              if (a.size) continue;
+              float d[4]; rsx_dsp_vertex_default(&g.rsx, i, d);
+              if (d[0] == 0.0f && d[1] == 0.0f && d[2] == 0.0f && (d[3] == 0.0f || d[3] == 1.0f)) continue;
+              fprintf(stderr, " %u=(%.3g %.3g %.3g %.3g)", i, d[0], d[1], d[2], d[3]); } } }
     fprintf(stderr, " attrs:");
     for (u32 i = 0; i < 16; i++) {
         rsx_dsp_vertex_attr a; rsx_dsp_get_vertex_attr(&g.rsx, i, &a);
@@ -3288,6 +3372,10 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
         snprintf(line, sizeof line, "f%u CLEAR mask=0x%X color=0x%08X target=s%d", g.frames, mask,
                  rsx_dsp_clear_color(&g.rsx), n_targets ? (int)targets[0] : -1);
         eng_ring_push(line); }
+    if (s_dtrace_frame >= 0 && (long)g.frames >= s_dtrace_frame && (long)g.frames < s_dtrace_frame + 4)
+        fprintf(stderr, "[draw-trace] f%u CLEAR mask=0x%X color=0x%08X target=s%d scissor=%08X/%08X\n", g.frames, mask,
+                rsx_dsp_clear_color(&g.rsx), n_targets ? (int)targets[0] : -1,
+                rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL));
     if (!n_targets) return;
 
     if (mask & (RSX_CLEAR_COLOR_R | RSX_CLEAR_COLOR_G |
