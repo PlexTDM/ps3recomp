@@ -8,6 +8,7 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
+#include <time.h>        /* timespec_get: SEM_WAITTIME */
 
 /* Environment switches are read where they are used, some of them per call:
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
@@ -331,9 +332,49 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
+
+/* SEM_WAITTIME=1: every 5 s, the time each (semaphore, caller) pair spent in
+ * sys_semaphore_wait, top 12 -- which wait a slow frame is made of. */
+static double sem_now_ms(void)
+{
+    struct timespec ts; timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec * 1e-6;
+}
+static void sem_waittime_note(uint32_t sem, uint32_t lr, uint64_t tid, double ms)
+{
+    enum { N = 64 };
+    static struct { uint32_t sem, lr; uint64_t tid; double ms; uint32_t n; } t[N];
+    static volatile long lock; static double since;
+    while (__sync_lock_test_and_set(&lock, 1)) {}
+    uint32_t i = 0;
+    while (i < N && t[i].n && !(t[i].sem == sem && t[i].lr == lr && t[i].tid == tid)) i++;
+    if (i < N) { t[i].sem = sem; t[i].lr = lr; t[i].tid = tid; t[i].ms += ms; t[i].n++; }
+    const double now = sem_now_ms();
+    if (since == 0.0) since = now;
+    if (now - since >= 5000.0) {
+        fprintf(stderr, "[sem-time] %.1f s:", (now - since) / 1e3);
+        for (int k = 0; k < 12; k++) {
+            uint32_t b = N; double bv = 0.0;
+            for (uint32_t j = 0; j < N; j++) if (t[j].n && t[j].ms > bv) { bv = t[j].ms; b = j; }
+            if (b == N) break;
+            fprintf(stderr, " sem%u@%08X(t%llu) %.0fms/%u", t[b].sem, t[b].lr,
+                    (unsigned long long)t[b].tid, t[b].ms, t[b].n);
+            t[b].ms = -1.0;
+        }
+        fputc('\n', stderr);
+        memset(t, 0, sizeof t); since = now;
+    }
+    __sync_lock_release(&lock);
+}
+
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    static int wt = -1; if (wt < 0) wt = getenv("SEM_WAITTIME") ? 1 : 0;
+    const uint32_t wsem = (uint32_t)ctx->gpr[3], wlr = (uint32_t)ctx->lr;
+    const uint64_t wtid = ctx->thread_id;
+    const double t0 = wt ? sem_now_ms() : 0.0;
     int64_t r = sys_semaphore_wait_impl(ctx);
+    if (wt) sem_waittime_note(wsem, wlr, wtid, sem_now_ms() - t0);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
     if (d && r) { static int n = 0; if (n < 12 && ++n)
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
@@ -509,8 +550,8 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
     { static int _n=0; if (getenv("SEMTID") && _n < 60000)
-        fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
-                (unsigned long long)ctx->thread_id, sem_id, count);
+        fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d lr=0x%08X)\n",
+                (unsigned long long)ctx->thread_id, sem_id, count, (unsigned)ctx->lr);
       else if (!getenv("SEMTID") && _n < 40)
         fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
       _n++; }
