@@ -806,7 +806,16 @@ static int rsx_fp_decompile_internal(
                      a, a, b);
             break;
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
-        case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
+        /* A zero vector is left as it is, not normalized to NaN (oracle:
+         * RPCS3 FragmentProgramDecompiler.cpp, _builtin_normalize, "some
+         * games ... generate NaNs" otherwise). Drakengard 3's cliff material
+         * normalizes a blended normal that comes to zero on a few pixels of
+         * the chapter 1 beach: the NaN went through its lighting into the
+         * HDR scene as large negative colours, black blocks once the bloom
+         * and tone map had spread them. */
+        case OP_NRM:
+            snprintf(rhs, sizeof(rhs), "float4(length((%s).xyz) > 0.0 ? normalize((%s).xyz) : (%s).xyz, 1.0)", a, a, a);
+            break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
         /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
          * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
