@@ -861,6 +861,15 @@ void ppu_gcm_pump(void)
 void cellGcm_pump_stale(u32 ms)
 {
     static u64 s_seen_ns = 0;
+    /* User commands at once. The title waits for the GPU to reach them, and
+     * on hardware the handler runs on libgcm's interrupt thread the moment it
+     * does. Bleach: Soul Resurreccion's draw thread waits for its user
+     * handler twice a frame; waiting here for a guest thread's next HLE call
+     * cost ~3 ms a delivery, and prompt delivery cut its waits by ~10 ms a
+     * frame. (cellGcmQueueUserCommand kicks the frame clock, so this runs
+     * right after the drain that queued them.) GCM_USER_PROMPT=0: as before. */
+    { static int on = -1; if (on < 0) { const char* e = getenv("GCM_USER_PROMPT"); on = !(e && e[0] == '0'); }
+      if (on && *(volatile u32*)&s_user_qhead != *(volatile u32*)&s_user_qtail) { ppu_gcm_pump(); return; } }
     if (!GCM_PENDING_PEEK()) { s_seen_ns = 0; return; }
     const u64 now = get_timestamp_ns();
     if (!s_seen_ns) { s_seen_ns = now; return; }
@@ -1769,6 +1778,18 @@ void* cellGcm_fifo_kick_event(void)
  * starved guest still paid the full tick. Waiting here instead costs nothing
  * when no one kicks (the timeout is the old sleep) and drains immediately when
  * someone does. */
+/* Wake the walker now: something that may have patched the command stream
+ * finished. An SPU job that fills a hole the title parked the FIFO on writes
+ * no FIFO register, so the walker only saw the patch at its next timeout (up
+ * to ~4 ms). Bleach: Soul Resurreccion's first stage parks on a dozen holes a
+ * frame; this alone did not move its frame rate (the serial job list did,
+ * SPURS_JOBLIST_PAR), but the walker no longer trails the jobs by a tick. */
+void cellGcm_fifo_kick(void)
+{
+    HANDLE ev = (HANDLE)cellGcm_fifo_kick_event();
+    if (ev) SetEvent(ev);
+}
+
 void cellGcm_fifo_kick_wait(unsigned ms)
 {
     static int on = -1;
@@ -1993,6 +2014,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
+    static int walk_stats = -1;
+    if (walk_stats < 0) walk_stats = getenv("GCM_WALK_STATS") ? 1 : 0;
+    const u64 walk_t0 = walk_stats ? get_timestamp_ns() : 0;
+    const u32 walk_from = s_fifo_getoff;
     if (s_fifo_getoff == s_pos_flip_io) gcm_fire_pos_flip();
     while (s_fifo_getoff != put && budget-- > 0) {
         if (s_fifo_getoff == s_pos_flip_io) {
@@ -2138,8 +2163,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         armed_io = s_fifo_getoff; armed_word = w;
                         g_ww_dyn = pea; g_spu_watchea_dyn = pea; g_ww_lo = pea & ~15u; g_ww_hi = (pea & ~15u) + 16;
                         { extern void ppu_vm_slow_any_update(void); ppu_vm_slow_any_update(); }
-                        fprintf(stderr, "[park] parked at io=0x%08X ea=0x%08X word=%08X put=0x%08X -- watching writers\n",
-                                s_fifo_getoff, pea, w, put);
+                        fprintf(stderr, "[park] %.1f ms: parked at io=0x%08X ea=0x%08X word=%08X put=0x%08X -- watching writers\n",
+                                (double)get_timestamp_ns() / 1e6, s_fifo_getoff, pea, w, put);
                     } }
                   /* Parked. If the title has meanwhile moved `put` somewhere
                    * else, it has switched to its other segment and left this
@@ -2186,7 +2211,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
         { static int pw2 = -1; if (pw2 < 0) pw2 = getenv("GCM_PARK_WATCH") ? 1 : 0;
           extern uint32_t g_ww_dyn;
           if (pw2 && g_ww_dyn && gcm_io2ea(s_fifo_getoff) == g_ww_dyn) {
-              fprintf(stderr, "[park] io=0x%08X patched -> %08X (walker moving on)\n", s_fifo_getoff, w);
+              fprintf(stderr, "[park] %.1f ms: io=0x%08X patched -> %08X (walker moving on)\n",
+                      (double)get_timestamp_ns() / 1e6, s_fifo_getoff, w);
               g_ww_dyn = 0;
               { extern void ppu_vm_slow_any_update(void); ppu_vm_slow_any_update(); } } }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
@@ -2618,6 +2644,26 @@ static void gcm_rsx_process_fifo_unlocked(void)
         if (n2++ % 60 == 0)
             fprintf(stderr, "[DRAINEND] %s: %08X -> %08X (%u bytes), put=%08X\n",
                     why, start_off, s_fifo_getoff, s_fifo_getoff - start_off, put);
+    }
+    /* GCM_WALK_STATS=1: every 5 s, the drains' time and why each stopped --
+     * a walker that is busy against one waiting on the title. */
+    if (walk_stats) {
+        static const char* names[12]; static u32 counts[12]; static double ms_by[12];
+        static u64 since; static u32 n_drain, n_moved;
+        const u64 now = get_timestamp_ns();
+        u32 k = 0;
+        while (k < 12 && names[k] && strcmp(names[k], why)) k++;
+        if (k < 12) { names[k] = why; counts[k]++; ms_by[k] += (double)(now - walk_t0) / 1e6; }
+        n_drain++; if (s_fifo_getoff != walk_from) n_moved++;
+        if (!since) since = now;
+        if (now - since >= 5000000000ull) {
+            fprintf(stderr, "[walk] %.1f s: %u drains (%u moved get):", (double)(now - since) / 1e9, n_drain, n_moved);
+            for (u32 j = 0; j < 12 && names[j]; j++)
+                fprintf(stderr, " %s=%u/%.0fms", names[j], counts[j], ms_by[j]);
+            fputc('\n', stderr);
+            memset(counts, 0, sizeof counts); memset(ms_by, 0, sizeof ms_by);
+            n_drain = n_moved = 0; since = now;
+        }
     }
     /* Recycle the TITLE'S OWN command buffer when its callback will not.
      *
@@ -4167,6 +4213,7 @@ void cellGcmQueueUserCommand(u32 cmd)
 {
     GCM_USER_STORE(cmd);
     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+    cellGcm_fifo_kick();     /* the frame clock delivers it (cellGcm_pump_stale) */
 }
 
 /* Invalidate a tile region (unbind + clear) */
