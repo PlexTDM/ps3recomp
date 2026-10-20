@@ -2965,8 +2965,9 @@ static void jc_execute(int slot)
                 { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
                 int idx = jobs++;
                 { static int jl = -1; if (jl < 0) { const char* e = getenv("SPURS_JC_LOG"); jl = e ? atoi(e) : 0; }
-                  if (jl >= 2) fprintf(stderr, "[jc] %.1f ms: list job[%d] %u/%u ea=0x%08X chain 0x%08X\n",
-                                       jc_now_ms(), idx, k, n, list + k * stride, jc_ea); }
+                  if (jl >= 2) fprintf(stderr, "[jc] %.1f ms: list job[%d] %u/%u ea=0x%08X bin=0x%08X chain 0x%08X\n",
+                                       jc_now_ms(), idx, k, n, list + k * stride,
+                                       (u32)(vm_read64(list + k * stride) & ~7ull), jc_ea); }
                 jc_run_one_job(list + k * stride, idx, stride);
                 jc_signal_done(jc_ea, idx);
             }
