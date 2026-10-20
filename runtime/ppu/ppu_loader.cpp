@@ -3867,6 +3867,30 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The guest stack a callback runs on. A guest thread that calls back through
+ * an HLE (a flip handler from cellRescSetConvertAndFlip, a SAIL event raised
+ * by the player call) runs it below its own stack pointer, as the PS3 does.
+ * Every caller used to share one scratch stack at 0xCFFE0000, so two threads'
+ * callbacks could overwrite each other's frames: the frame clock's vblank
+ * handler against the main thread's flip handler, once a frame. A host-only
+ * thread (the frame clock, a timer) gets a 64 KB stack of its own, the first
+ * one at 0xCFFE0000 as before. Nested callbacks stack below the outer one,
+ * whose context is the active one by then. */
+static uint32_t ppu_callback_sp(const ppu_context* caller)
+{
+    if (caller) {
+        const uint32_t sp = (uint32_t)caller->gpr[1];
+        if (sp > 0x10000u) return (sp - 0x400u) & ~0xFu;
+    }
+    static PPU_THREAD_LOCAL uint32_t s_sp = 0;
+    if (!s_sp) {
+        static volatile LONG s_next = -1;
+        const uint32_t k = (uint32_t)InterlockedIncrement(&s_next) & 15u;
+        s_sp = 0xCFFE0000u - k * 0x10000u;
+    }
+    return s_sp;
+}
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -3891,14 +3915,9 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                 vm_read32(opd_addr + 8), vm_read32(opd_addr + 12));
         return 0; }
 
-    /* Private scratch stack high in the guest stack region, distinct from the
-     * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_callback_sp(g_active_ctx);
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
@@ -3938,12 +3957,9 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
-
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
-    ctx.gpr[1]  = s_cb_sp;
+    ctx.gpr[1]  = ppu_callback_sp(g_active_ctx);
     ctx.gpr[2]  = toc;
     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
