@@ -271,6 +271,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint6
                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
 extern "C" void cellGcmTickFlip(void);
+extern "C" void cellGcm_pump_stale(unsigned ms);
 extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
 static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
@@ -518,6 +519,9 @@ static DWORD WINAPI vblank_ticker(LPVOID)
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
+        /* Deliver a vblank/flip no guest thread has collected (every guest
+         * thread in a syscall wait): libs/video/cellGcmSys.c. */
+        cellGcm_pump_stale(4);
         /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
          * titles fence EVERY render pass on an RSX label the drain writes;
          * at 16ms per fence wave's six passes paced the guest to ~7 fps.

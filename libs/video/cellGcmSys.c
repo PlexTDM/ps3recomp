@@ -848,6 +848,28 @@ void ppu_gcm_pump(void)
     GCM_PUMP_LEAVE();
 }
 
+/* Ticks no guest thread has collected, delivered by the frame clock itself.
+ * Delivery waits for the next HLE call on a guest thread, and a syscall is not
+ * one: a title whose threads are all in lv2 waits gets no vblank handler at
+ * all. Bleach: Soul Resurreccion's main loop waits on a semaphore its vblank
+ * handler posts, and once its other threads went quiet (the main menu) the
+ * game stopped for good. On hardware the vblank handler runs on libgcm's own
+ * interrupt thread, so delivering it from the frame clock is closer to the
+ * console than waiting is. Call from one host thread (the frame clock), once
+ * per loop: a tick still pending `ms` milliseconds after it was first seen is
+ * pumped here. */
+void cellGcm_pump_stale(u32 ms)
+{
+    static u64 s_seen_ns = 0;
+    if (!GCM_PENDING_PEEK()) { s_seen_ns = 0; return; }
+    const u64 now = get_timestamp_ns();
+    if (!s_seen_ns) { s_seen_ns = now; return; }
+    if (now - s_seen_ns >= (u64)ms * 1000000ull) {
+        s_seen_ns = 0;
+        ppu_gcm_pump();
+    }
+}
+
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
 void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
@@ -2128,9 +2150,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       static u32 park_off, park_put;
                       static unsigned long long park_since;
                       const unsigned long long now = ps3_ms_now();
+                      /* GCM_PARK_GRACE_MS=<ms> overrides the grace (a port
+                       * whose title links its segments late). */
+                      static long long grace = -1;
+                      if (grace < 0) { const char* e = getenv("GCM_PARK_GRACE_MS");
+                                       grace = e ? atoll(e) : (long long)GCM_PARK_GRACE_MS; }
                       if (park_off != s_fifo_getoff || park_put != put) {
                           park_off = s_fifo_getoff; park_put = put; park_since = now;
-                      } else if (now - park_since >= GCM_PARK_GRACE_MS) {
+                      } else if (now - park_since >= (unsigned long long)grace) {
                           park_off = 0;
                           gcm_fifo_dump_around(s_fifo_getoff);
                           gcm_fifo_resync_why("jump-park", &s_fifo_getoff, put);
@@ -2548,8 +2575,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
           }
       } else burned = 0; }
 
+    /* Not for a park: the jump-park path above owns that case and gives the
+     * title GCM_PARK_GRACE_MS to patch it. Eight passes are ~30 ms, so this
+     * used to win the race and skip the segment the title was about to link
+     * in -- Bleach: Soul Resurreccion's first main-menu frame, whose label the
+     * game then waited on for good, drawing nothing more. */
+    const int parked_here = why && !strcmp(why, "parked");
     { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
-      if (s_fifo_getoff == last && s_fifo_getoff != put) {
+      if (s_fifo_getoff == last && s_fifo_getoff != put && !parked_here) {
           if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
                              gcm_fifo_resync_why("stuck-get", &s_fifo_getoff, put); stuck = 0; }
       } else { stuck = 0; last = s_fifo_getoff; } }
