@@ -1402,13 +1402,26 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
             u32 idx = (method - 0x0400) >> 2;
+            /* Only SIZE_OUT's width is written. libgcm pads an inline
+             * transfer's data to an even number of words, and the padding
+             * word lands past the destination. Bleach patches its own command
+             * stream with one-word transfers (the libfontGcm call site gets
+             * its JUMP, the font block its return JUMP): writing the padding
+             * as well zeroed the method header after the call site, the
+             * walker read the next data word (a vertex format, 0xC32) as a
+             * CALL into old ring contents and ran the frame again, and again
+             * -- 36,000 draws a frame in the main menu. */
+            { const u32 w = s_gcm2d.size_out & 0xFFFFu;
+              if (w && idx >= w) return; }
             u32 px  = (s_gcm2d.point & 0xFFFF) + idx;
             u32 py  = s_gcm2d.point >> 16;
             u32 dst_pitch = s_gcm2d.pitch >> 16;
             int local = (s_gcm2d.dst_dma != 0xFEED0001u);
             u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
-            { static int _it = 0;
-              if (_it < 6 && ++_it)
+            /* GCM2D_LOG=1: every inline write, not just the first six. */
+            { static int _it = 0, all = -1;
+              if (all < 0) all = getenv("GCM2D_LOG") ? 1 : 0;
+              if (all || (_it < 6 && ++_it))
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
@@ -2182,11 +2195,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   fprintf(stderr, "[ring] CALL out of the ring at io 0x%08X -> 0x%08X (put=0x%08X)\n", s_fifo_getoff, tgt, put);
                   gcm_fifo_dump_around(s_fifo_getoff); } }
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+              { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+                if (_rd) { fprintf(stderr, "[CALL] %08X -> %08X (put=%08X, pending return %08X) words",
+                                   s_fifo_getoff, tgt, put, s_fifo_calloff);
+                           for (int q = -4; q <= 2; q++) { const u32 e = gcm_io2ea(s_fifo_getoff + (u32)(q * 4));
+                                                           fprintf(stderr, " %s%08X", q ? "" : "*", e ? vm_read32(e) : 0u); }
+                           fputc('\n', stderr); } }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
         }
         if (w == 0x00020000u) {                /* RET */
+            { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
+              if (_rd) fprintf(stderr, "[RET] %08X -> %08X (put=%08X)\n", s_fifo_getoff, s_fifo_calloff, put); }
             s_fifo_getoff = s_fifo_calloff;
             s_fifo_calloff = 0;
             continue;
@@ -2570,6 +2591,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   fprintf(stderr, "[cellGcmSys] FIFO walker circling (get=0x%08X, "
                           "put=0x%08X, full budget burned x%d) -- following the "
                           "write head\n", s_fifo_getoff, put, burned);
+              gcm_fifo_dump_around(s_fifo_getoff);   /* the loop's last words */
               gcm_fifo_resync_why("circling", &s_fifo_getoff, put);
               burned = 0;
           }
