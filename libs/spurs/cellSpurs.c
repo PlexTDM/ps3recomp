@@ -2563,6 +2563,8 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
      * Synchronous by design: a job runs to completion, and the chain's own
      * NEXT/CALL/RET commands are what order them. */
     spu_workload_dispatch_job(vm_base + ea_bin, size_bin, job_ea, size_desc);
+    /* The job may have filled a command-stream hole the FIFO is parked on. */
+    { extern void cellGcm_fifo_kick(void); cellGcm_fifo_kick(); }
 }
 
 /* Walk one chain's command stream. Bounded: a malformed or self-looping stream
@@ -2605,6 +2607,51 @@ static int jg_find(u32 ea)
         if (s_jobguards[i].active && s_jobguards[i].ea == ea) return i;
     return -1;
 }
+
+/* A notify wakes the chains waiting on guards (jg_wait). They polled with a
+ * 1 ms sleep, which Windows rounds up, so every lap of a guarded chain began
+ * up to a tick late. (Bleach: Soul Resurreccion's sound chain is notified
+ * every 5.3 ms.) One lock and condition for all guards: notifies are rare
+ * next to the work they release. */
+#ifdef _WIN32
+static SRWLOCK            s_jg_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_jg_cv   = CONDITION_VARIABLE_INIT;
+static void jg_wake_all(void)
+{
+    AcquireSRWLockExclusive(&s_jg_lock);
+    WakeAllConditionVariable(&s_jg_cv);
+    ReleaseSRWLockExclusive(&s_jg_lock);
+}
+/* Wait up to ms for a wake unless pending already covers need. */
+static void jg_block(volatile u32* pending, u32 need, u32 ms)
+{
+    AcquireSRWLockExclusive(&s_jg_lock);
+    if (__atomic_load_n(pending, __ATOMIC_SEQ_CST) < need)
+        SleepConditionVariableSRW(&s_jg_cv, &s_jg_lock, ms, 0);
+    ReleaseSRWLockExclusive(&s_jg_lock);
+}
+#else
+static pthread_mutex_t s_jg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_jg_cv   = PTHREAD_COND_INITIALIZER;
+static void jg_wake_all(void)
+{
+    pthread_mutex_lock(&s_jg_lock);
+    pthread_cond_broadcast(&s_jg_cv);
+    pthread_mutex_unlock(&s_jg_lock);
+}
+static void jg_block(volatile u32* pending, u32 need, u32 ms)
+{
+    pthread_mutex_lock(&s_jg_lock);
+    if (__atomic_load_n(pending, __ATOMIC_SEQ_CST) < need) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)ms * 1000000L;
+        ts.tv_sec += ts.tv_nsec / 1000000000L; ts.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&s_jg_cv, &s_jg_lock, &ts);
+    }
+    pthread_mutex_unlock(&s_jg_lock);
+}
+#endif
+static double jc_now_ms(void);
 
 /* cellSpursJobGuardInitialize(CellSpursJobChain* jobChain,
  *                             CellSpursJobGuard* jobGuard,
@@ -2663,6 +2710,11 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
      * too many through. */
     const u32 pend = __atomic_add_fetch(&s_jobguards[i].pending, 1u, __ATOMIC_SEQ_CST);
     s_jobguards[i].ever_notified = 1;
+    jg_wake_all();
+    { static int jl = -1; if (jl < 0) { const char* e = getenv("SPURS_JC_LOG"); jl = e ? atoi(e) : 0; }
+      if (jl >= 2) { extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+          fprintf(stderr, "[jc] %.1f ms: JobGuardNotify(0x%08X) pending=%u tid=%u lr=0x%08X\n", jc_now_ms(), ea, pend,
+                  g_active_ctx ? (unsigned)g_active_ctx->thread_id : 0u, g_active_ctx ? (unsigned)g_active_ctx->lr : 0u); } }
     { u32 remaining = (pend >= s_jobguards[i].reset)
                     ? 0u : s_jobguards[i].reset - pend;
       s_jobguards[i].count = remaining;
@@ -2703,7 +2755,8 @@ static int jg_wait(u32 ea)
     static long first_ms = -1;
     if (first_ms < 0) { const char* e = getenv("SPURS_GUARD_FIRST_MS"); first_ms = e ? atol(e) : 200; }
     const int spins = s_jobguards[i].ever_notified ? 20000 : (int)first_ms;
-    for (int spin = 0; spin < spins; spin++) {     /* 1 ms each */
+    const double deadline = jc_now_ms() + (double)spins;
+    for (;;) {
         /* Consume exactly one release worth of credits, so notifies that
          * arrived during the previous lap still count. A compare-exchange,
          * against cellSpursJobGuardNotify adding credits concurrently. */
@@ -2720,11 +2773,8 @@ static int jg_wait(u32 ea)
             vm_write32(ea, s_jobguards[i].count);
             return 1;
         }
-#ifdef _WIN32
-        Sleep(1);
-#else
-        usleep(1000);
-#endif
+        if (jc_now_ms() >= deadline) break;
+        jg_block(&s_jobguards[i].pending, need, 1);   /* a notify wakes it at once */
     }
     printf("[cellSpurs] guard 0x%08X still closed after %d ms%s -- chain gives up\n", ea, spins,
            s_jobguards[i].ever_notified ? "" : " (never notified)");
@@ -2849,6 +2899,12 @@ static void jc_joblist_read(u32 ea, u32 size_desc, u32* n, u32* stride, u32* lis
         printf("[cellSpurs] JOBLIST @0x%08X: %u job(s) of %u bytes at 0x%08X\n", ea, *n, *stride, *list); }
 }
 
+/* The job worker pool (SPURS_JC_ASYNC, SPURS_JOBLIST_PAR), defined below. */
+typedef struct { volatile int pending; } jc_run_t;
+static void jc_pool_init(int workers);
+static void jc_async_enqueue(jc_run_t* run, u32 job_ea, u32 jc_ea, int idx, u32 size_desc);
+static void jc_async_barrier(jc_run_t* run);
+
 static void jc_execute(int slot)
 {
     const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
@@ -2887,9 +2943,30 @@ static void jc_execute(int slot)
         if (op == 6 && cmd != 6) {                            /* JOBLIST */
             u32 n, stride, list;
             jc_joblist_read((u32)(cmd & ~7ull), size_desc, &n, &stride, &list);
+            /* SPURS_JOBLIST_PAR=<workers>: a list's jobs on that many pool
+             * threads, the walk going on once all are done -- what the SPUs
+             * do with a list (every one grabs the next job; the command after
+             * a list is an ordering one). Bleach: Soul Resurreccion's geometry
+             * chain is one list of ~320 jobs a frame whose results fill the
+             * holes the FIFO waits at; run one after another they took ~65 ms
+             * a frame. 0 (default): in order on this thread. */
+            { static int par = -1;
+              if (par < 0) { const char* e = getenv("SPURS_JOBLIST_PAR"); par = e ? atoi(e) : 0; }
+              if (par > 1 && n > 1) {
+                  jc_pool_init(par);
+                  jc_run_t run; run.pending = 0;
+                  for (u32 k = 0; k < n; k++)
+                      jc_async_enqueue(&run, list + k * stride, jc_ea, jobs++, stride);
+                  jc_async_barrier(&run);
+                  idle = 0;
+                  pc += 8; continue;
+              } }
             for (u32 k = 0; k < n; k++) {
                 { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
                 int idx = jobs++;
+                { static int jl = -1; if (jl < 0) { const char* e = getenv("SPURS_JC_LOG"); jl = e ? atoi(e) : 0; }
+                  if (jl >= 2) fprintf(stderr, "[jc] %.1f ms: list job[%d] %u/%u ea=0x%08X chain 0x%08X\n",
+                                       jc_now_ms(), idx, k, n, list + k * stride, jc_ea); }
                 jc_run_one_job(list + k * stride, idx, stride);
                 jc_signal_done(jc_ea, idx);
             }
@@ -2901,6 +2978,8 @@ static void jc_execute(int slot)
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
         if (op == 7) {
             if (ext == (7 | (15 << 3))) {                     /* END */
+                { static int jl = -1; if (jl < 0) { const char* e = getenv("SPURS_JC_LOG"); jl = e ? atoi(e) : 0; }
+                  if (jl >= 2) fprintf(stderr, "[jc] %.1f ms: END chain 0x%08X after %d job(s)\n", jc_now_ms(), jc_ea, jobs); }
                 { static int _n = 0; if (_n < 8 && ++_n)
                     printf("[cellSpurs] chain 0x%08X: END after %d job(s) at pc=0x%08X (resumes there)\n", jc_ea, jobs, pc); }
                 s_jobchains[slot].resume_pc = pc;             /* halted: the next Run re-fetches this slot */
@@ -2948,7 +3027,6 @@ static void jc_execute(int slot)
  * all of them at each ordering command. GUARD waits now block a walker, not
  * the title's thread.
  * -----------------------------------------------------------------------*/
-typedef struct { volatile int pending; } jc_run_t;
 typedef struct { u32 job_ea, jc_ea, size_desc; int idx; jc_run_t* run; } jc_job_item;
 
 #define JC_POOL_QDEPTH 4096
@@ -3020,7 +3098,7 @@ static void jc_pool_init(int workers)
     if (workers < 1) workers = 1;
     if (workers > 16) workers = 16;
     for (int i = 0; i < workers; i++) jc_spawn(jc_pool_worker, NULL, "job worker");
-    printf("[cellSpurs] SPURS_JC_ASYNC: %d job worker thread(s)\n", workers);
+    printf("[cellSpurs] job pool: %d worker thread(s)\n", workers);
 }
 
 static void jc_async_enqueue(jc_run_t* run, u32 job_ea, u32 jc_ea, int idx, u32 size_desc)
@@ -3262,7 +3340,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         s_jobchains[i].run_count++;
         { static int jl = -1; if (jl < 0) jl = getenv("SPURS_JC_LOG") ? 1 : 0;   /* every call */
-          if (jl) fprintf(stderr, "[jc] %s #%d jc=0x%08X running=%ld\n", who, s_jobchains[i].run_count,
+          if (jl) fprintf(stderr, "[jc] %.1f ms: %s #%d jc=0x%08X running=%ld\n", jc_now_ms(), who, s_jobchains[i].run_count,
                           (u32)jc_ea, (long)s_jobchains[i].running); }
         if (s_jobchains[i].run_count <= 3) {
             printf("[cellSpurs] %s(jc=0x%08X) run#%d entry=0x%08X\n",
