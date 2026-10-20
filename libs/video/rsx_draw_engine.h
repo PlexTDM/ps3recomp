@@ -219,6 +219,9 @@ typedef struct rsx_draw_backend {
     void (*set_viewport)(void* user, float x, float y, float w, float h);
     void (*set_scissor)(void* user, u32 x, u32 y, u32 w, u32 h);
     void (*set_stencil_ref)(void* user, u32 ref);
+    /* Optional: the CONSTANT_COLOR / CONSTANT_ALPHA blend factor
+     * (SET_BLEND_COLOR), dynamic like the stencil reference. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time

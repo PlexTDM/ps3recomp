@@ -159,6 +159,11 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * depth-only pass's garbage FP output (the blue-character class). */
     rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
 
+    /* SET_SURFACE_COLOR_TARGET starts at A (CELL_GCM_SURFACE_TARGET_0), so a
+     * written NONE -- a depth-only pass, which the draw engine now honours --
+     * is told apart from a stream that never wrote the register. */
+    rsx->regs[M_RT_ENABLE >> 2] = 0x01u;
+
     /* NV40 reset state is counter-clockwise front winding.  Leaving this
      * register zero made a live stream that relied on the hardware default
      * cull the exterior of orphanage meshes, while captured replay was correct

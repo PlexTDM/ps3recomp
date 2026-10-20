@@ -294,6 +294,9 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
      * (a depth-prime pass), and rsx_dispatch_init seeds the nv40 reset value
      * so never-written reads as all-on. */
     rs->color_mask  = rsx_dsp_reg(rsx, M_COLOR_MASK);
+    /* No colour target (SET_SURFACE_COLOR_TARGET NONE): nothing is written
+     * but depth and stencil; eng_current_target_set binds a scratch target. */
+    if (sf.color_target == CELL_GCM_SURFACE_TARGET_NONE) rs->color_mask = 0;
     rs->stencil_enable    = rsx_dsp_reg(rsx, M_STENCIL_TEST_ENABLE) & 1;
     rs->stencil_two_sided = rsx_dsp_reg(rsx, M_TWO_SIDED_STENCIL) & 1;
     rs->s_func       = rsx_dsp_reg(rsx, M_STENCIL_FUNC);
@@ -593,6 +596,11 @@ static const void* eng_surface_seed(u32 location, u32 offset, u32 w, u32 h,
 /* The colour target for this (location, offset), created or reallocated when
  * the size or format moved. Returns a slot index, or ENG_INVALID.
  * rsx_live_draw.c's surface_get (2605-2690). */
+/* The location of the scratch colour targets a depth-only pass binds (no
+ * guest memory: neither RSX_LOCATION_LOCAL nor _MAIN, so no texture unit and
+ * no flip resolves to one). */
+#define ENG_SCRATCH_LOCATION 0xFFu
+
 static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
                           rsx_be_format want_fmt)
 {
@@ -655,10 +663,26 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
+    const rsx_be_format fmt = eng_surface_format(sf.color_format);
+    /* SET_SURFACE_COLOR_TARGET NONE: a depth-only pass. Resolved as target A,
+     * it re-created whatever surface sat at A's offset at the pass's size and
+     * drew into it: Bleach: Soul Resurreccion renders three 1024x1024 shadow
+     * cascades with NONE while A still names its 1280x720 scene buffer at
+     * offset 0, and the scene was wiped every frame (a black stage). Bind a
+     * scratch target of the pass's size instead, at a location no texture can
+     * name, with colour writes off (rsx_draw_engine_decode_render_state).
+     * The register is seeded with A, so a stream that never writes it binds
+     * A as before. */
+    if (sf.color_target == CELL_GCM_SURFACE_TARGET_NONE) {
+        const u32 s = eng_surface_get(ENG_SCRATCH_LOCATION, (sf.clip_w << 16) | (sf.clip_h & 0xFFFFu),
+                                      sf.clip_w, sf.clip_h, fmt);
+        if (s == ENG_INVALID) return 0;
+        slots[0] = s;
+        return 1;
+    }
     /* SET_SURFACE_COLOR_TARGET 2 selects B alone; every other value starts at
      * A, and the MRT selectors add B, C and D on top of it. */
     const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
-    const rsx_be_format fmt = eng_surface_format(sf.color_format);
     const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
                                       sf.clip_w, sf.clip_h, fmt);
     if (first == ENG_INVALID) return 0;
@@ -2528,7 +2552,7 @@ static void sink_inline_array(void* user, const rsx_dispatch* r,
                               const u8* data, u32 bytes)
 {
     (void)user;
-    const u32 stride = rsx_vertex_inline_layout(r, NULL);
+    const u32 stride = rsx_vertex_inline_stride(r, bytes);
     if (!stride || bytes < stride) return;
     dc.inl = data;
     dc.inl_bytes = bytes;
@@ -2855,6 +2879,7 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
             tnt ? (u32)g.surfaces[ttargets[0]].fmt : 0,
             trs.blend_enable, trs.sf_rgb, trs.df_rgb, trs.eq_rgb, trs.alpha_test_enable, trs.alpha_func, trs.alpha_ref_raw, trs.alpha_ref_format, (double)rsx_fp_alpha_ref(trs.alpha_ref_raw, trs.alpha_ref_format), trs.depth_test, trs.depth_write,
             trs.cull_enable, trs.color_mask);
+    fprintf(stderr, " ablend=%X/%X eq%X", trs.sf_a, trs.df_a, trs.eq_a);
     /* The first decoded vertex of a small draw: a full-screen quad's position
      * and its vertex colour are what decide whether it covers the frame. */
     /* RSX_TRACE_VERTS=<n>: every vertex of draws up to n vertices (default 8). */
@@ -2870,6 +2895,14 @@ static void eng_draw_trace(const char* outcome, u32 prim, int indexed, u32 n_dra
         }
     }
     fprintf(stderr, " logic=%u/%X", rsx_dsp_reg(&g.rsx, 0x0374), rsx_dsp_reg(&g.rsx, 0x0378));
+    /* The fragment program's HLSL hash: what RSX_SURF_DUMP_AT_FP, RSX_SKIP_FP
+     * and the shader dump files name it by. */
+    { u64 fh = 0;
+      for (u32 i = 0; i < g.n_pipelines; i++) if (g.pipelines[i].handle == pipeline) { fh = g.pipelines[i].fp_hlsl; break; }
+      fprintf(stderr, " fph=%016llx", (unsigned long long)fh); }
+    { rsx_dsp_surface tsf; rsx_dsp_get_surface(&g.rsx, &tsf);
+      fprintf(stderr, " rt=%u a=%X b=%X z=%X clip=%ux%u", tsf.color_target, tsf.color_offset[0], tsf.color_offset[1],
+              tsf.zeta_offset, tsf.clip_w, tsf.clip_h); }
     /* RSX_TRACE_FPCONST=1: the draw's fragment constants (the ones inlined in
      * its program, which a title patches in place between draws). */
     { static int fc = -1; if (fc < 0) fc = getenv("RSX_TRACE_FPCONST") ? 1 : 0;
@@ -2970,6 +3003,13 @@ static inline float eng_half_pow2(unsigned ex)
     union { u32 u; float f; } p;
     p.u = (ex + 112u) << 23;
     return p.f;
+}
+static inline float eng_half_to_float(u16 v)
+{
+    const u32 ex = (v >> 10) & 0x1Fu, mant = v & 0x3FFu;
+    const float m = ex == 0 ? (float)mant / 1024.0f / 16384.0f
+                  : ex == 31 ? 65504.0f : (1.0f + (float)mant / 1024.0f) * eng_half_pow2(ex);
+    return (v & 0x8000u) ? -m : m;
 }
 
 static void sink_end_impl(void* user, const rsx_dispatch* r)
@@ -3292,6 +3332,24 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     /* Dynamic, and deliberately outside the pipeline key. */
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* SET_BLEND_COLOR, for the CONSTANT_* blend factors. Never passed on
+     * before: Bleach: Soul Resurreccion blends each material's glow into the
+     * scene's alpha with CONSTANT_ALPHA, the constant read as 1, every pixel
+     * glowed and the bloom turned the first stage white. A8R8G8B8 for an
+     * 8-bit target; on an FP16 one, halves R,G here and B,A in 0x037C. */
+    if (g.be->set_blend_color) {
+        const u32 bc = rsx_dsp_reg(&g.rsx, 0x031C);
+        float c[4];
+        if (rs.rt_fp16) {
+            const u32 bc2 = rsx_dsp_reg(&g.rsx, 0x037C);
+            c[0] = eng_half_to_float((u16)bc);  c[1] = eng_half_to_float((u16)(bc >> 16));
+            c[2] = eng_half_to_float((u16)bc2); c[3] = eng_half_to_float((u16)(bc2 >> 16));
+        } else {
+            c[0] = (float)((bc >> 16) & 0xFF) / 255.0f; c[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+            c[2] = (float)(bc & 0xFF) / 255.0f;         c[3] = (float)((bc >> 24) & 0xFF) / 255.0f;
+        }
+        g.be->set_blend_color(g.be->user, c);
+    }
 
     const u32 uploaded = indexed ? dc.n_verts : n_draw;
     if (g.q_cur && g.be->query_set) { g.be->query_set(g.be->user, g.q_cur); g.q_draws++; }
@@ -3549,6 +3607,8 @@ static void eng_surface_dump_now(void)
                 float v; memcpy(&v, buf + (size_t)p * 4, 4); c[0] = c[1] = c[2] = v;
             } else {
                 c[0] = buf[p * 4] / 255.0f; c[1] = buf[p * 4 + 1] / 255.0f; c[2] = buf[p * 4 + 2] / 255.0f;
+                const double a = buf[p * 4 + 3] / 255.0;
+                asum += a; if (a < amin) amin = a; if (a > amax) amax = a;
             }
             u8 rgb[3];
             for (int k = 0; k < 3; k++) {
@@ -3562,7 +3622,7 @@ static void eng_surface_dump_now(void)
         fprintf(stderr, "[surf-dump] f%u s%u %ux%u %s off=0x%08X mean=(%.3f %.3f %.3f) max=(%.2f %.2f %.2f) nan=%lu",
                 g.frames, i, sf->w, sf->h, fp16 ? "fp16" : f32 ? "r32f" : "rgba8", sf->offset,
                 sum[0] / n, sum[1] / n, sum[2] / n, mx[0], mx[1], mx[2], nan);
-        if (fp16) fprintf(stderr, " alpha mean=%.4g min=%.4g max=%.4g", asum / n, amin, amax);
+        if (!f32) fprintf(stderr, " alpha mean=%.4g min=%.4g max=%.4g", asum / n, amin, amax);
         fprintf(stderr, " -> %s\n", path);
         /* An FP16 target's alpha as its own image, scaled to its maximum:
          * UE3 on PS3 keeps scene depth there. */
@@ -3702,6 +3762,20 @@ static void eng_present(u32 buffer_id)
           fputc('\n', stderr);
       }
       memset(s_surf_draws, 0, sizeof s_surf_draws); s_skin_draws = s_skin_verts = 0; }
+    /* RSX_DRAW_TRACE_AT_S=<s>: trace the four frames after the first present
+     * that many seconds after the first one -- a frame number drifts from run
+     * to run, a moment in a scripted run much less. */
+    { static double at = -2.0, t0 = 0.0;
+      if (at == -2.0) { const char* e = getenv("RSX_DRAW_TRACE_AT_S"); at = e ? atof(e) : -1.0; }
+      if (at >= 0.0) {
+          struct timespec ts; timespec_get(&ts, TIME_UTC);
+          const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+          if (t0 == 0.0) t0 = now;
+          if (now - t0 >= at) {
+              at = -1.0; s_dtrace_frame = (long)g.frames + 1;
+              eng_surface_dump_now();      /* with RSX_SURF_DUMP_DIR: every target, as presented */
+              fprintf(stderr, "[draw-trace] %.1f s: tracing frames %ld..%ld\n", now - t0, s_dtrace_frame, s_dtrace_frame + 3);
+          } } }
     /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
      * (nearly) all white, trace the next four frames draw by draw. */
     if (s_ring_on > 0) { char line[120];

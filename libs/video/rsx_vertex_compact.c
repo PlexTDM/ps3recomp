@@ -165,6 +165,23 @@ u32 rsx_vertex_inline_layout(
     return declared ? declared : packed;
 }
 
+u32 rsx_vertex_inline_stride(const rsx_dispatch* rsx, u32 bytes)
+{
+    u32 packed = 0, declared = 0;
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; attr++) {
+        rsx_dsp_vertex_attr desc;
+        rsx_dsp_get_vertex_attr(rsx, attr, &desc);
+        if (!desc.type || !desc.size)
+            continue;
+        packed += rsx_vertex_attrib_size(desc.type, desc.size);
+        if (desc.stride > declared)
+            declared = desc.stride;
+    }
+    if (packed && bytes % packed == 0) return packed;
+    if (declared && bytes % declared == 0) return declared;
+    return packed ? packed : declared;
+}
+
 void rsx_vertex_fetch_plan_set_inline(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const u8* data, u32 bytes)
@@ -175,7 +192,8 @@ void rsx_vertex_fetch_plan_set_inline(
     plan->inline_bytes = 0;
     if (!data || !bytes || !rsx)
         return;
-    plan->inline_stride = rsx_vertex_inline_layout(rsx, plan->inline_off);
+    rsx_vertex_inline_layout(rsx, plan->inline_off);
+    plan->inline_stride = rsx_vertex_inline_stride(rsx, bytes);
     plan->inline_data = data;
     plan->inline_bytes = bytes;
 }

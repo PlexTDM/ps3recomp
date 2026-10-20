@@ -264,6 +264,7 @@ typedef struct {
     float vp[4];
     u32   sc[4];
     u32   stencil_ref;
+    float blend_factor[4];
     float clear_rgba[4];
     u32   clear_flags;
     float clear_depth;
@@ -2466,6 +2467,8 @@ static void eng_set_viewport(void* user, float x, float y, float w, float h)
 static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 { (void)user; s_pending.sc[0] = x; s_pending.sc[1] = y; s_pending.sc[2] = w; s_pending.sc[3] = h; }
 static void eng_set_stencil_ref(void* user, u32 ref) { (void)user; s_pending.stencil_ref = ref; }
+static void eng_set_blend_color(void* user, const float rgba[4])
+{ (void)user; for (int k = 0; k < 4; k++) s_pending.blend_factor[k] = rgba[k]; }
 
 static void eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                      u32 stride, const u32* indices, u32 index_count)
@@ -3193,6 +3196,7 @@ static void eng_encode_draw(const EngRecord* r)
     CALL(s_list, RSSetViewports, 1, &vp);
     CALL(s_list, RSSetScissorRects, 1, &sc);
     CALL(s_list, OMSetStencilRef, r->stencil_ref);
+    CALL(s_list, OMSetBlendFactor, r->blend_factor);
 
     D3D12_GPU_VIRTUAL_ADDRESS vb_va, ib_va; u32 vleft;
     if (!eng_draw_buffers(r, &vb_va, &ib_va, &vleft)) return;
@@ -3222,6 +3226,7 @@ static void eng_encode_draw(const EngRecord* r)
             CALL(s_list, IASetPrimitiveTopology, topo); s_cur_topo = topo;
             CALL(s_list, RSSetViewports, 1, &vp); CALL(s_list, RSSetScissorRects, 1, &sc);
             CALL(s_list, OMSetStencilRef, r->stencil_ref);
+            CALL(s_list, OMSetBlendFactor, r->blend_factor);
             CALL(s_list, IASetVertexBuffers, 0, 1, &vbv);
             if (r->index_count) { D3D12_INDEX_BUFFER_VIEW ibv = { ib_va, r->index_count * 4u, DXGI_FORMAT_R32_UINT }; CALL(s_list, IASetIndexBuffer, &ibv); }
             CALL(s_list, SetGraphicsRootConstantBufferView, 0, eng_cb_va(r->vs_cb_off, r->vs_cb_bytes));
@@ -4322,6 +4327,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_viewport         = eng_set_viewport,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
+    .set_blend_color      = eng_set_blend_color,
     .draw                 = eng_draw,
     .buffer_wrap          = eng_buffer_wrap,
     .buffer_release       = eng_buffer_release,

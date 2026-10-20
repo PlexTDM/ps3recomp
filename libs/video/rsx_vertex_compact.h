@@ -88,12 +88,22 @@ void rsx_vertex_layout_plan_init(
  * An inline stream carries no per-array offset registers -- the only thing
  * that says where an attribute sits is the VTXFMT declaration, and the
  * hardware rule is that the ENABLED attributes pack in ascending register
- * order. The declared stride wins over the packed size when the two differ
- * (a format may pad); the packed size is the fallback when no enabled array
- * declares a stride. Shared so the hoisted, legacy and reference fetch paths
- * cannot drift on it. */
+ * order. The return value is the declared stride, or the packed size when no
+ * enabled array declares one; the draw paths read a stream with
+ * rsx_vertex_inline_stride instead, which also looks at its length. Shared so
+ * the hoisted, legacy and reference fetch paths cannot drift on it. */
 u32 rsx_vertex_inline_layout(
     const rsx_dispatch* rsx, u32 offsets[RSX_DSP_NUM_VERTEX_ATTR]);
+
+/* The vertex size of an INLINE_ARRAY stream of `bytes`. The enabled
+ * attributes pack (RPCS3 sums their sizes, ignoring the declared stride),
+ * and a stream whose length is a whole number of packed vertices is read
+ * that way: Bleach: Soul Resurreccion declares stride 24 over 20-byte
+ * vertices (position + texcoord), so its full-screen composite quads came out
+ * as three vertices and were dropped -- a frozen picture over the whole
+ * first stage. The declared stride is kept for a stream that divides by it
+ * and not by the packed size (the padded format the rule above assumed). */
+u32 rsx_vertex_inline_stride(const rsx_dispatch* rsx, u32 bytes);
 
 /* Point a plan at an INLINE_ARRAY stream instead of guest memory. Call
  * between _init and _prepare; a NULL `data` leaves the plan reading guest

@@ -5817,7 +5817,8 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
         return;
     }
 
-    const u32 stride = rsx_vertex_inline_layout(&g.rsx, dc.inl_off);
+    rsx_vertex_inline_layout(&g.rsx, dc.inl_off);
+    const u32 stride = rsx_vertex_inline_stride(&g.rsx, bytes);
     if (!stride || bytes < stride) { g_ld_stats.packets_queue_full++; return; }
 
     dc.inl = data; dc.inl_bytes = bytes; dc.inl_stride = stride;

@@ -990,6 +990,38 @@ static void test_inline_array(void)
     engine_down();
 }
 
+/* An inline stream whose arrays declare a stride larger than the packed
+ * attributes: Bleach: Soul Resurreccion's full-screen passes declare 24 over
+ * float3 + float2 (20 bytes) and push 20-byte vertices. Read at 24, three
+ * vertices came out as two and the quads were dropped. */
+static void test_inline_array_packed(void)
+{
+    engine_up();
+    m(M_VTXFMT, 2u | (3u << 4) | (24u << 8));                /* ATTR0: float3, stride 24 */
+    m(M_VTXFMT + 8u * 4u, 2u | (2u << 4) | (24u << 8));      /* ATTR8: float2, stride 24 */
+
+    const int before = stub.n_draw;
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    for (u32 v = 0; v < 3; v++) {
+        m(M_INLINE_ARRAY, f32_bits(40.0f + (float)v));
+        m(M_INLINE_ARRAY, f32_bits(50.0f));
+        m(M_INLINE_ARRAY, f32_bits(60.0f));
+        m(M_INLINE_ARRAY, f32_bits(0.25f));                   /* u */
+        m(M_INLINE_ARRAY, f32_bits(0.75f));                   /* v */
+    }
+    m(M_BEGIN_END, 0u);
+
+    CHECK(stub.n_draw == before + 1, "packed inline array issues a draw");
+    CHECK(stub.draw_vertices == 3, "packed inline array draws 3 vertices, not 60/24 (got %u)",
+          stub.draw_vertices);
+    CHECK(stub.draw_first_vertex[0] == 40.0f && stub.draw_first_vertex[1] == 50.0f &&
+          stub.draw_first_vertex[2] == 60.0f,
+          "packed inline vertex 0 position (got %g,%g,%g)", stub.draw_first_vertex[0],
+          stub.draw_first_vertex[1], stub.draw_first_vertex[2]);
+    m(M_VTXFMT + 8u * 4u, 2u);                                /* ATTR8 off again */
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1014,6 +1046,7 @@ int main(void)
     test_custom_guest_mapping();
     test_queued_flip_buffer();
     test_inline_array();
+    test_inline_array_packed();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",
