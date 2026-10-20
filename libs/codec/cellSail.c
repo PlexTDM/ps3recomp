@@ -9,6 +9,7 @@
 
 #include "ps3emu/guest_call.h"
 #include "cellSail.h"
+#include "../../runtime/platform/win32_compat.h"   /* CreateThread, Sleep, Interlocked* */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_read32 / vm_write32 */
 #include <stdio.h>
 #include <string.h>
@@ -140,6 +141,7 @@ static void sail_notify(int slot, u32 major, u32 minor, u64 arg0, u64 arg1)
  * boot has reported CLOSED; without these events it boots the player and then
  * waits on a black screen for good. */
 #define SAIL_EV_STATE_CHANGED 3
+#define SAIL_EV_SOURCE_EOS    8   /* CELL_SAIL_EVENT_SOURCE_EOS: the source has no more data */
 enum { SAIL_ST_BOOT_TRANSITION = 1, SAIL_ST_CLOSED = 2, SAIL_ST_OPEN_TRANSITION = 3,
        SAIL_ST_OPENED = 4, SAIL_ST_START_TRANSITION = 5, SAIL_ST_RUNNING = 6,
        SAIL_ST_STOP_TRANSITION = 7, SAIL_ST_CLOSE_TRANSITION = 8 };
@@ -151,6 +153,45 @@ static void sail_call(int slot, u32 call, u32 via, u32 to, u64 userParam)
     sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, via, 0);
     sail_notify(slot, SAIL_EV_CALL_COMPLETED, call, 0, userParam);
     sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, to, 0);
+}
+
+/* The end of a stream nothing decodes: the source reports end of stream, and
+ * a finished stream drops the player back to OPENED, which is what a title
+ * waiting out a movie watches for (Midway's logo AVIs: OPENED; Bleach: Soul
+ * Resurreccion: SOURCE_EOS, then OPENED).
+ *
+ * Reported from a thread of its own 100 ms after Start, as SAIL's player
+ * thread would, not from inside Start. Bleach waits for START's completion to
+ * set a "running" flag and its OPENED handler clears that flag again; with
+ * all of it delivered inside cellSailPlayerStart the flag was gone before the
+ * title looked, and it waited on a black screen. Stop, CloseStream or a new
+ * Start in the meantime cancels the report (the generation changes). */
+static volatile LONG s_sail_end_gen[CELL_SAIL_PLAYER_MAX];
+
+static DWORD WINAPI sail_end_thread(LPVOID p)
+{
+    const intptr_t v = (intptr_t)p;
+    const int slot = (int)(v & 0xFF);
+    const LONG gen = (LONG)(v >> 8);
+    Sleep(100);
+    if (s_sail_end_gen[slot] != gen || !s_sail_players[slot].in_use) return 0;
+    sail_notify(slot, SAIL_EV_SOURCE_EOS, 0, 0, 0);
+    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION, 0);
+    sail_notify(slot, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED, 0);
+    return 0;
+}
+
+static void sail_end_later(int slot)
+{
+    const LONG gen = InterlockedIncrement(&s_sail_end_gen[slot]);
+    HANDLE th = CreateThread(NULL, 1u << 20, sail_end_thread,
+                             (LPVOID)(((intptr_t)gen << 8) | slot), 0, NULL);
+    if (th) CloseHandle(th);
+}
+
+static void sail_end_cancel(int slot)
+{
+    if (slot >= 0) InterlockedIncrement(&s_sail_end_gen[slot]);
 }
 
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
@@ -195,6 +236,7 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_end_cancel(_sp);
     sail_call(_sp, SAIL_CALL_CLOSE_STREAM, SAIL_ST_CLOSE_TRANSITION, SAIL_ST_CLOSED, 0);
     return CELL_OK;
 }
@@ -209,11 +251,9 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
     /* Immediately signal finished since we don't play anything */
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_START, SAIL_ST_START_TRANSITION, SAIL_ST_RUNNING, 0);
-    /* Nothing decodes the stream, so it has already ended: a finished stream
-     * drops the player back to OPENED, which is what a title waiting out a
-     * movie (Midway's logo AVIs) watches for. */
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_STOP_TRANSITION, 0);
-    sail_notify(_sp, SAIL_EV_STATE_CHANGED, 0, SAIL_ST_OPENED, 0);
+    /* Nothing decodes the stream, so it ends at once -- but after the title
+     * has seen it start, the way SAIL's own thread reports it (sail_end_later). */
+    sail_end_later(_sp);
     return CELL_OK;
 }
 
@@ -223,6 +263,7 @@ s32 cellSailPlayerStop(CellSailPlayerHandle handle)
     const int _sp = sail_player_slot((u32)handle);
     if (_sp < 0)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_end_cancel(_sp);
     s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     sail_call(_sp, SAIL_CALL_STOP, SAIL_ST_STOP_TRANSITION, SAIL_ST_OPENED, 0);
     return CELL_OK;
@@ -582,5 +623,85 @@ s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
         vm_write32(alloc_ea + 0, vm_read32(funcs_ea + 0));   /* pAlloc */
         vm_write32(alloc_ea + 4, vm_read32(funcs_ea + 4));   /* pFree  */
     }
+    return CELL_OK;
+}
+
+/* The adapters' pull side. Nothing is decoded, so there is never a frame to
+ * hand out: the calls succeed and leave the title's frame info as it was, as
+ * RPCS3's do. Bleach: Soul Resurreccion polls the sound adapter while its
+ * intro movie "plays". */
+s32 cellSailSoundAdapterGetFrame(u32 pSelf, u32 samples, u32 pInfo)
+{
+    (void)samples; (void)pInfo;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailGraphicsAdapterGetFrame(u32 pSelf, u32 pInfo)
+{
+    (void)pInfo;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+/* No format is negotiated (nothing is decoded); the title's struct is left
+ * as it is. */
+s32 cellSailSoundAdapterGetFormat(u32 pSelf, u32 pFormat)
+{
+    (void)pFormat;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailGraphicsAdapterGetFormat(u32 pSelf, u32 pFormat)
+{
+    (void)pFormat;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailSoundAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime)
+{
+    (void)pts;
+    if (pTime) vm_write64(pTime, 0);
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailGraphicsAdapterPtsToTimePosition(u32 pSelf, u64 pts, u32 pTime)
+{
+    (void)pts;
+    if (pTime) vm_write64(pTime, 0);
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailSoundAdapterUpdateAvSync(u32 pSelf, u64 pts)
+{
+    (void)pts;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailGraphicsAdapterUpdateAvSync(u32 pSelf, u64 pts)
+{
+    (void)pts;
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailSoundAdapterFinalize(u32 pSelf)
+{
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+s32 cellSailGraphicsAdapterFinalize(u32 pSelf)
+{
+    return pSelf ? CELL_OK : (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+}
+
+/* The player made by cellSailPlayerInitialize2 goes away: its slot is freed,
+ * and a pending end-of-stream report is dropped with it. */
+s32 cellSailPlayerFinalize(u32 pSelf)
+{
+    printf("[cellSail] PlayerFinalize(self=0x%08X)\n", pSelf);
+    const int _sp = sail_player_slot(pSelf);
+    if (_sp < 0)
+        return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
+    sail_end_cancel(_sp);
+    s_sail_players[_sp].in_use = 0;
+    s_sail_players[_sp].state = CELL_SAIL_PLAYER_STATE_CLOSED;
     return CELL_OK;
 }
