@@ -113,6 +113,11 @@ s32 cellRescSetPalInterpolateDropFlexRatio(float ratio);
 s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth);
 s32 cellRescAdjustAspectRatio(float horizontal, float vertical);
 
+/* gcmSurface is a CellGcmSurface (guest, big-endian), rescSrc a CellRescSrc. */
+s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, CellRescSrc* rescSrc);
+s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode);
+void cellRescSetWaitFlip(void);
+
 #ifdef __cplusplus
 }
 #endif

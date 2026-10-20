@@ -193,7 +193,30 @@ s32 cellRescSetConvertAndFlip(s32 index)
      * real conversion draw if a title ever needs RESC's PAL/interlace modes
      * rather than a plain scale. */
     extern s32 cellGcmSetFlipCommand(u32 bufferId);
+    extern s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch, u32 width, u32 height);
     extern u32 cellGcm_display_buffer_count(void);
+    /* A title that registered no display buffers of its own leaves them to
+     * RESC, which on hardware scales the source into buffers it allocated
+     * from cellRescSetBufferAddress's memory. Bleach: Soul Resurreccion does
+     * that. Here the source surface itself is the display buffer: the backend
+     * scales the scanout to the window anyway. Its id is the source's index,
+     * and it is registered again only when the source changes. */
+    static int s_src_is_display = -1;
+    if (s_src_is_display < 0) s_src_is_display = cellGcm_display_buffer_count() == 0;
+    if (s_src_is_display && index >= 0 && index < 8 && s_src[index].width) {
+        static CellRescSrc s_shown[8];
+        if (memcmp(&s_shown[index], &s_src[index], sizeof s_src[index]) != 0) {
+            s_shown[index] = s_src[index];
+            cellGcmSetDisplayBuffer((u32)index, s_src[index].offset, s_src[index].pitch,
+                                    s_src[index].width, s_src[index].height);
+        }
+        cellGcmSetFlipCommand((u32)index);
+        s_flip_status = 0;
+        s_last_flip_time++;
+        if (s_flip_handler_opd)
+            ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+        return CELL_OK;
+    }
     u32 nbuf = cellGcm_display_buffer_count();
     if (nbuf) {
         cellGcmSetFlipCommand(s_flip_target % nbuf);
@@ -221,10 +244,16 @@ s32 cellRescSetFlipHandler(void (*handler)(u32))
     return CELL_OK;
 }
 
+/* libresc installs the handler as GCM's vblank handler, so it runs on every
+ * vblank. Calling it only from cellRescGetFlipStatus left a title that paces
+ * its main loop on it waiting forever: Bleach: Soul Resurreccion posts a
+ * semaphore from its vblank handler and blocks on it once a frame. */
 s32 cellRescSetVBlankHandler(void (*handler)(u32))
 {
+    extern void cellGcmSetVBlankHandler(void (*handler)(u32));
     s_vblank_handler_opd = (u32)(uintptr_t)handler;
     printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", s_vblank_handler_opd);
+    cellGcmSetVBlankHandler(handler);
     return CELL_OK;
 }
 
@@ -260,8 +289,8 @@ s32 cellRescGetFlipStatus(void)
         s_last_flip_time++;
         if (s_flip_handler_opd)
             ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-        if (s_vblank_handler_opd)
-            ps3_invoke_guest(s_vblank_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
+        /* The vblank handler is GCM's now (cellRescSetVBlankHandler) and runs
+         * on the frame clock; calling it here as well ran it twice. */
     }
     return s_flip_status;
 }
@@ -301,4 +330,61 @@ s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
     s_aspect_h = horizontal;
     s_aspect_v = vertical;
     return CELL_OK;
+}
+
+/* A render target as a RESC source: its first colour buffer, with the
+ * surface format turned into the texture format RESC samples it as
+ * (A8R8G8B8 or W16Z16Y16X16 float; LN for a pitch surface). Antialiased
+ * surfaces are wider or taller in memory than their nominal size.
+ * CellGcmSurface: type u8 @0, antialias u8 @1, colorFormat u8 @2,
+ * colorOffset[4] u32 @8, colorPitch[4] u32 @0x18, width u16 @0x34,
+ * height u16 @0x36. */
+s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, CellRescSrc* rescSrc)
+{
+    if (!gcmSurface || !rescSrc)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    const u32 s = (u32)(uintptr_t)gcmSurface, d = (u32)(uintptr_t)rescSrc;
+    const u8 type = vm_read8(s + 0), aa = vm_read8(s + 1), cfmt = vm_read8(s + 2);
+    u32 tex;
+    switch (cfmt) {
+    case 0x08: tex = 0x85; break;   /* SURFACE_A8R8G8B8      -> TEXTURE_A8R8G8B8 */
+    case 0x0B: tex = 0x9A; break;   /* SURFACE_F_W16Z16Y16X16 -> TEXTURE_W16_Z16_Y16_X16_FLOAT */
+    default: return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    }
+    if (type == 1) tex |= 0x20;     /* SURFACE_PITCH -> TEXTURE_LN */
+    else if (type != 2) return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    u32 xw = 1, xh = 1;
+    switch (aa) {
+    case 3: case 4: xw = xh = 2; break;   /* SQUARE_ROTATED_4, SQUARE_CENTERED_4 */
+    case 2: xw = 2; break;                /* DIAGONAL_CENTERED_2 */
+    default: break;
+    }
+    vm_write32(d + 0, tex);
+    vm_write32(d + 4, vm_read32(s + 0x18));
+    vm_write16(d + 8, (u16)(vm_read16(s + 0x34) * xw));
+    vm_write16(d + 10, (u16)(vm_read16(s + 0x36) * xh));
+    vm_write32(d + 12, vm_read32(s + 8));
+    return CELL_OK;
+}
+
+s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode)
+{
+    if (!bufferMode)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    u32 mode;
+    switch (resolutionId) {
+    case 1: mode = CELL_RESC_1920x1080; break;   /* CELL_VIDEO_OUT_RESOLUTION_1080 */
+    case 2: mode = CELL_RESC_1280x720;  break;   /* _720 */
+    case 4: mode = CELL_RESC_720x480;   break;   /* _480 */
+    case 5: mode = CELL_RESC_720x576;   break;   /* _576 */
+    default: return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+    }
+    vm_write32((u32)(uintptr_t)bufferMode, mode);
+    return CELL_OK;
+}
+
+/* Makes the command buffer wait for the previous flip. Flips complete as
+ * they are asked for here, so there is nothing to wait for. */
+void cellRescSetWaitFlip(void)
+{
 }
