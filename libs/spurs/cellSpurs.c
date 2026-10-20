@@ -582,6 +582,16 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
 }
 
+/* The CellSpurs2 form (8192 bytes, room for 32 workloads): the same start-up.
+ * flags1 is left without SF1_32_WORKLOADS, so the title sees a 16-workload
+ * instance, which is what the scheduler here runs. Bleach: Soul Resurreccion
+ * starts its SPURS this way. */
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr)
+{
+    return cellSpursInitializeWithAttribute(spurs, attr);
+}
+
 static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
 
 s32 cellSpursFinalize(CellSpurs* spurs)
@@ -2398,6 +2408,15 @@ s32 cellSpursJobChainAttributeSetName(u64 attr_ea, u64 name_ea)
     vm_write32((u32)attr_ea + JCATTR_NAME, (u32)name_ea);
     printf("[cellSpurs] JobChainAttributeSetName(attr=0x%08X, \"%s\")\n",
            (u32)attr_ea, name_ea ? (const char*)(vm_base + (u32)name_ea) : "-");
+    return CELL_OK;
+}
+
+/* Halt the chain when a job raises an exception. The jobs here raise none (no
+ * exception path is modelled), so there is nothing to record; the attribute
+ * is left as it is. */
+s32 cellSpursJobChainAttributeSetHaltOnError(u64 attr_ea)
+{
+    if (!attr_ea) return CELL_SPURS_TASK_ERROR_NULL_POINTER;
     return CELL_OK;
 }
 

@@ -202,6 +202,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
