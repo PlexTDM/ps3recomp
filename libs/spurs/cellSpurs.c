@@ -2656,10 +2656,15 @@ s32 cellSpursJobGuardNotify(u64 guard_ea)
      * OBSERVED zero, which threw away any notify that arrived while the job
      * was still running -- the title notified 6 times and the chain completed
      * 2 laps, so the thread waiting on the other 4 completions never woke. */
-    s_jobguards[i].pending++;
+    /* Atomic: the chain's walker thread takes credits (jg_wait) while guest
+     * threads add them. A plain ++ against its -= lost updates: a lost
+     * notify left the guard closed for good (Bleach: Soul Resurreccion's
+     * sound chain, "still closed after 20000 ms"), a lost take let one job
+     * too many through. */
+    const u32 pend = __atomic_add_fetch(&s_jobguards[i].pending, 1u, __ATOMIC_SEQ_CST);
     s_jobguards[i].ever_notified = 1;
-    { u32 remaining = (s_jobguards[i].pending >= s_jobguards[i].reset)
-                    ? 0u : s_jobguards[i].reset - s_jobguards[i].pending;
+    { u32 remaining = (pend >= s_jobguards[i].reset)
+                    ? 0u : s_jobguards[i].reset - pend;
       s_jobguards[i].count = remaining;
       vm_write32(ea, remaining); }
     { static int _n = 0;
@@ -2699,10 +2704,17 @@ static int jg_wait(u32 ea)
     if (first_ms < 0) { const char* e = getenv("SPURS_GUARD_FIRST_MS"); first_ms = e ? atol(e) : 200; }
     const int spins = s_jobguards[i].ever_notified ? 20000 : (int)first_ms;
     for (int spin = 0; spin < spins; spin++) {     /* 1 ms each */
-        if (s_jobguards[i].pending >= s_jobguards[i].reset) {
-            /* Consume exactly one release worth of credits, so notifies that
-             * arrived during the previous lap still count. */
-            s_jobguards[i].pending -= s_jobguards[i].reset;
+        /* Consume exactly one release worth of credits, so notifies that
+         * arrived during the previous lap still count. A compare-exchange,
+         * against cellSpursJobGuardNotify adding credits concurrently. */
+        const u32 need = s_jobguards[i].reset;
+        u32 have = __atomic_load_n(&s_jobguards[i].pending, __ATOMIC_SEQ_CST);
+        int taken = 0;
+        while (have >= need) {
+            if (__atomic_compare_exchange_n(&s_jobguards[i].pending, &have, have - need, 0,
+                                            __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) { taken = 1; break; }
+        }
+        if (taken) {
             if (!s_jobguards[i].auto_reset) s_jobguards[i].reset = 0;
             s_jobguards[i].count = s_jobguards[i].reset;
             vm_write32(ea, s_jobguards[i].count);
@@ -2816,6 +2828,27 @@ static void jc_signal_done(u32 jc_ea, int job_index)
     }
 }
 
+/* JOBLIST (opcode 6): the command's EA is a CellSpursJobList,
+ * {be32 numJobs; be32 sizeOfJob; be64 eaJobList}, and the jobs are numJobs
+ * descriptors laid out sizeOfJob apart from eaJobList. They were skipped, so
+ * a chain that hands its work over as a list ran none of it: Bleach: Soul
+ * Resurreccion's "geom-jobchain" (JOBLIST, SYNC, FLUSH, JOB, END) at its main
+ * menu, which then stopped drawing. A zero sizeOfJob falls back to the
+ * chain's descriptor size; the count is bounded as a malformed list's is. */
+static void jc_joblist_read(u32 ea, u32 size_desc, u32* n, u32* stride, u32* list)
+{
+    *n = vm_read32(ea);
+    *stride = vm_read32(ea + 4);
+    *list = (u32)vm_read64(ea + 8);
+    if (!*stride) *stride = size_desc ? size_desc : 128;
+    if (!*list || *n > 4096) {
+        printf("[cellSpurs] JOBLIST @0x%08X: numJobs=%u list=0x%08X -- skipped\n", ea, *n, *list);
+        *n = 0;
+    }
+    { static int _n = 0; if (_n < 4 && ++_n)
+        printf("[cellSpurs] JOBLIST @0x%08X: %u job(s) of %u bytes at 0x%08X\n", ea, *n, *stride, *list); }
+}
+
 static void jc_execute(int slot)
 {
     const u32 jc_ea = s_jobchains[slot].jc_ea, size_desc = s_jobchains[slot].size_desc;
@@ -2851,6 +2884,18 @@ static void jc_execute(int slot)
             jc_signal_done(jc_ea, idx);
             pc += 8; continue;
         }
+        if (op == 6 && cmd != 6) {                            /* JOBLIST */
+            u32 n, stride, list;
+            jc_joblist_read((u32)(cmd & ~7ull), size_desc, &n, &stride, &list);
+            for (u32 k = 0; k < n; k++) {
+                { extern u32 g_spurs_job_ls_handle; g_spurs_job_ls_handle = jc_ea; }
+                int idx = jobs++;
+                jc_run_one_job(list + k * stride, idx, stride);
+                jc_signal_done(jc_ea, idx);
+            }
+            if (n) idle = 0;
+            pc += 8; continue;
+        }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }   /* RESET_PC */
         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }   /* NEXT     */
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }  /* CALL */
@@ -2877,7 +2922,7 @@ static void jc_execute(int slot)
             pc += 8; continue;
         }
         /* NOP(0) / SYNC+LWSYNC(2, one virtual SPU: nothing to wait for) /
-         * FLUSH(5) / JOBLIST(6, nested arrays TODO) / SET_LABEL */
+         * FLUSH(5) / SET_LABEL */
         pc += 8;
     }
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d "
@@ -3015,6 +3060,14 @@ static void jc_execute_async(int slot)
             idle = 0;
             pc += 8; continue;
         }
+        if (op == 6 && cmd != 6) {                                   /* JOBLIST */
+            u32 n, stride, list;
+            jc_joblist_read((u32)(cmd & ~7ull), size_desc, &n, &stride, &list);
+            for (u32 k = 0; k < n; k++)
+                jc_async_enqueue(&run, list + k * stride, jc_ea, jobs++, stride);
+            if (n) idle = 0;
+            pc += 8; continue;
+        }
         if (op == 1) { pc = (u32)(cmd & ~7ull); continue; }           /* RESET_PC */
         if (op == 3) { pc = (u32)(cmd & ~7ull); continue; }           /* NEXT     */
         if (op == 4) { ret_pc = pc + 8; pc = (u32)(cmd & ~7ull); continue; }   /* CALL */
@@ -3045,7 +3098,7 @@ static void jc_execute_async(int slot)
             }
         }
         if (op == 2 || op == 5) jc_async_barrier(&run);               /* SYNC / LWSYNC / FLUSH */
-        pc += 8;                                                      /* NOP / JOBLIST / SET_LABEL */
+        pc += 8;                                                      /* NOP / SET_LABEL */
     }
     jc_async_barrier(&run);
     printf("[cellSpurs] chain 0x%08X: 4096 commands with no job run after %d job(s) -- malformed? (async)\n",
