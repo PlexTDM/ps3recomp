@@ -1098,8 +1098,13 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
              * reports the LINE BASE as the faulting address, so an exact match
              * misses precisely the writer we are hunting. */
             if ((guest & ~31u) == (s_guard_ea & ~31u)) {
-                static int _cs = 0;
-                if (_cs < 6 && ++_cs) {
+                /* PPU_WW_GUARD_FROM=N skips the first N hits on the line, so
+                 * the six call stacks land on later writers (boot-time setup
+                 * of a buffer is usually the first, uninteresting one). */
+                static int _cs = 0, _seen = 0, _from = -1;
+                if (_from < 0) { const char* f = getenv("PPU_WW_GUARD_FROM");
+                                 _from = f ? atoi(f) : 0; }
+                if (_seen++ >= _from && _cs < 6 && ++_cs) {
                     /* The writer's own arguments, live. The guard fires INSIDE
                      * the writing routine, so for a memset/memcpy/arena-init
                      * these are (dst, value/src, length) in r3/r4/r5 -- i.e. the
