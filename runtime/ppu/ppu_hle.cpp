@@ -44,7 +44,9 @@ extern "C" uint32_t ps3_hle_count(void) { return g_hle_inited ? g_hle_nids.count
  * args beyond the generic ABI, set registers like r13, touch memory, etc.).
  * Registered separately and dispatched before the generic table. */
 typedef void (*hle_ctx_fn)(ppu_context*);
-#define HLE_CTX_CAP 256
+/* The runtime's own CRT, fs and module surface takes about 100 slots; a port
+ * that binds a lifted firmware module's exports here adds one per NID. */
+#define HLE_CTX_CAP 1024
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
@@ -54,6 +56,11 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
         g_ctx[g_ctx_count].nid = nid; g_ctx[g_ctx_count].fn = fn;
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
         g_ctx_count++;
+    } else {
+        /* A dropped handler is an import that silently falls through to the
+         * generic table or to "unresolved": say so. */
+        fprintf(stderr, "[hle] ps3_hle_register_ctx: table full (%d), 0x%08X %s not registered\n",
+                HLE_CTX_CAP, nid, name ? name : "?");
     }
 }
 
