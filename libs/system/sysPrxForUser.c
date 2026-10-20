@@ -400,6 +400,66 @@ s32 _sys_memcmp(const void* s1, const void* s2, u32 size)
 s32 _sys_toupper(s32 c) { return toupper(c); }
 s32 _sys_tolower(s32 c) { return tolower(c); }
 
+/* Firmware FreeType (libfreetype.sprx) and libfont import these. Pointers
+ * come back as guest addresses: the argument's EA plus the offset found. */
+void* _sys_memmove(void* dst, const void* src, u32 size)
+{
+    void* d = yz_g2h(dst); const void* s = yz_g2h(src);
+    if (d && s) memmove(d, s, size);
+    return dst;
+}
+
+void* _sys_memchr(const void* s, s32 c, u32 size)
+{
+    const u8* h = (const u8*)yz_g2h(s);
+    if (!h) return 0;
+    const u8* p = (const u8*)memchr(h, c, size);
+    return p ? (void*)(uintptr_t)((u32)(uintptr_t)s + (u32)(p - h)) : 0;
+}
+
+char* _sys_strchr(const char* s, s32 c)
+{
+    const char* h = (const char*)yz_g2h(s);
+    if (!h) return 0;
+    const char* p = strchr(h, c);
+    return p ? (char*)(uintptr_t)((u32)(uintptr_t)s + (u32)(p - h)) : 0;
+}
+
+char* _sys_strrchr(const char* s, s32 c)
+{
+    const char* h = (const char*)yz_g2h(s);
+    if (!h) return 0;
+    const char* p = strrchr(h, c);
+    return p ? (char*)(uintptr_t)((u32)(uintptr_t)s + (u32)(p - h)) : 0;
+}
+
+/* qsort with a guest comparison function (an OPD), called through the PPU
+ * scaffold's ppu_guest_call (weak: a build without the scaffold has no guest
+ * to call, and sorts nothing). A shell sort by swaps, in place on guest
+ * memory, so both elements the comparator is handed are always inside the
+ * array, as on the console; qsort promises no stability. */
+extern uint64_t ppu_guest_call(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2,
+                               uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6,
+                               uint64_t a7) __attribute__((weak));
+
+void _sys_qsort(void* base, u32 nmemb, u32 size, u32 compar)
+{
+    const u32 ea = (u32)(uintptr_t)base;
+    if (!ea || nmemb < 2 || !size || !compar || !ppu_guest_call) return;
+    u8* tmp = (u8*)malloc(size);
+    if (!tmp) return;
+    for (u32 gap = nmemb / 2; gap; gap /= 2)
+        for (u32 i = gap; i < nmemb; i++)
+            for (u32 j = i; j >= gap; j -= gap) {
+                const u32 a = ea + (j - gap) * size, b = ea + j * size;
+                if ((s32)ppu_guest_call(compar, a, b, 0, 0, 0, 0, 0, 0) <= 0) break;
+                memcpy(tmp, vm_base + a, size);
+                memcpy(vm_base + a, vm_base + b, size);
+                memcpy(vm_base + b, tmp, size);
+            }
+    free(tmp);
+}
+
 /* ---------------------------------------------------------------------------
  * Lightweight mutex
  * -----------------------------------------------------------------------*/
