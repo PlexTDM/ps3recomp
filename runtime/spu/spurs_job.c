@@ -162,6 +162,12 @@ SPURS_JOB_TLS int g_spurs_job_mbox_valid;
  * that overhead alone held it at 4 fps. */
 static SPURS_JOB_TLS spu_context* s_jctx;
 
+void spurs_job_thread_done(void)
+{
+    free(s_jctx);
+    s_jctx = NULL;
+}
+
 /* spu_context_init minus the local-store memset: every field before ls_store
  * and every field after it. jm2 runs jobs in a dirty local store anyway; the
  * caller zeroes what is past the binary to keep the state jobs saw here. */

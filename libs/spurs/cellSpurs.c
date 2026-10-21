@@ -3285,6 +3285,19 @@ static DWORD WINAPI jc_thread_par(LPVOID p)
     return 0;
 }
 
+static DWORD WINAPI jc_thread(LPVOID p);
+
+/* jc_thread on a thread made for the one walk: the job context that thread
+ * cached goes with it. Without this every Run left one behind -- Bleach: Soul
+ * Resurreccion runs its geometry chain each frame, and the heap grew 8 MB a
+ * second until it held 2 GB more. */
+static DWORD WINAPI jc_thread_own(LPVOID p)
+{
+    const DWORD r = jc_thread(p);
+    spurs_job_thread_done();
+    return r;
+}
+
 static DWORD WINAPI jc_thread(LPVOID p)
 {
     int slot = (int)(intptr_t)p;
@@ -3400,7 +3413,7 @@ static s32 jc_start(u64 jc_ea, const char* who)
             return CELL_OK;
         }
         if (_InterlockedCompareExchange(&s_jobchains[i].running, 1, 0) == 0) {
-            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread, (LPVOID)(intptr_t)i, 0, NULL);
+            HANDLE th = CreateThread(NULL, 1u << 20, jc_thread_own, (LPVOID)(intptr_t)i, 0, NULL);
             if (th) CloseHandle(th);
             else s_jobchains[i].running = 0;
         } else {
