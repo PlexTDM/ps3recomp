@@ -3776,6 +3776,21 @@ static void eng_present(u32 buffer_id)
               eng_surface_dump_now();      /* with RSX_SURF_DUMP_DIR: every target, as presented */
               fprintf(stderr, "[draw-trace] %.1f s: tracing frames %ld..%ld\n", now - t0, s_dtrace_frame, s_dtrace_frame + 3);
           } } }
+    /* RSX_DRAW_TRACE_REQ=<file>: when that file appears, trace the next four
+     * frames and delete it -- so a script can aim the trace at a moment it
+     * caused (a button press), which neither a frame number nor a time since
+     * the first present hits from run to run. Looked for every other frame. */
+    { static int on = -1; static char rq[512]; static unsigned n;
+      if (on < 0) { const char* e = getenv("RSX_DRAW_TRACE_REQ"); on = (e && *e) ? 1 : 0;
+                    if (on) { strncpy(rq, e, sizeof rq - 1); rq[sizeof rq - 1] = 0; } }
+      if (on && (++n & 1) == 0 && (s_dtrace_frame < 0 || (long)g.frames >= s_dtrace_frame + 4)) {
+          FILE* f = fopen(rq, "rb");
+          if (f) {
+              fclose(f); remove(rq);
+              s_dtrace_frame = (long)g.frames + 1;
+              eng_surface_dump_now();
+              fprintf(stderr, "[draw-trace] requested: tracing frames %ld..%ld\n", s_dtrace_frame, s_dtrace_frame + 3);
+          } } }
     /* RSX_TRACE_ON_WHITE=1: read the presented frame back; when it comes out
      * (nearly) all white, trace the next four frames draw by draw. */
     if (s_ring_on > 0) { char line[120];
