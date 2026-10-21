@@ -43,6 +43,8 @@ extern "C" void ppu_dump_guest_stack(ppu_context*,const char*) {}
 extern "C" void ppu_dump_bctrl_ring(uint32_t,const char*) {}
 extern "C" void ppu_guest_callstack(const char*) {}
 uint32_t g_ydkj_real_spurs_ea=0,g_ydkj_real_taskset_ea=0;
+/* cellSail opens its movie through the lv2 path translation; none is opened here. */
+extern "C" void sys_fs_translate_path(const char* p,char* h,int n) { std::snprintf(h,(size_t)n,"%s",p); }
 
 #include <array>
 #include <vector>
