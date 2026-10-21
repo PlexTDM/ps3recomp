@@ -485,16 +485,35 @@ static DWORD WINAPI vblank_ticker(LPVOID)
      * advance at ~60Hz regardless of how long present() blocks. On a hidden/occluded
      * window DXGI Present throttles hard, which previously stalled these ticks and
      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
-     * and catch up in a bounded burst so present latency never slows the game. */
-    ULONGLONG next_tick = GetTickCount64();
+     * and catch up in a bounded burst so present latency never slows the game.
+     *
+     * The beat is the PS3's 59.94 Hz (60000/1001), on the performance
+     * counter, as wave/main.cpp has it. It was GetTickCount64 + 16 ms: 62.5 Hz,
+     * and GetTickCount64 moves in 15.6 ms steps, so ticks came 15.6 ms apart
+     * with a double gap every ~42 -- Bleach: Soul Resurreccion's stages (two
+     * vblanks a frame) ran at 31.3 fps with a 47 ms frame every 21. */
+    LARGE_INTEGER qpf_li, qpc_li;
+    QueryPerformanceFrequency(&qpf_li);
+    QueryPerformanceCounter(&qpc_li);
+    const ULONGLONG vblank_period = (ULONGLONG)(qpf_li.QuadPart * 1001ULL / 60000ULL);
+    ULONGLONG next_tick = (ULONGLONG)qpc_li.QuadPart;
     for (;;) {
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
          * fence still paid the whole tick. Waiting on it keeps the same 4 ms
          * ceiling when nothing kicks, and drains on demand when something
-         * does. */
-        cellGcm_fifo_kick_wait(4);
-        ULONGLONG now = GetTickCount64();
+         * does. The wait ends at the next vblank, so a tick is at most ~1 ms
+         * late rather than up to 4. */
+        {
+            QueryPerformanceCounter(&qpc_li);
+            const long long left = (long long)(next_tick - (ULONGLONG)qpc_li.QuadPart);
+            if (left > 0) {
+                ULONGLONG ms = ((ULONGLONG)left * 1000ULL + (ULONGLONG)qpf_li.QuadPart - 1) / (ULONGLONG)qpf_li.QuadPart;
+                cellGcm_fifo_kick_wait(ms < 4 ? (unsigned)ms : 4u);
+            }
+        }
+        QueryPerformanceCounter(&qpc_li);
+        ULONGLONG now = (ULONGLONG)qpc_li.QuadPart;
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
@@ -515,7 +534,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
              * Doing it here (not after present) keeps those fences advancing at 60Hz
              * even when present() throttles on a hidden/occluded window. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;                 /* ~60 Hz */
+            next_tick += vblank_period;
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
