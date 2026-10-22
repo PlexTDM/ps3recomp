@@ -123,12 +123,23 @@ static void ps3_vfs_overlay(char* path, size_t cap)
  * The overlay is applied after, to the path this settles on.
  *
  * All three path translators call this -- sys_fs, cellFs and ppu_fs each do
- * their own translation (see docs), and a guest path can arrive at any of them. */
+ * their own translation (see docs), and a guest path can arrive at any of them.
+ *
+ * The title's own hook, if it set one (ps3_vfs_title_hook): a port that
+ * serves some files from elsewhere -- a mod's, files chosen by what the title
+ * is doing -- rewrites the host path there. It is asked before the fallback,
+ * which would reshape the path of a file only the hook has, and again after,
+ * for the shape the fallback settled on; a path it rewrote is one it leaves
+ * alone. It runs on every translation (an open, a stat, a directory), from
+ * any thread, so it must be cheap. */
+void (*ps3_vfs_title_hook)(char* path, size_t cap);
 static void ps3game_fallback(char* path, size_t cap);
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
 {
     if (!path || !*path) return;
+    if (ps3_vfs_title_hook) ps3_vfs_title_hook(path, cap);
     ps3game_fallback(path, cap);
+    if (ps3_vfs_title_hook) ps3_vfs_title_hook(path, cap);
     ps3_vfs_overlay(path, cap);
 }
 
@@ -212,6 +223,8 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
         struct stat dst;
         snprintf(host_path, (size_t)host_path_size, "%s/%s", g_sys_fs_root, ps3_path + 10);
         fs_normalize_sep(host_path);
+        /* a file the title's hook serves exists only once it has been asked */
+        if (ps3_vfs_title_hook) ps3_vfs_title_hook(host_path, (size_t)host_path_size);
         if (stat(host_path, &dst) == 0) {
             ps3_vfs_ps3game_fallback(host_path, (size_t)host_path_size);
             return;
