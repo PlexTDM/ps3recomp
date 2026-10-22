@@ -17,11 +17,19 @@ static volatile LONG s_want;       /* the port asked for the cursor */
 static volatile LONG s_held;       /* and has it: the window is in front */
 static volatile LONG s_dx, s_dy, s_wheel;
 static volatile LONG s_escape_closes = 1;
+static volatile LONG s_frame_click;   /* the window's frame (its title bar) is held */
+static volatile LONG s_modal;         /* Windows' own loop: the window moved or sized, its menu open */
 
-/* On the window's thread: take the cursor or give it back. */
+/* On the window's thread: take the cursor or give it back. Not while the
+ * player has the window's frame in hand -- held inside the window, the
+ * pointer would pull the window after it as it is dragged, down without end
+ * -- nor while the click that brought the window in front is still down: it
+ * is taken when that button is let go. (SDL waits the same way: its
+ * in_title_click, in_modal_loop and focus_click_pending.) */
 static void mouse_apply(HWND hwnd)
 {
-    const int hold = s_want && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+    const int may = s_want && GetForegroundWindow() == hwnd && !IsIconic(hwnd) && !s_frame_click && !s_modal;
+    const int hold = may && (s_held || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
     if (hold) {
         RECT rc;
         POINT tl, br;
@@ -63,9 +71,13 @@ int rsx_host_mouse_message(void* hwnd_, unsigned msg, uintptr_t wp, intptr_t lp,
     case WM_INPUT: {
         RAWINPUT ri;
         UINT size = sizeof ri;
-        if (s_held &&
+        if ((s_held || s_want) &&
             GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
             ri.header.dwType == RIM_TYPEMOUSE) {
+            /* the click that brought the window in front let go, wherever the pointer is */
+            if (!s_held && (ri.data.mouse.usButtonFlags & (RI_MOUSE_BUTTON_1_UP | RI_MOUSE_BUTTON_2_UP)))
+                mouse_apply(hwnd);
+            if (!s_held) return 0;
             if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
                 InterlockedExchangeAdd(&s_dx, ri.data.mouse.lLastX);
                 InterlockedExchangeAdd(&s_dy, ri.data.mouse.lLastY);
@@ -82,6 +94,26 @@ int rsx_host_mouse_message(void* hwnd_, unsigned msg, uintptr_t wp, intptr_t lp,
             return 1;
         }
         return 0;
+    case WM_NCLBUTTONDOWN:   /* the frame: Windows takes the mouse until it is let go */
+        InterlockedExchange(&s_frame_click, 1);
+        mouse_apply(hwnd);
+        return 0;
+    case WM_CAPTURECHANGED:
+        InterlockedExchange(&s_frame_click, 0);
+        mouse_apply(hwnd);
+        return 0;
+    case WM_ENTERSIZEMOVE:
+    case WM_ENTERMENULOOP:
+        InterlockedExchange(&s_modal, 1);
+        mouse_apply(hwnd);
+        return 0;
+    case WM_EXITSIZEMOVE:
+    case WM_EXITMENULOOP:
+        InterlockedExchange(&s_modal, 0);
+        InterlockedExchange(&s_frame_click, 0);
+        mouse_apply(hwnd);
+        return 0;
+    case WM_LBUTTONUP:
     case WM_ACTIVATE:
     case WM_SETFOCUS:
     case WM_KILLFOCUS:
