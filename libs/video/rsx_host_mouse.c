@@ -20,6 +20,12 @@ static volatile LONG s_escape_closes = 1;
 static volatile LONG s_frame_click;   /* the window's frame (its title bar) is held */
 static volatile LONG s_modal;         /* Windows' own loop: the window moved or sized, its menu open */
 
+/* A mouse button down (the buttons as they are, swapped or not). */
+static int button_down(void)
+{
+    return ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) | GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+}
+
 /* On the window's thread: take the cursor or give it back. Not while the
  * player has the window's frame in hand -- held inside the window, the
  * pointer would pull the window after it as it is dragged, down without end
@@ -29,7 +35,7 @@ static volatile LONG s_modal;         /* Windows' own loop: the window moved or 
 static void mouse_apply(HWND hwnd)
 {
     const int may = s_want && GetForegroundWindow() == hwnd && !IsIconic(hwnd) && !s_frame_click && !s_modal;
-    const int hold = may && (s_held || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000));
+    const int hold = may && (s_held || !button_down());
     if (hold) {
         RECT rc;
         POINT tl, br;
@@ -74,10 +80,12 @@ int rsx_host_mouse_message(void* hwnd_, unsigned msg, uintptr_t wp, intptr_t lp,
         if ((s_held || s_want) &&
             GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
             ri.header.dwType == RIM_TYPEMOUSE) {
-            /* the click that brought the window in front let go, wherever the pointer is */
-            if (!s_held && (ri.data.mouse.usButtonFlags & (RI_MOUSE_BUTTON_1_UP | RI_MOUSE_BUTTON_2_UP)))
-                mouse_apply(hwnd);
-            if (!s_held) return 0;
+            if (!s_held) {   /* the click that brought the window in front let go, wherever the pointer is */
+                if (ri.data.mouse.usButtonFlags &
+                    (RI_MOUSE_LEFT_BUTTON_UP | RI_MOUSE_RIGHT_BUTTON_UP | RI_MOUSE_MIDDLE_BUTTON_UP))
+                    mouse_apply(hwnd);
+                if (!s_held) return 0;
+            }
             if (!(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
                 InterlockedExchangeAdd(&s_dx, ri.data.mouse.lLastX);
                 InterlockedExchangeAdd(&s_dy, ri.data.mouse.lLastY);
