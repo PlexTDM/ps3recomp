@@ -166,6 +166,12 @@ static int vdec_ff_receive(VdecFf* d, vdec_ff_emit_fn emit, void* cb_ctx)
             pic.token = (u32)(f->pts != AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp);
             pic.pict_type = (int)f->pict_type;
             pic.key = (f->flags & AV_FRAME_FLAG_KEY) != 0;
+            /* The decoder knows the frame rate from the stream (H.264: the
+             * SPS's timing info); repeat_pict is the extra fields a picture
+             * is shown for, in halves of a frame (pulldown). */
+            if (d->ctx->framerate.num > 0 && d->ctx->framerate.den > 0)
+                pic.duration = 90000.0 * d->ctx->framerate.den / d->ctx->framerate.num *
+                               (1.0 + 0.5 * f->repeat_pict);
             emit(cb_ctx, &pic);                        /* takes pic.yuv */
         }
         d->ff->av_frame_unref(f);
