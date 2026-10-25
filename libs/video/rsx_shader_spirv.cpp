@@ -62,7 +62,11 @@ extern "C" u32 rsx_hlsl_to_spirv(const char* hlsl, int stage, u32** words, char*
     std::vector<unsigned int> spirv;
     spv::SpvBuildLogger logger;
     glslang::SpvOptions opts;
-    opts.disableOptimizer = false;      /* the HLSL legalization passes */
+    /* The HLSL legalization passes include the SPIRV-Tools loop unroller. A
+     * guest shader with a large loop can spend minutes there, which looks
+     * like a startup freeze. RSX_SPV_NO_OPT=1 skips the passes for testing;
+     * the emitted SPIR-V is usually valid for the simple PS3 shaders. */
+    opts.disableOptimizer = getenv("RSX_SPV_NO_OPT") != NULL;
     glslang::GlslangToSpv(*program.getIntermediate(lang), spirv, &logger, &opts);
     if (spirv.empty()) { put_log(log, log_size, "SPIR-V generation", logger.getAllMessages().c_str()); return 0; }
     u32* out = (u32*)malloc(spirv.size() * sizeof(u32));
