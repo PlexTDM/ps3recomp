@@ -3104,8 +3104,14 @@ static int vk_init_all(u32 width, u32 height, const char* title)
 
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
+    const int require_window = vk_env_on("PS3RECOMP_VK_WINDOW");
     memset(&s_vk, 0, sizeof s_vk);
     if (vk_init_all(width, height, title)) {
+        rsx_vulkan_backend_shutdown();
+        return -1;
+    }
+    if (require_window && !s_vk.windowed) {
+        VK_LOG("PS3RECOMP_VK_WINDOW=1 was requested but no SDL window is available\n");
         rsx_vulkan_backend_shutdown();
         return -1;
     }
