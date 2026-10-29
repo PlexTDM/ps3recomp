@@ -11,13 +11,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#ifdef _WIN32
-#include <direct.h>
-#define mkdir_p(path, mode) _mkdir(path)
-#else
 #include <unistd.h>
 #define mkdir_p(path, mode) mkdir(path, mode)
-#endif
 
 /* Create directory and all parents */
 s32 cellFsUtilMkdirAll(const char* path, u32 mode)

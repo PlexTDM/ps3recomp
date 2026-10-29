@@ -40,36 +40,25 @@ The PlayStation 3 has over **3,000 titles** and some of the most beloved games e
 
 ## Platform support
 
-CI builds and tests every row on every pull request: Windows (clang-cl), macOS
-arm64, Linux (GCC and Clang), and Linux with the Vulkan backend on lavapipe
-under the validation layer. A green check means the runtime built and the tests
-passed. It does not mean a game ran; the last row is the only one that claims
-that.
+CI builds and tests the runtime on Linux (GCC and Clang), and builds the
+Vulkan backend on lavapipe under the validation layer. A green check means the
+runtime built and the tests passed. It does not mean a game ran.
 
-| | Windows | macOS (arm64) | Linux |
-|---|---|---|---|
-| Runtime library builds | yes | yes | yes |
-| Lifter test suites + C unit tests | yes | yes | yes |
-| Render backend | D3D12 | Metal | Vulkan (opt-in); null (headless, CI) |
-| Runs a recompiled game, in this tree | **yes** | **no** | **no** |
+| | Linux |
+|---|---|
+| Runtime library builds | yes |
+| Lifter test suites + C unit tests | yes |
+| Render backend | Vulkan (opt-in); null (headless, CI) |
+| Runs a recompiled game, in this tree | **yes**, with the Vulkan backend |
 
-**What stops macOS and Linux running a title is the PPU boot scaffold.**
-`ppu_loader.cpp`, `boot_main.cpp` and the HLE dispatch are compiled per game,
-not into the library. They compile on POSIX with zero errors (a CI ratchet
-keeps it that way) and the frame clock runs there, but no title has yet been
-booted to gameplay from this tree on either OS.
-
-**The renderers are further along than that.** `ps3recomp_host` drives cellGcm
-→ RSX → backend end to end with no game. With guest programs on, Metal and
-Vulkan both run the title's own shaders on the shared register-file draw
-engine. Every `ps3recomp_host` scene passes on both, including render-to-texture,
-MRT, depth textures, cube maps and stencil. Linux's default stays the headless
-null backend, a CPU triangle filler that CI draws with.
-
-**Downstream, people are already past this.** Twisted Metal's menus run on
-Linux/Vulkan, inFamous on macOS, and Killzone 3 under Proton (see
-[In the community](#in-the-community)). Those ports carry patches that are
-still on their way upstream, which is why the table still says "no".
+**The PPU boot scaffold is compiled per game**, not into the library:
+`ppu_loader.cpp`, `boot_main.cpp` and the HLE dispatch. `ps3recomp_host`
+drives cellGcm → RSX → backend end to end with no game. With guest programs on,
+Vulkan runs the title's own shaders on the shared register-file draw engine;
+without them, the null backend's fixed-function path. Every `ps3recomp_host`
+scene passes with the Vulkan backend, including render-to-texture, MRT, depth
+textures, cube maps and stencil. The null backend stays the headless fallback,
+a CPU triangle filler that CI draws with.
 
 ## The Challenge
 
@@ -195,7 +184,7 @@ The pipeline follows the same proven approach as our [burnout3](https://github.c
           │
           ▼
    ┌─────────────┐
-   │  Compile &   │  MSVC / GCC / Clang
+   │  Compile &   │  GCC / Clang
    │  Ship!       │  Native x86-64 executable
    └─────────────┘
 ```
@@ -227,8 +216,8 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **Kernel Filesystem** | sys_fs (path mapping, real I/O) | ✅ Complete |
 | **Filesystem** | cellFs (real file I/O, dir ops, stat, path translation) | ✅ Complete |
 | **Save System** | cellSaveData (callback-driven, PARAM.SFO), cellGame | ✅ Complete |
-| **Input** | cellPad (XInput/SDL2), cellKb, cellMouse | ✅ Complete |
-| **Audio** | cellAudio (WASAPI/SDL2, mixing thread, multi-port) | ✅ Complete |
+| **Input** | cellPad (SDL2), cellKb, cellMouse | ✅ Complete |
+| **Audio** | cellAudio (SDL2, mixing thread, multi-port) | ✅ Complete |
 | **Video Output** | cellVideoOut (resolution config, 720p default) | ✅ Complete |
 | **Codecs** | cellPngDec, cellJpgDec, cellGifDec (stb_image) | ✅ Complete |
 | **Font** | cellFont (stb_truetype backend + fallback metrics) | ✅ Complete |
@@ -238,10 +227,10 @@ HLE implementations of the PS3 system libraries, written for this project. RPCS3
 | **System** | cellRtc, cellMsgDialog, cellOskDialog, cellUserInfo, cellGameExec | ✅ Complete |
 | **Localization** | cellL10n (UTF-8/16/32/UCS-2, ISO-8859-1, generic converter) | ✅ Complete |
 | **Resolution** | cellResc (display modes, scaling, interlace, aspect ratio) | ✅ Complete |
-| **Fibers** | cellFiber (PPU fibers via Windows Fibers/ucontext) | ✅ Complete |
+| **Fibers** | cellFiber (PPU fibers via ucontext) | ✅ Complete |
 | **AV Config** | cellAvconfExt (audio output info, gamma, sound availability) | ✅ Complete |
 | **Input Util** | cellKey2char (HID scancode → Unicode, US-101 layout) | ✅ Complete |
-| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **live D3D12 backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (Win32 window) | ✅ Complete |
+| **Graphics** | cellGcmSys (cmd buffer, IO mapping, tile/zcull, flip handlers, timestamps, FIFO walker + ring recycle), RSX command processor (NV47xx parsing, state tracking, backend callbacks), **Vulkan backend** (executes the title's real NV4097 vertex/fragment programs — indexed draws, per-draw VP constants + textures, render-to-texture, MRT, FP predication), null backend (headless software rasteriser) | ✅ Complete |
 | **SPURS** | cellSpurs (management APIs, event flags, task/workload tracking), cellSpursJq (job queues with wait/signal), cellDaisy (real ring buffer FIFO) | ✅ Complete |
 | **Core Runtime** | cellSysutil (BGM, cache, disc), cellSysmodule, sysPrxForUser (real lwmutex/lwcond/threads) | ✅ Complete |
 | **Media Pipeline** | cellPamf (PAMF header + stream descriptors), cellDmux (callback sequencing), cellVdec (H.264/MPEG-2 through FFmpeg loaded at run time, opt-in), cellAtrac (ATRAC3plus, all-in-memory), cellAdec (callbacks, no decode yet), cellSail (state machine) | 🔨 Partial |
@@ -268,10 +257,10 @@ We've written extensive docs covering every aspect of the project. Whether you'r
 | **[NID System](docs/NID_SYSTEM.md)** | How PS3 function linking works, NID computation, module registration framework |
 | **[Module Reference](docs/MODULES_REFERENCE.md)** | Detailed documentation for every HLE module — what they do and how they're implemented |
 | **[Module Status](docs/MODULE_STATUS.md)** | Quick-reference status table for all modules |
-| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, D3D12 and Metal backends, shader strategy |
+| **[RSX Graphics](docs/RSX_GRAPHICS.md)** | RSX GPU translation architecture: command processor, Vulkan backend, shader strategy |
 | **[Tools Reference](docs/TOOLS.md)** | Every recompiler pipeline tool documented: ELF parser, disassembler, lifter, NID database |
 | **[SPU Lifter](docs/SPU_LIFTER.md)** | SPU ISA decoding/lifting, the runtime model (local store, channels, DMA, per-image dispatch), and the SPU tests |
-| **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How we handle Win32 vs POSIX: threading, sockets, timers, audio, memory, fibers |
+| **[Platform Abstraction](docs/PLATFORM_ABSTRACTION.md)** | How the Linux host fills in the Win32 names the runtime was written against |
 | **[SPU Fallback](docs/SPU_FALLBACK.md)** | The PPU-side fallback registry — a hand-written replacement for an SPU job, or a bring-up shim before an image is lifted |
 | **[Debug Console](docs/DEBUG_CONSOLE.md)** | Ask a title that is already running what it is doing, without a rebuild |
 | **[Runtime Diagnostics](docs/DIAGNOSTICS.md)** | Generated index of every diagnostic environment variable the runtime reads |
@@ -287,7 +276,7 @@ includes a prebuilt SDK bundle per platform (`ps3recomp-<version>-win-x64.zip`,
 runtime library, its headers and the Python pipeline. `VERSION.txt` inside it
 says what that platform can and cannot do yet.
 
-> **Prerequisites (building from source)**: Python 3.10+, CMake 3.20+, a C17/C++20 compiler (MSVC 19.x / clang-cl, GCC 12+, or Clang 15+)
+> **Prerequisites (building from source)**: Linux, Python 3.10+, CMake 3.20+, Ninja, and a C17/C++20 compiler (GCC 12+ or Clang 15+)
 
 ```bash
 git clone https://github.com/sp00nznet/ps3recomp.git
@@ -383,8 +372,8 @@ Want to port a game? Start with the [Getting Started](#getting-started) section,
 ## Building Blocks We Leverage
 
 - **RPCS3**: a behavioural reference for HLE modules and syscalls. We read what it does and then write our own. No RPCS3 (GPL) code belongs in this tree.
-- **Direct3D 12 / Metal / Vulkan**: RSX graphics translation. D3D12 is the backend that runs games in this tree today. Metal (macOS) and Vulkan (Linux, opt-in, see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend-linux-opt-in)) run guest shaders on the shared draw engine. CI draws with the headless null backend.
-- **SDL2**: input and audio off Windows. `cellPad` and `cellAudio` always use their SDL2 backends on non-Windows hosts, so SDL2 is required there; on Windows they use XInput and WASAPI. SDL2 does no windowing here; each graphics backend makes its own.
+- **Vulkan**: RSX graphics translation. The Linux backend runs guest shaders on the shared draw engine (opt-in, see [docs/BUILDING.md](docs/BUILDING.md#the-vulkan-backend)). CI draws with the headless null backend.
+- **SDL2**: input, audio and the window of the Vulkan backend. `cellPad` and `cellAudio` use their SDL2 backends, so SDL2 is required.
 - **FFmpeg** (optional, loaded at run time): video decode for cellVdec and ATRAC3plus for cellAtrac. It is never linked and never vendored.
 
 ## Contributing
@@ -393,7 +382,7 @@ This is a massive undertaking and we need help. Here's how to get involved:
 
 - **HLE Module Authors** — Fill in the partial modules (media decode, SPURS edge cases) from documented behaviour
 - **PPU/SPU Experts** — Improve the disassembler and lifter accuracy
-- **Graphics Engineers** — Bring Metal and Vulkan to D3D12 parity, then run a title on them
+- **Graphics Engineers** — Improve the Vulkan backend and run more titles on it
 - **Game Testers** — Try recompiling titles and report what breaks
 - **Documentation** — Help us map out the PS3's system library landscape
 

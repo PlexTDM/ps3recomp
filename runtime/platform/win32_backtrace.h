@@ -59,27 +59,19 @@
  * needless portability floor under the whole runtime for the sake of a
  * debug-only facility the library never calls.
  */
-#ifndef PS3RECOMP_WIN32_BACKTRACE_H
+#if !defined(PS3RECOMP_WIN32_BACKTRACE_H)
 #define PS3RECOMP_WIN32_BACKTRACE_H
 
-#ifdef _WIN32
-
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-#else /* !_WIN32 */
 
 #include <stddef.h>
 #include <stdint.h>   /* uintptr_t, for the function-pointer -> void* cast */
 #include <string.h>   /* the symbol and module names are copied out */
 
-/* backtrace(3) is a glibc/Apple extension; musl ships no <execinfo.h>. Where it
- * is missing the shims stay, but report an empty stack -- the diagnostics then
+/* backtrace(3) is a glibc extension; musl ships no <execinfo.h>. Where it is
+ * missing the shims stay, but report an empty stack -- the diagnostics then
  * print nothing useful instead of failing to build, which is the right trade
  * for a debug path. */
-#if defined(__GLIBC__) || defined(__APPLE__)
+#if defined(__GLIBC__)
 #  include <execinfo.h>
 #  define PS3_HAVE_BACKTRACE 1
 #else
@@ -301,5 +293,4 @@ static inline DWORD GetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD size
     return (DWORD)n;
 }
 
-#endif /* _WIN32 */
-#endif /* PS3RECOMP_WIN32_BACKTRACE_H */
+#endif

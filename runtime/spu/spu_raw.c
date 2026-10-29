@@ -39,9 +39,6 @@
 #include <string.h>
 #include <time.h>      /* nanosleep, in the POSIX half of spu_intr.inc */
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
 
 extern uint8_t* vm_base;
 extern int g_spu_force_ch_block;              /* spu_channels.c */
@@ -90,9 +87,6 @@ typedef struct raw_spu {
      * streamed in this way is resolved by fingerprinting a run (raw_spu_start). */
     uint32_t     get_lo[8], get_hi[8];
     int          get_runs;
-#ifdef _WIN32
-    HANDLE       thread;
-#endif
 } raw_spu;
 
 static raw_spu s_spu[SPU_RAW_COUNT];
@@ -229,45 +223,6 @@ void spu_raw_note_image(uint32_t src_ea, uint32_t entry)
 /* ---------------------------------------------------------------------------
  * The SPU host thread
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-static DWORD WINAPI raw_spu_thread(LPVOID arg)
-{
-    raw_spu* s = (raw_spu*)arg;
-    spu_context* c = s->ctx;
-
-    c->status = SPU_STATUS_RUNNING;
-    publish(s);
-
-    int halted = spu_run_with_halt(s->entry, c);
-
-    /* A raw SPU that returns has executed `stop`. Report it the way hardware
-     * does -- run bit clear, stop bit set, stop code in the high half -- so the
-     * PPU's status poll sees a real termination instead of a stuck 'running'. */
-    c->status = SPU_STATUS_STOPPED_BY_STOP | (c->stop_code << 16);
-    /* Stop-and-signal is an INTERRUPT, not just a status change. This is how a
-     * raw SPU asks the PPU for something: `stop <code>`, the PPU takes the
-     * class-2 interrupt (status bit 0x2), reads the code, services it and
-     * restarts the SPU. ps1_netemu unmasks exactly this bit, and without it the
-     * GPU core stopping with code 0x2000 looked like a clean exit that nobody
-     * was ever told about -- so nobody restarted it. */
-    s->int_stat |= 0x2u;
-    if (s->int_stat & s->int_mask) ps3_intr_raise(s->intrtag);
-    publish(s);
-    InterlockedExchange(&s->started, 0);
-
-    fprintf(stderr, "[spu-raw] spu%u stopped: halted=%d pc=0x%05X lr=0x%05X "
-                    "steps=%llu stop_code=0x%X outmbox(n=%u v=0x%08X) "
-                    "outintr(n=%u v=0x%08X) inmbox(n=%u)\n",
-            (unsigned)(s - s_spu), halted, (unsigned)(c->pc & SPU_LS_MASK),
-            (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK),
-            (unsigned long long)c->steps, c->stop_code,
-            (unsigned)c->ch_out_mbox.count, c->ch_out_mbox.value,
-            (unsigned)c->ch_out_intr_mbox.count, c->ch_out_intr_mbox.value,
-            (unsigned)c->ch_in_mbox.count);
-    fflush(stderr);
-    return 0;
-}
-#endif
 
 static void raw_spu_start(raw_spu* s)
 {
@@ -291,9 +246,6 @@ static void raw_spu_start(raw_spu* s)
         fflush(stderr);
         return;
     }
-#ifdef _WIN32
-    if (InterlockedCompareExchange(&s->started, 1, 0) != 0) return;  /* already up */
-#endif
 
     if (!s->ctx) {
         s->ctx = (spu_context*)malloc(sizeof(spu_context));
@@ -328,10 +280,6 @@ static void raw_spu_start(raw_spu* s)
               l[pc],l[pc+1],l[pc+2],l[pc+3], nz); }
     fflush(stderr);
 
-#ifdef _WIN32
-    s->thread = CreateThread(NULL, 1u << 20, raw_spu_thread, s, 0, NULL);
-    if (!s->thread) InterlockedExchange(&s->started, 0);
-#endif
 }
 
 /* ---------------------------------------------------------------------------

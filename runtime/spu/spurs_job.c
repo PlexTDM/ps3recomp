@@ -143,11 +143,7 @@ const uint8_t* spurs_job_ls_for_handle(uint32_t handle)
  * job's mailbox. Per-thread keeps each job paired with its own answer. */
 /* __declspec(thread) for MSVC only: MinGW GCC ignores it, which would make
  * these process-wide. spurs_job.c and cellSpurs.c must agree. */
-#if defined(_MSC_VER)
-#  define SPURS_JOB_TLS __declspec(thread)
-#else
 #  define SPURS_JOB_TLS __thread
-#endif
 SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr;
 /* The command this job ran, read from its own command block. Only a query
  * expects an answer back through the completion event. */
@@ -180,27 +176,12 @@ static void spu_context_init_regs(spu_context* ctx)
 
 /* Monotonic nanoseconds for the job-shape histogram (spu_workload.c keeps
  * its own copy private). */
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-static uint64_t sj_now_ns(void)
-{
-    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
-}
-#else
 #include <time.h>
 static uint64_t sj_now_ns(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
-#endif
 int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
                       uint32_t job_ea, uint32_t job_desc_size)
 {

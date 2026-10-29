@@ -10,7 +10,7 @@
  * native order), 4 words / 16 bytes per instruction, no inline constants
  * (VP constants live in a separate bank), program ends at the D3.end bit.
  *
- * Self-contained: no D3D12 dependency, build/test standalone.
+ * Self-contained: no graphics-API dependency, build/test standalone.
  */
 #ifndef PS3RECOMP_RSX_VP_DECOMPILER_H
 #define PS3RECOMP_RSX_VP_DECOMPILER_H

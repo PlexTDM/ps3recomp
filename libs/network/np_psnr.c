@@ -9,18 +9,10 @@
 #include <ctype.h>
 #include <time.h>
 
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-static SRWLOCK s_lock = SRWLOCK_INIT;
-#  define LOCK()   AcquireSRWLockExclusive(&s_lock)
-#  define UNLOCK() ReleaseSRWLockExclusive(&s_lock)
-#else
 #  include <pthread.h>
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 #  define LOCK()   pthread_mutex_lock(&s_lock)
 #  define UNLOCK() pthread_mutex_unlock(&s_lock)
-#endif
 
 /* The fake username from sceNp.c. */
 extern const char* np_fake_username(void);
@@ -35,11 +27,7 @@ static void (*s_push_fn)(const psnr_msg*);
 
 static void set_env(const char* k, const char* v)
 {
-#ifdef _WIN32
-    _putenv_s(k, v);
-#else
     setenv(k, v, 1);
-#endif
 }
 
 /* PSN online IDs: 3-16 letters, digits, '-' and '_', starting with a letter.
@@ -78,11 +66,7 @@ void np_psnr_setup(const char* username, const char* server)
     }
     if (!found) {
         if (!np_psnr_enabled()) { s_id_state = 2; return; }   /* offline: "PS3Player" */
-#ifdef _WIN32
-        const char* os = getenv("USERNAME");
-#else
         const char* os = getenv("USER");
-#endif
         if (!clean_online_id(os, s_id)) strcpy(s_id, "PS3Player");
     }
     s_id_state = 1;
@@ -212,13 +196,9 @@ static struct peer {
 
 static uint64_t nat_now_ms(void)
 {
-#ifdef _WIN32
-    return GetTickCount64();
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-#endif
 }
 
 /* Callers hold LOCK. */

@@ -11,11 +11,7 @@
 
 const char* np_fake_username(void) { return "PS3Player"; }
 
-#ifdef _WIN32
-#  define OS_USER "USERNAME"
-#else
 #  define OS_USER "USER"
-#endif
 
 /* Resolve afresh, as a new process would. */
 static const char* resolve(const char* username, const char* server)

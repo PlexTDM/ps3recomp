@@ -9,10 +9,6 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
-#ifdef _WIN32
-#include <windows.h>
-#include <d3dcompiler.h>
-#endif
 
 static unsigned char buf[65536];
 static char hlsl[160 * 1024];
@@ -40,22 +36,6 @@ int main(int argc, char** argv)
         if (r < 0) { decode_err++; continue; }
         decoded++;
 
-#ifdef _WIN32
-        ID3DBlob *code=NULL,*err=NULL;
-        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), e->d_name, NULL, NULL,
-                                "main", "vs_5_0", 0, 0, &code, &err);
-        if (SUCCEEDED(hr)) { compiled++; if(code)code->lpVtbl->Release(code); }
-        else {
-            fail++;
-            if (shown < 5) {
-                const char* msg = err?(const char*)err->lpVtbl->GetBufferPointer(err):"?";
-                const char* ee = strstr(msg, "error");
-                printf("  [FAIL] %s: %s\n", e->d_name, ee?ee:msg);
-                shown++;
-            }
-        }
-        if (err) err->lpVtbl->Release(err);
-#endif
     }
     closedir(d);
 
@@ -63,9 +43,5 @@ int main(int argc, char** argv)
     printf("total .vp      : %d\n", total);
     printf("decoded        : %d  (%.1f%%)\n", decoded, total?100.0*decoded/total:0);
     printf("decode errors  : %d\n", decode_err);
-#ifdef _WIN32
-    printf("D3DCompile OK  : %d  (%.1f%%)\n", compiled, total?100.0*compiled/total:0);
-    printf("D3DCompile FAIL: %d\n", fail);
-#endif
     return 0;
 }

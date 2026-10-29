@@ -59,14 +59,9 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
 /* Hands a relayed stream to sysNet's sink from another thread, the way the
  * pump thread does while the title's thread sits in a blocking accept. */
 static struct { int64_t fd; uint8_t ip[4]; uint16_t port; } s_late;
-#ifdef _WIN32
-static DWORD WINAPI late_sink(LPVOID u) { (void)u; Sleep(200); s_sink(s_late.fd, s_late.ip, s_late.port); return 0; }
-static void start_late_sink(void) { CloseHandle(CreateThread(NULL, 0, late_sink, NULL, 0, NULL)); }
-#else
 #include <pthread.h>
 static void* late_sink(void* u) { (void)u; usleep(200 * 1000); s_sink(s_late.fd, s_late.ip, s_late.port); return NULL; }
 static void start_late_sink(void) { pthread_t t; pthread_create(&t, NULL, late_sink, NULL); pthread_detach(t); }
-#endif
 
 static unsigned int bump_alloc(unsigned int size, unsigned int align)
 {

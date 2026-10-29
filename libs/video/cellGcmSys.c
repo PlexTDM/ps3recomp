@@ -8,7 +8,6 @@
  * Actual rendering is handled elsewhere -- this module just tracks state.
  */
 
-#include "rsx_live_draw.h"
 #include "rsx_draw_engine.h"
 #include "cellGcmSys.h"
 #include "../../runtime/platform/win32_compat.h"
@@ -32,48 +31,18 @@ static u32 s_gcm_context_ea = 0;
 #include "ps3emu/env_cache.h"
 #define getenv(name) ps3_env(name)
 
-#ifdef _WIN32
-#include <windows.h>
-/* WaitOnAddress / WakeByAddressAll (the ring-full recycle): every program
- * that links this, rsx_replay included, needs the library. */
-#pragma comment(lib, "synchronization.lib")
-#else
 #include <time.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Timestamp helpers (same pattern as sys_timer)
  * -----------------------------------------------------------------------*/
 
-#ifdef _WIN32
-static LARGE_INTEGER s_qpc_freq;
-static int           s_qpc_init = 0;
-
-static void ensure_qpc_init(void)
-{
-    if (!s_qpc_init) {
-        QueryPerformanceFrequency(&s_qpc_freq);
-        s_qpc_init = 1;
-    }
-}
-
-static u64 get_timestamp_ns(void)
-{
-    LARGE_INTEGER now;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&now);
-    now.QuadPart = ps3_guest_ticks(now.QuadPart);   /* still while paused */
-    /* Convert to nanoseconds: (count * 1e9) / freq */
-    return (u64)((double)now.QuadPart * 1000000000.0 / (double)s_qpc_freq.QuadPart);
-}
-#else
 static u64 get_timestamp_ns(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);   /* still while paused */
 }
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -263,14 +232,9 @@ static u32 s_second_v_frequency = 0;
 static u32 s_vblank_frequency   = 0;
 
 /* User command */
-#ifdef _WIN32
-static volatile LONG s_user_command = 0;
-#define GCM_USER_STORE(cmd) InterlockedExchange(&s_user_command, (LONG)(cmd))
-#else
 #include <stdatomic.h>
 static atomic_uint s_user_command = 0;
 #define GCM_USER_STORE(cmd) atomic_store(&s_user_command, (cmd))
-#endif
 /* Pending user commands, delivered IN ORDER by the pump. A single slot let a
  * second command overwrite the first before the pump ran -- and the pump only
  * runs when some guest thread crosses an HLE boundary, so that is common.
@@ -680,9 +644,6 @@ void cellGcmSetWaitFlip(void)
      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
      * to vsync; without it the guest loops unthrottled and many frames batch
      * into a single host present -> the console text stacks/duplicates. */
-#ifdef _WIN32
-    __declspec(dllimport) void __stdcall Sleep(unsigned long);
-#endif  /* elsewhere: runtime/platform/win32_compat.h */
     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
         Sleep(1);
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
@@ -731,16 +692,6 @@ u32 cellGcmGetFlipStatus(void)
  * or on a dedicated callback thread. The pump serializes guest handlers with
  * one another; it does not stop unrelated guest execution on other threads.
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-#include <windows.h>
-static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
-#define GCM_PENDING_SET(bits)  InterlockedOr(&s_gcm_pending, (bits))
-#define GCM_PENDING_TAKE()     InterlockedExchange(&s_gcm_pending, 0)
-#define GCM_PENDING_PEEK()     (s_gcm_pending != 0)
-static volatile LONG s_gcm_pumping = 0;
-#define GCM_PUMP_TRY_ENTER() (InterlockedCompareExchange(&s_gcm_pumping, 1, 0) == 0)
-#define GCM_PUMP_LEAVE()     InterlockedExchange(&s_gcm_pumping, 0)
-#else
 #include <stdatomic.h>
 static atomic_int s_gcm_pending = 0;
 #define GCM_PENDING_SET(bits)  atomic_fetch_or(&s_gcm_pending, (bits))
@@ -749,7 +700,6 @@ static atomic_int s_gcm_pending = 0;
 static atomic_flag s_gcm_pumping = ATOMIC_FLAG_INIT;
 #define GCM_PUMP_TRY_ENTER() (!atomic_flag_test_and_set_explicit(&s_gcm_pumping, memory_order_acquire))
 #define GCM_PUMP_LEAVE()     atomic_flag_clear_explicit(&s_gcm_pumping, memory_order_release)
-#endif
 
 /* Called by the vblank ticker thread. NO guest code -- advance the vblank count
  * and mark a vblank+flip tick pending for the main thread to deliver. */
@@ -881,17 +831,13 @@ static u32 gcm_io2ea(u32 io)
 /* RSX get pointer (IO offset) + one-deep CALL return slot. The FIFO-wrap
  * recycle path teleports these when it resets a ring without a JUMP command. */
 /* Milliseconds on a monotonic clock, for the runtime's own timeouts and rate
- * logs. Off Windows this returned 0, so every interval measured with it was
- * 0 there: rate logs never printed and timeouts never expired. */
+ * logs. A zero return here would make every interval measure as 0: rate logs
+ * never print and timeouts never expire. */
 unsigned long long ps3_ms_now(void)
 {
-#ifdef _WIN32
-    return (unsigned long long)GetTickCount64();
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
-#endif
 }
 
 static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
@@ -1011,29 +957,6 @@ static void nv3089_blit(void)
                      s_nv309e.active, 10);
           }
       } }
-    /* A copy out of a surface the live renderer drew exists only on the GPU;
-     * mirror 1:1 blits there too (the guest-memory copy below still runs). */
-    if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
-        rsx_live_draw_enabled()) {
-        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
-        const int sl = (s_nv3089.src_dma != 0xFEED0001u);
-        const int dl = (s_gcm2d.dst_dma  != 0xFEED0001u);
-        rsx_live_draw_blit(sl ? 0u : 1u, s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch,
-                           dl ? 0u : 1u, s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
-                                         + (s_nv3089.out_pt & 0xFFFF) * 4u, dst_pitch,
-                           out_w, out_h);
-    } else if (rsx_live_draw_enabled()) {
-        /* Scaled: a resolve. Copy it on the GPU into the display buffer; fall
-         * back to presenting the source when that cannot be done. */
-        const u32 sl = s_nv3089.src_dma != 0xFEED0001u ? 0u : 1u;
-        const u32 dl = s_gcm2d.dst_dma  != 0xFEED0001u ? 0u : 1u;
-        const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
-        const int rok = rsx_live_draw_resolve_blit(sl, s_nv3089.in_off + v0 * in_pitch + u0 * 4u, in_pitch,
-                                        s_nv3089.ds_dx, s_nv3089.dt_dy, dl, s_gcm2d.dst_offset,
-                                        dst_pitch, out_x, out_y, out_w, out_h);
-        if (!rok && s_nv3089.in_uv <= 0x00100010u && !s_nv3089.out_pt)
-            rsx_live_draw_note_resolve(sl, s_nv3089.in_off, dl, s_gcm2d.dst_offset);
-    }
     /* Only the 32-bit colour formats are handled; anything else would need a
      * per-format converter and is better skipped loudly than written wrong. */
     u32 f = s_nv3089.fmt & 0xFF;
@@ -1711,8 +1634,8 @@ static void gcm_rsx_process_fifo_unlocked(void);
  * present thread to run the FIFO walker NOW instead of on its next 16 ms
  * tick. A movie frame issues ~46 one-ahead cellGcmFinish waits; paying a
  * 16 ms tick per fence was ~0.75 s/frame (the 2 FPS intro). The walker (and
- * the D3D12 backend it feeds) stays on the present thread -- running it from
- * the polling game thread killed the process silently. */
+ * the backend it feeds) stays on the present thread -- running it from the
+ * polling game thread killed the process silently. */
 static HANDLE s_gcm_kick_ev = NULL;
 void* cellGcm_fifo_kick_event(void)
 {
@@ -1971,7 +1894,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                      getenv("GCM_VAL_WATCH") || getenv("GCM_SUBCH_HIST") || getenv("RSX_LIVE_FEED_DBG") ||
                      getenv("TCONST_FIFO") || getenv("RSX_TRACE") || getenv("GCM_ENGINE_ALL_SUBCH")) ? 1 : 0;
     const int fifo_fast = g_gcm_fifo_fast && !fifo_diag && rsx_draw_engine_enabled() &&
-                          !rsx_live_draw_enabled() && rsx_get_backend() == NULL;
+                          rsx_get_backend() == NULL;
     /* GCM_SUBCH1_2D, as the word loop reads it: subchannel 1 is 3D unless set
      * (Drakengard 3 sets it). */
     static int sub1_2d = -1;
@@ -2314,7 +2237,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * title may bind NV4097 to something other than subchannel 0.
                  * Twisted Metal uses subchannel 1, and caner (canersaka) hit
                  * the same thing in Yakuza Dead Souls, where SPU-built command
-                 * lists bind NV4097 elsewhere -- his rsx_live_draw.c masks the
+                 * lists bind NV4097 elsewhere -- the draw engine masks the
                  * subchannel out of the method for exactly this reason.
                  *
                  * gcm_2d_method only ever handles subchannels 2..7 (NV3062,
@@ -2348,18 +2271,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
                       if ((poll++ & 255u) == 0) { FILE* g = fopen(sg, "rb"); open_g = g != NULL; if (g) fclose(g); }
                       if (open_g) printf("[subch] %u 0x%04X = 0x%08X%c", subch, m, vm_read32(dea), 10);
                   } }
-                /* Mirror the whole method stream into the live NV4097->D3D12
-                 * engine (caner / canersaka). Inert unless RSX_LIVE_DRAW is set.
-                 * It wants the raw method with its subchannel bits -- it
-                 * canonicalises with & 0x1FFC itself. */
-                { static int live = -1;
-                  if (live < 0) live = rsx_live_draw_enabled();
-                  if (live) rsx_live_draw_method((subch << 13) | m, vm_read32(dea)); }
-
-                /* And into the platform-neutral register-file draw engine,
-                 * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
+                /* And into the platform-neutral register-file draw engine.
                  * It wants the raw method with its subchannel bits for the
-                 * same reason the live engine does, and masks them itself. */
+                 * same reason the walker does, and masks them itself. */
                 /* Only what the walker itself treats as NV4097 (subchannel 0, or
                  * 1 while that is routed to 3D) plus the driver methods
                  * (0xE9xx/0xEBxx, subchannel 7) that carry flips and user
@@ -2703,10 +2617,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
-#ifdef _WIN32
-    /* A ring-full recycle is waiting on this (WaitOnAddress): let it look now. */
-    if (s_recycle_in_progress) WakeByAddressAll((PVOID)&g_gcm_fifo_drained_ea);
-#endif
     s_last_why = why;
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
@@ -2799,29 +2709,10 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * would simply wait for the RSX here. */
     int spins = 0, total = 0;
     u32 seen = g_gcm_fifo_drained_ea;
-#ifdef _WIN32
-    /* Woken by the walker's drain (WakeByAddressAll above) instead of polling
-     * with Sleep(1): each poll cost a millisecond or two of timer granularity,
-     * several times per ring wrap in a busy scene. The limits are kept in real
-     * milliseconds. */
-    {
-        ULONGLONG t_progress = GetTickCount64(), t_start = t_progress;
-        while (g_gcm_fifo_drained_ea != begin) {
-            const ULONGLONG now = GetTickCount64();
-            if (now - t_progress >= 20000 || now - t_start >= 120000) break;
-            u32 cur = g_gcm_fifo_drained_ea;
-            if (cur != seen) { seen = cur; t_progress = now; }
-            if (g_gcm_fifo_kick_hook) g_gcm_fifo_kick_hook();
-            WaitOnAddress((volatile VOID*)&g_gcm_fifo_drained_ea, &cur, sizeof cur, 2);
-        }
-        spins = (int)(GetTickCount64() - t_start); total = spins;
-    }
-#else
     while (g_gcm_fifo_drained_ea != begin && spins < 20000 && total < 120000) {
         Sleep(1); spins++; total++;
         if (g_gcm_fifo_drained_ea != seen) { seen = g_gcm_fifo_drained_ea; spins = 0; }
     }
-#endif
     if (g_gcm_fifo_drained_ea != begin) {
         static int warned = 0;
         if (warned < 4 && ++warned)
@@ -2878,11 +2769,9 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
     s_display_buffers[bufferId].height = height;
     s_display_buffer_set[bufferId] = 1;
 
-    /* Tell the live engine too, or it has no registered scanout to present and
+    /* Tell the draw engine too, or it has no registered scanout to present and
      * falls back to whatever surface happens to be current. Display buffers are
      * always in RSX local memory (location 0). */
-    if (rsx_live_draw_enabled())
-        rsx_live_draw_set_display_buffer(bufferId, 0, offset, pitch, width, height);
     if (rsx_draw_engine_enabled())
         rsx_draw_engine_set_display_buffer(bufferId, 0, offset, pitch, width, height);
 
@@ -4246,7 +4135,7 @@ void rsx_reset_upload_claims(void)
  * syscalls instead of importing cellGcmSys, so none of the HLE entry points above
  * ever run. Everything the FIFO walker needs is still here -- it just has to be
  * reachable from the syscall layer. These four accessors are that surface; the
- * walker, the method decoder and rsx_live_draw are untouched.
+ * walker and the method decoder are untouched.
  * -----------------------------------------------------------------------*/
 
 /* Bring the GCM state up the way cellGcmInit would, minus the IO window (the

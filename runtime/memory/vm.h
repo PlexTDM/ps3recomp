@@ -1,8 +1,7 @@
 /*
  * ps3recomp - Virtual memory manager
  *
- * Manages the host-side mapping of the PS3's 32-bit address space.
- * On Windows uses VirtualAlloc; on POSIX uses mmap.
+ * Manages the host-side mapping of the PS3's 32-bit address space with mmap.
  *
  * PS3 memory map (simplified):
  *   0x00010000 - 0x0FFFFFFF : User-space (main memory, 256 MB)
@@ -11,7 +10,7 @@
  *   0xD0000000 - 0xDFFFFFFF : Stack area
  */
 
-#ifndef VM_H
+#if !defined(VM_H)
 #define VM_H
 
 #include "../../include/ps3emu/ps3types.h"
@@ -23,14 +22,9 @@
 #include <string.h>
 #include <assert.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <sys/mman.h>
   #include <signal.h>
   #include <unistd.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,25 +81,21 @@ extern uint32_t ppu_hle_inject_base;
 
 #define VM_PAGE_SIZE        0x00001000u      /* 4 KB: the GUEST page size */
 
-/* The HOST page size, which is what mprotect/VirtualProtect actually work in.
- * Windows and x86-64 Linux use 4 KB, so it used to be safe to assume the two
- * were the same number; Apple Silicon uses 16 KB, where an mprotect on a
- * 4 KB-aligned address fails with EINVAL and a 4 KB guard "page" is really a
- * 16 KB one that eats the bottom of the stack beside it. Everything that
- * changes protection goes through this, so guest-visible layout stays 4 KB
- * granular while the host operations are aligned to what the host needs. */
+/* The HOST page size, which is what mprotect actually works in. x86-64 Linux
+ * uses 4 KB, so it used to be safe to assume it matched the guest; aarch64
+ * Linux can use 16 KB, where an mprotect on a 4 KB-aligned address fails with
+ * EINVAL and a 4 KB guard "page" is really a 16 KB one that eats the bottom of
+ * the stack beside it. Everything that changes protection goes through this,
+ * so guest-visible layout stays 4 KB granular while the host operations are
+ * aligned to what the host needs. */
 static inline uint32_t vm_host_page_size(void)
 {
-#ifdef _WIN32
-    return VM_PAGE_SIZE;
-#else
     static uint32_t s_page = 0;
     if (!s_page) {
         long v = sysconf(_SC_PAGESIZE);
         s_page = (v > 0) ? (uint32_t)v : VM_PAGE_SIZE;
     }
     return s_page;
-#endif
 }
 
 /* Align a value up to `align` (must be power of 2) */
@@ -119,7 +109,6 @@ static inline uint32_t vm_host_page_size(void)
  * -----------------------------------------------------------------------*/
 extern uint8_t* vm_base;
 
-#ifndef _WIN32
 /* mprotect over the host pages covering [addr, addr+size). */
 static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
 {
@@ -128,7 +117,6 @@ static inline int vm__mprotect_pages(uint32_t addr, uint32_t size, int prot)
     uint64_t a1 = ((uint64_t)addr + size + pg - 1u) & ~(pg - 1u);
     return mprotect(vm_base + a0, (size_t)(a1 - a0), prot);
 }
-#endif
 
 /* Guest address-space size; set non-zero once the host has mapped guest memory
  * (ppu_loader.cpp). Under native-VA mapping vm_base is deliberately 0 (guest
@@ -165,47 +153,6 @@ static inline int32_t vm_init(void)
 {
     if (vm_base != NULL) return CELL_OK; /* already initialized */
 
-#ifdef _WIN32
-    /*
-     * Reserve a contiguous 4 GB region.  We only commit pages as needed.
-     * MEM_RESERVE just reserves address space without backing pages.
-     *
-     * Windows cannot release part of a reservation, so the equivalent of the
-     * POSIX trim below is to over-reserve, note where the aligned base falls,
-     * release the lot and re-reserve exactly there. Another allocation could
-     * take that address in between, hence the retries; on a 64-bit address
-     * space losing a race for an 8 GB hole repeatedly is not a real risk, but
-     * failing outright beats carrying on unaligned.
-     */
-    for (int attempt = 0; attempt < 8 && !vm_base; attempt++) {
-        uint8_t* probe = (uint8_t*)VirtualAlloc(NULL, (SIZE_T)(VM_TOTAL_SIZE * 2),
-                                                MEM_RESERVE, PAGE_NOACCESS);
-        if (!probe) break;
-        uint8_t* aligned = (uint8_t*)(((uintptr_t)probe + (uintptr_t)VM_TOTAL_SIZE - 1u)
-                                      & ~((uintptr_t)VM_TOTAL_SIZE - 1u));
-        VirtualFree(probe, 0, MEM_RELEASE);
-        vm_base = (uint8_t*)VirtualAlloc(aligned, (SIZE_T)VM_TOTAL_SIZE,
-                                         MEM_RESERVE, PAGE_NOACCESS);
-    }
-    if (!vm_base) return CELL_ENOMEM;
-
-    /* Commit main memory region (256 MB, read/write) */
-    if (!VirtualAlloc(vm_base + VM_MAIN_MEM_BASE, VM_MAIN_MEM_SIZE,
-                      MEM_COMMIT, PAGE_READWRITE)) {
-        VirtualFree(vm_base, 0, MEM_RELEASE);
-        vm_base = NULL;
-        return CELL_ENOMEM;
-    }
-
-    /* Commit stack region */
-    if (!VirtualAlloc(vm_base + VM_STACK_BASE, VM_STACK_REGION,
-                      MEM_COMMIT, PAGE_READWRITE)) {
-        VirtualFree(vm_base, 0, MEM_RELEASE);
-        vm_base = NULL;
-        return CELL_ENOMEM;
-    }
-
-#else /* POSIX */
     /* Over-map and trim: ask for twice the space, keep the 4 GB aligned window
      * inside it, and give the head and tail back. mmap can hand back part of a
      * mapping, so this needs no retry and cannot race. */
@@ -242,7 +189,6 @@ static inline int32_t vm_init(void)
         vm_base = NULL;
         return CELL_ENOMEM;
     }
-#endif
 
     /* The invariant every host-pointer-to-guest-address truncation rests on.
      * The reservations above hold it by construction; this is here so that a
@@ -264,11 +210,7 @@ static inline void vm_shutdown(void)
 {
     if (!vm_base) return;
 
-#ifdef _WIN32
-    VirtualFree(vm_base, 0, MEM_RELEASE);
-#else
     munmap(vm_base, (size_t)VM_TOTAL_SIZE);
-#endif
 
     vm_base = NULL;
 }
@@ -282,16 +224,8 @@ static inline int32_t vm_commit(uint32_t addr, uint32_t size)
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
-#ifdef _WIN32
-    /* Reserved pages only: re-committing a committed page resets its
-     * protection, and a page the texture write-watch protected (a freed
-     * texture's memory being reallocated) would then take writes without
-     * faulting -- the engine kept drawing its old contents. */
-    if (!vm_commit_reserved(vm_base + addr, size)) return CELL_ENOMEM;
-#else
     if (vm__mprotect_pages(addr, size, PROT_READ | PROT_WRITE) != 0)
         return CELL_ENOMEM;
-#endif
 
     return CELL_OK;
 }
@@ -301,18 +235,6 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
     if (!VM_READY) return CELL_EFAULT;
     size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
 
-#ifdef _WIN32
-    DWORD prot = PAGE_NOACCESS;
-    if (read && write && exec) prot = PAGE_EXECUTE_READWRITE;
-    else if (read && write)    prot = PAGE_READWRITE;
-    else if (read && exec)     prot = PAGE_EXECUTE_READ;
-    else if (read)             prot = PAGE_READONLY;
-    else if (exec)             prot = PAGE_EXECUTE;
-
-    DWORD old;
-    if (!VirtualProtect(vm_base + addr, size, prot, &old))
-        return CELL_EFAULT;
-#else
     int prot = PROT_NONE;
     if (read)  prot |= PROT_READ;
     if (write) prot |= PROT_WRITE;
@@ -320,7 +242,6 @@ static inline int32_t vm_protect(uint32_t addr, uint32_t size, int read, int wri
 
     if (vm__mprotect_pages(addr, size, prot) != 0)
         return CELL_EFAULT;
-#endif
 
     return CELL_OK;
 }
@@ -428,4 +349,4 @@ static inline int vm_is_valid_addr(uint32_t addr)
 } /* extern "C" */
 #endif
 
-#endif /* VM_H */
+#endif

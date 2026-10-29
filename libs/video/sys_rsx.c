@@ -5,19 +5,19 @@
  *
  * Every ps3recomp port so far reaches RSX through the HLE cellGcmSys imports:
  * the title calls cellGcmSetDrawArrays & friends, libs/video/cellGcmSys.c owns
- * the FIFO, its walker decodes the method stream and feeds rsx_live_draw. That
- * only works for a title that *imports* cellGcmSys.
+ * the FIFO, its walker decodes the method stream and feeds the draw engine.
+ * That only works for a title that *imports* cellGcmSys.
  *
  * A PS3 FIRMWARE module does not. /dev_flash/ps1emu/ps1_netemu.self (the PS1
  * emulator PSOne Classics run under) links libgcm statically -- the library's
  * own debug assertions are still in the image -- and talks to the GPU through
  * the kernel. No import to hook, so the whole HLE layer is bypassed and the
- * live draw engine has nothing to walk.
+ * draw engine has nothing to walk.
  *
  * This file is the missing bottom half. It is a thin bridge, not a second RSX:
  * every handler routes into the state cellGcmSys.c already keeps, so the FIFO
- * walker, the NV4097 method decoder, the D3D12 backend and RSX_LIVE_DRAW=1 are
- * all unchanged. The tap point moves down a layer; nothing else moves.
+ * walker, the NV4097 method decoder and the platform backend are all
+ * unchanged. The tap point moves down a layer; nothing else moves.
  *
  * THE CONTRACT, AND WHERE IT COMES FROM
  *

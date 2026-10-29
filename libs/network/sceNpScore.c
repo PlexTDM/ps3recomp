@@ -33,14 +33,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-static void sleep_10ms(void) { Sleep(10); }
-#else
 #  include <time.h>
 static void sleep_10ms(void) { struct timespec ts = { 0, 10000000L }; nanosleep(&ts, NULL); }
-#endif
 
 #define SCORE_ERROR_NO_SERVER      0x8002A1A1u   /* community server error: unavailable */
 #define SCORE_ERROR_INVALID_ID     0x8002A106u

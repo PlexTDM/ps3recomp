@@ -15,8 +15,8 @@
  *     $FLOW/prx/libsre_ns/ppu_recomp.c \
  *     $PS3RECOMP_DIR/runtime/prx/tests/test_prx_loader.cpp \
  *     -I$PS3RECOMP_DIR/runtime/prx -I$FLOW/prx/libsre_ns \
- *     -o test_prx_loader.exe
- *   ./test_prx_loader.exe <path to libsre.linked.bin>
+ *     -o test_prx_loader
+ *   ./test_prx_loader <path to libsre.linked.bin>
  */
 #include "ppu_recomp.h"      /* libsre header: ppu_context, func_entry,
                                 libsre_function_table[] (extern "C") */
@@ -25,7 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
-#include <windows.h>
+#include <sys/mman.h>
 
 /* libsre's namespaced table (declared extern "C" in its header). */
 extern "C" const func_entry libsre_function_table[];
@@ -72,10 +72,11 @@ int main(int argc, char** argv) {
     /* Reserve guest address space (like the real runtime) and commit just the
      * PRX window — reserving 0x30000000+ costs only address space, not RAM. */
     const size_t span = (size_t)BASE + 0x00100000;
-    vm_base = (uint8_t*)VirtualAlloc(nullptr, span, MEM_RESERVE, PAGE_NOACCESS);
-    if (!vm_base) { fprintf(stderr, "VirtualAlloc reserve failed\n"); return 2; }
-    if (!VirtualAlloc(vm_base + BASE, 0x00080000, MEM_COMMIT, PAGE_READWRITE)) {
-        fprintf(stderr, "VirtualAlloc commit failed\n"); return 2;
+    vm_base = (uint8_t*)mmap(nullptr, span, PROT_NONE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (vm_base == MAP_FAILED) { fprintf(stderr, "mmap reserve failed\n"); return 2; }
+    if (mprotect(vm_base + BASE, 0x00080000, PROT_READ | PROT_WRITE) != 0) {
+        fprintf(stderr, "mprotect commit failed\n"); return 2;
     }
 
     uint32_t img_size = 0;

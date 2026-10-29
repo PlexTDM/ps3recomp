@@ -28,7 +28,7 @@ Primary contracts at RPCS3 ffba2bf09ef3980638f9327b25240d81414034ab:
 
 Synthetic `test_rsx_texture_gamma.c` exercises real production dispatch/cache,
 format and remap state, all 16 masks, supported fetch types, explicit failures
-and source-byte compatibility. Its Metal companion consumes these generated
+and source-byte compatibility. The draw-engine tests consume these generated
 shaders on units 0 and 15 with asymmetric bilinear samples and a nonidentity
 resource crossbar. Float observation targets expose arithmetic differences.
 These are translated GPU checks, not original RSX hardware or scene claims.

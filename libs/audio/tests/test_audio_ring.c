@@ -1,7 +1,7 @@
 /* Exercise the real mixer across ring wraps, without starting a device/thread.
- * macOS: clang -std=gnu17 -I include -I /opt/homebrew/include
- *   libs/audio/tests/test_audio_ring.c -L /opt/homebrew/lib -lSDL2
- *   -Wl,-dead_strip -o /tmp/test_audio_ring && /tmp/test_audio_ring
+ * clang -std=gnu17 -I include $(pkg-config --cflags SDL2)
+ *   libs/audio/tests/test_audio_ring.c $(pkg-config --libs SDL2)
+ *   -Wl,--gc-sections -o /tmp/test_audio_ring && /tmp/test_audio_ring
  */
 #include "../cellAudio.c"
 #include <assert.h>

@@ -5,7 +5,7 @@
  * for translating between PS3 (big-endian) and host (little-endian) byte order.
  */
 
-#ifndef PS3EMU_ENDIAN_H
+#if !defined(PS3EMU_ENDIAN_H)
 #define PS3EMU_ENDIAN_H
 
 #include <stdint.h>
@@ -15,14 +15,7 @@
  * Platform intrinsics
  * -----------------------------------------------------------------------*/
 
-#if defined(_MSC_VER)
-  #include <stdlib.h>   /* _byteswap_* */
-
-  static inline uint16_t ps3_bswap16(uint16_t v) { return _byteswap_ushort(v); }
-  static inline uint32_t ps3_bswap32(uint32_t v) { return _byteswap_ulong(v);  }
-  static inline uint64_t ps3_bswap64(uint64_t v) { return _byteswap_uint64(v); }
-
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
 
   static inline uint16_t ps3_bswap16(uint16_t v) { return __builtin_bswap16(v); }
   static inline uint32_t ps3_bswap32(uint32_t v) { return __builtin_bswap32(v); }
@@ -114,4 +107,4 @@ inline T host_to_be(T v) { return byte_swap<T>(v); }
 } /* namespace ps3 */
 
 #endif /* __cplusplus */
-#endif /* PS3EMU_ENDIAN_H */
+#endif

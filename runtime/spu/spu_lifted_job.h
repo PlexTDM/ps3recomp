@@ -10,7 +10,7 @@
  * `user` = the lifted entry fn; lv2's spu_fallback_thread_proc then calls it with
  * (tid, args_ea, args_size, user), and we run the lifted job on that thread's LS.
  */
-#ifndef SPU_LIFTED_JOB_H
+#if !defined(SPU_LIFTED_JOB_H)
 #define SPU_LIFTED_JOB_H
 
 #include "spu_context.h"
@@ -156,11 +156,7 @@ typedef struct spu_run_opts {
  * a SPURS task with no persistent LS): the 256 KB copy back out is skipped.
  * Thread-local, read once per run; every other caller leaves it 0. */
 extern
-#ifdef _MSC_VER
-__declspec(thread)
-#else
 _Thread_local
-#endif
 int g_spu_job_ls_discard;
 
 static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
@@ -384,4 +380,4 @@ static inline int32_t spu_run_lifted_job(spu_lifted_entry_fn entry,
 int32_t spu_lifted_fallback(uint32_t tid, uint32_t args_ea,
                             uint32_t args_size, void* user);
 
-#endif /* SPU_LIFTED_JOB_H */
+#endif

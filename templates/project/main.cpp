@@ -23,9 +23,7 @@
  * shape for that. It was copied faithfully, comments and all. If a pacing bug
  * is fixed in one of the two, look at the other.
  *
- * This builds on Windows, macOS and Linux. CI builds and runs it against the
- * boot smoke title on the last two, and compile-checks it against clang-cl on
- * the first (tools/check_ppu_scaffold.py).
+ * This targets Linux. CI builds and runs it against the boot smoke title.
  */
 
 /* The lifter's generated header, which declares ppu_context and the function
@@ -33,9 +31,9 @@
 #include "ppu_recomp.h"
 
 /* The Win32 names -- Sleep, GetTickCount64, CreateThread, InterlockedIncrement,
- * VirtualAlloc, the scalar typedefs -- from one place. On Windows this is a
- * passthrough to <windows.h>; off Windows the toolkit's shim supplies the same
- * names over pthreads and mmap, so the call sites below are written once. */
+ * VirtualAlloc, the scalar typedefs -- come from one place: the toolkit's shim
+ * supplies them over pthreads and mmap, so the call sites below are written
+ * once. */
 #include "win32_compat.h"
 
 #include <stdint.h>
@@ -43,14 +41,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-/* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
- * excludes the multimedia timer API, so it is asked for by name -- and after
- * windows.h, since timeapi.h uses UINT. No shim exists off Windows because
- * there is nothing to shim: the 15.6 ms default timer granularity this works
- * around is a Windows problem. */
-#include <timeapi.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * What the scaffold gives this file
@@ -101,27 +91,9 @@ unsigned cellGcm_flip_request_count(void);
 /* ---------------------------------------------------------------------------
  * RSX present backend
  * -----------------------------------------------------------------------*/
-/* D3D12 on Windows, Metal on Apple, and the null backend's headless software
- * path anywhere else -- the same selection runtime/host/host_posix.c and the
- * toolkit's boot harness make. All three expose the same three entry points,
- * so the frame clock below is backend-agnostic. */
-#if defined(_WIN32)
-extern "C" int  rsx_d3d12_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_d3d12_backend_present(void);
-extern "C" int  rsx_d3d12_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_d3d12_backend_init
-#  define rsx_backend_present rsx_d3d12_backend_present
-#  define rsx_backend_pump    rsx_d3d12_backend_pump_messages
-#  define RSX_BACKEND_NAME    "D3D12"
-#elif defined(__APPLE__)
-extern "C" int  rsx_metal_backend_init(uint32_t w, uint32_t h, const char* title);
-extern "C" void rsx_metal_backend_present(void);
-extern "C" int  rsx_metal_backend_pump_messages(void);
-#  define rsx_backend_init    rsx_metal_backend_init
-#  define rsx_backend_present rsx_metal_backend_present
-#  define rsx_backend_pump    rsx_metal_backend_pump_messages
-#  define RSX_BACKEND_NAME    "Metal"
-#else
+/* The null backend's headless software path, the same selection
+ * runtime/host/host_posix.c and the toolkit's boot harness make. Its three
+ * entry points keep the frame clock below backend-agnostic. */
 extern "C" int  rsx_null_backend_init(uint32_t w, uint32_t h, const char* title);
 extern "C" void rsx_null_backend_present(void);
 extern "C" int  rsx_null_backend_pump_messages(void);
@@ -129,7 +101,6 @@ extern "C" int  rsx_null_backend_pump_messages(void);
 #  define rsx_backend_present rsx_null_backend_present
 #  define rsx_backend_pump    rsx_null_backend_pump_messages
 #  define RSX_BACKEND_NAME    "null (headless software)"
-#endif
 
 /* ---------------------------------------------------------------------------
  * Configuration
@@ -264,40 +235,14 @@ static void derive_vfs_root(const char* eboot)
 /* ---------------------------------------------------------------------------
  * Guest VM
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-/* Demand-paging for the flat VM: reserve the whole 4 GB guest space, which
- * costs no commit, and commit each 64 KB page on first access. Every 32-bit
- * guest offset is then valid, so a garbage guest pointer reads zero instead of
- * killing the process. Faults outside the arena fall through untouched. */
-static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
-{
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        ULONG_PTR fault = ep->ExceptionRecord->ExceptionInformation[1];
-        uintptr_t base  = (uintptr_t)vm_base;
-        if (vm_base && fault >= base && fault < base + VM_SIZE) {
-            void* page = (void*)(fault & ~(uintptr_t)0xFFFF);
-            if (VirtualAlloc(page, 0x10000, MEM_COMMIT, PAGE_READWRITE))
-                return EXCEPTION_CONTINUE_EXECUTION;
-        }
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-#endif
 
 static bool alloc_guest_vm(void)
 {
-#ifdef _WIN32
-    AddVectoredExceptionHandler(1, vm_commit_veh);
-    vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
-    ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
-#else
-    /* No vectored exception handlers off Windows, so the arena is committed up
-     * front and lazily backed by the OS: only pages the title touches cost
-     * anything. It stops below the 0xE0000000 mark, so ppu_vm_size arms the
-     * loader's bounds check for what is left. */
+    /* The arena is committed up front and lazily backed by the OS: only pages
+     * the title touches cost anything. It stops below the 0xE0000000 mark, so
+     * ppu_vm_size arms the loader's bounds check for what is left. */
     vm_base = (uint8_t*)calloc(1, 0xE0000000u);
     ppu_vm_size = 0xE0000000u;
-#endif
     return vm_base != nullptr;
 }
 
@@ -318,14 +263,6 @@ int main(int argc, char** argv)
         return 2;
     }
 
-#ifdef _WIN32
-#pragma comment(lib, "winmm.lib")
-    /* 1 ms timer resolution. The default granularity is about 15.6 ms, which
-     * inflates every shorter wait the title makes and throttles the whole
-     * thing. POSIX timers are already fine-grained. */
-    timeBeginPeriod(1);
-    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: do not lose prints on a kill */
-#endif
 
     printf("=== ps3recomp game runner ===\n");
 

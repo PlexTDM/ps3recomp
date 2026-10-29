@@ -559,62 +559,7 @@ extern void tsp_spu_func_00000A00(spu_context*);
 /* pm-flow hang watchdog: dump the traced run's partial transfer trail + live
  * ctx state 5s after arm if the run hasn't returned (g_pm_flow_ctx still set).
  * Reads of the running ctx are racy by design -- diagnostic only. */
-#ifdef _WIN32
-#include <windows.h>
-static DWORD WINAPI spurs_pm_flow_watchdog(LPVOID p)
-{
-    (void)p;
-    extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
-    extern void* volatile g_pm_flow_ctx;
-    Sleep(5000);
-    spu_context* ctx = (spu_context*)g_pm_flow_ctx;
-    if (!ctx) { fprintf(stderr, "[pm-flow] watchdog: run returned (no hang)\n"); return 0; }
-    unsigned n = g_pm_flow_n; if (n > 8192) n = 8192;
-    fprintf(stderr, "[pm-flow] HUNG-RUN PARTIAL: %u transfers, live pc=0x%05X "
-            "LS12A0=%02X%02X LS12C0=%02X%02X LS12F0=%02X%02X%02X%02X LS1300=%02X%02X:",
-            n, ctx->pc & SPU_LS_MASK,
-            ctx->ls[0x12A0], ctx->ls[0x12A1],
-            ctx->ls[0x12C0], ctx->ls[0x12C1],
-            ctx->ls[0x12F0], ctx->ls[0x12F1], ctx->ls[0x12F2], ctx->ls[0x12F3],
-            ctx->ls[0x1300], ctx->ls[0x1301]);
-    /* Pipeline-state hex dump: batch commands (0xC00), per-slot records (0xDF0),
-     * staging ring (0xEB0), FFFF markers (0x11B0), scheduler vars (0x1270-0x1340),
-     * queue caches (0x13B0-0x1520). One shot -- everything the state-2 cycle's
-     * stage decision reads, so the divergent condition can be hand-simulated. */
-    { static const struct { uint32_t a, len; const char* tag; } R[] = {
-          { 0xC00, 0x60, "cmds" }, { 0xDF0, 0x40, "rec" }, { 0xEB0, 0x40, "ring" },
-          { 0x11B0, 0x20, "mark" }, { 0x1270, 0x40, "sched" }, { 0x12C0, 0x50, "state" },
-          { 0x13B0, 0x30, "qvar" }, { 0x14A0, 0x30, "qcache" }, { 0x1440, 0x40, "batchrec" } };
-      for (unsigned r = 0; r < sizeof R / sizeof R[0]; r++) {
-          fprintf(stderr, "\n[pm-ls] %-8s 0x%04X:", R[r].tag, R[r].a);
-          for (uint32_t o = 0; o < R[r].len; o += 4) {
-              if (o && (o & 15) == 0) fprintf(stderr, " |");
-              fprintf(stderr, " %02X%02X%02X%02X",
-                      ctx->ls[R[r].a+o], ctx->ls[R[r].a+o+1],
-                      ctx->ls[R[r].a+o+2], ctx->ls[R[r].a+o+3]);
-          }
-      }
-      fprintf(stderr, "\n"); }
-    uint32_t last = 0xFFFFFFFFu; unsigned rep = 0; unsigned col = 0;
-    for (unsigned i = 0; i < n; i++) {
-        uint32_t pc = g_pm_flow_buf[i] & SPU_LS_MASK;
-        if (pc == last) { rep++; continue; }
-        if (rep) { fprintf(stderr, "*%u", rep + 1); rep = 0; }
-        fprintf(stderr, "%s%05X", (col++ % 16) ? " " : "\n  ", pc);
-        last = pc;
-    }
-    if (rep) fprintf(stderr, "*%u", rep + 1);
-    fprintf(stderr, "\n"); fflush(stderr);
-    return 0;
-}
-void spurs_pm_flow_watchdog_start(void)
-{
-    HANDLE h = CreateThread(NULL, 0, spurs_pm_flow_watchdog, NULL, 0, NULL);
-    if (h) CloseHandle(h);
-}
-#else
 void spurs_pm_flow_watchdog_start(void) {}
-#endif
 
 int spurs_run_taskset_policy_probe(uint32_t taskset_ea, uint32_t taskid,
                                    uint32_t spurs_ea, uint64_t wkl_data,

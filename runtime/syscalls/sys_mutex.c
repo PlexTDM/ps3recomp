@@ -3,7 +3,6 @@
  */
 
 #include "sys_mutex.h"
-#include "../platform/darwin_compat.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
@@ -14,33 +13,16 @@
  * -----------------------------------------------------------------------*/
 sys_mutex_info g_sys_mutexes[SYS_MUTEX_MAX];
 
-#ifdef _WIN32
-static CRITICAL_SECTION s_mtx_table_lock;
-static int              s_mtx_table_lock_init = 0;
-#else
 static pthread_mutex_t  s_mtx_table_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 static void mtx_table_lock(void)
 {
-#ifdef _WIN32
-    if (!s_mtx_table_lock_init) {
-        InitializeCriticalSection(&s_mtx_table_lock);
-        s_mtx_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_mtx_table_lock);
-#else
     pthread_mutex_lock(&s_mtx_table_lock);
-#endif
 }
 
 static void mtx_table_unlock(void)
 {
-#ifdef _WIN32
-    LeaveCriticalSection(&s_mtx_table_lock);
-#else
     pthread_mutex_unlock(&s_mtx_table_lock);
-#endif
 }
 
 static int mtx_find_free(void)
@@ -56,7 +38,7 @@ static int mtx_find_free(void)
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
@@ -92,7 +74,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
         /* protocol is at offset 0 (u32 BE) */
         uint32_t proto_be;
         memcpy(&proto_be, attr_raw + 0, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
@@ -101,7 +83,7 @@ int64_t sys_mutex_create(ppu_context* ctx)
         /* recursive flag at offset 4 (u32 BE) */
         uint32_t rec_be;
         memcpy(&rec_be, attr_raw + 4, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         rec_be = ((rec_be >> 24) & 0xFF) | ((rec_be >> 8) & 0xFF00) |
                  ((rec_be << 8) & 0xFF0000) | ((rec_be << 24) & 0xFF000000u);
 #endif
@@ -112,10 +94,6 @@ int64_t sys_mutex_create(ppu_context* ctx)
     }
 
     /* Initialize host mutex */
-#ifdef _WIN32
-    InitializeCriticalSection(&m->cs);
-    m->wait_handle = CreateEventA(NULL, FALSE, TRUE, NULL);
-#else
     {
         pthread_mutexattr_t mattr;
         pthread_mutexattr_init(&mattr);
@@ -127,7 +105,6 @@ int64_t sys_mutex_create(ppu_context* ctx)
         pthread_mutex_init(&m->mtx, &mattr);
         pthread_mutexattr_destroy(&mattr);
     }
-#endif
 
     /* Write mutex ID (slot + 1) to guest */
     uint32_t mutex_id = (uint32_t)(slot + 1);
@@ -159,12 +136,7 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    DeleteCriticalSection(&m->cs);
-    if (m->wait_handle) CloseHandle(m->wait_handle);
-#else
     pthread_mutex_destroy(&m->mtx);
-#endif
 
     m->active = 0;
     mtx_table_unlock();
@@ -195,28 +167,6 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
-#ifdef _WIN32
-    if (timeout_us == 0) {
-        /* Infinite wait */
-        EnterCriticalSection(&m->cs);
-    } else {
-        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
-         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
-         * and slept a full tick per retry, overshooting sub-ms timeouts by
-         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
-         * holder can run; Sleep(1) only for waits long enough to absorb it.
-         * Safe to poll: TryEnterCriticalSection's success IS the atomic
-         * acquire, so there's no separate signal to miss between polls. */
-        int64_t deadline = lv2_usec_deadline(timeout_us);
-        while (!TryEnterCriticalSection(&m->cs)) {
-            if (lv2_deadline_passed(deadline)) {
-                return (int64_t)(int32_t)CELL_ETIMEDOUT;
-            }
-            if (timeout_us < 1000) SwitchToThread();
-            else                   Sleep(1);
-        }
-    }
-#else
     if (timeout_us == 0) {
         pthread_mutex_lock(&m->mtx);
     } else {
@@ -233,7 +183,6 @@ int64_t sys_mutex_lock(ppu_context* ctx)
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     }
-#endif
 
     m->owner_tid = caller_tid;
     m->lock_count++;
@@ -268,9 +217,6 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
      * EnterCriticalSection by the current owner is itself recursive and
      * never blocks, so this is safe and cheap. */
     if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
-#ifdef _WIN32
-        EnterCriticalSection(&m->cs);
-#else
         /* Same reasoning, and it applies here: create() gives a recursive
          * guest mutex a PTHREAD_MUTEX_RECURSIVE host mutex, so the owner
          * re-locking it bumps the host recursion count and never blocks.
@@ -280,21 +226,14 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
          * dropped the host mutex entirely and another thread could enter
          * while the guest still believed it held the mutex. */
         pthread_mutex_lock(&m->mtx);
-#endif
         m->lock_count++;
         return CELL_OK;
     }
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&m->cs)) {
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-#else
     int rc = pthread_mutex_trylock(&m->mtx);
     if (rc != 0) {
         return (int64_t)(int32_t)CELL_EBUSY;
     }
-#endif
 
     m->owner_tid = caller_tid;
     m->lock_count++;
@@ -333,11 +272,7 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
         m->owner_tid = 0;
     }
 
-#ifdef _WIN32
-    LeaveCriticalSection(&m->cs);
-#else
     pthread_mutex_unlock(&m->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -349,12 +284,6 @@ void sys_mutex_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_mutexes, 0, sizeof(g_sys_mutexes));
 
-#ifdef _WIN32
-    if (!s_mtx_table_lock_init) {
-        InitializeCriticalSection(&s_mtx_table_lock);
-        s_mtx_table_lock_init = 1;
-    }
-#endif
 
     lv2_syscall_register(tbl, SYS_MUTEX_CREATE,  sys_mutex_create);
     lv2_syscall_register(tbl, SYS_MUTEX_DESTROY, sys_mutex_destroy);

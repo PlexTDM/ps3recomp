@@ -1,26 +1,19 @@
 /*
  * ps3recomp - cellSync2 HLE implementation
  *
- * Extended sync primitives using host OS primitives.
- * Windows: SRWLOCK, CONDITION_VARIABLE
- * Unix: pthread_mutex, pthread_cond, ps3_sem_t (runtime/platform/posix_sem.h)
+ * Extended sync primitives using host OS primitives:
+ * pthread_mutex, pthread_cond, ps3_sem_t (runtime/platform/posix_sem.h)
  */
 
 #include "cellSync2.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
-#include "../../runtime/platform/darwin_compat.h"
 #include <stdio.h>
 #include <string.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <pthread.h>
-#include "../../runtime/platform/posix_sem.h"   /* sem_init is ENOSYS on Darwin */
+#include "../../runtime/platform/posix_sem.h"   /* portable timed semaphore */
 #include <errno.h>
 #include <time.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal layout overlaid on opaque buffers
@@ -31,32 +24,20 @@ typedef struct Sync2MutexInternal {
     u32 recursive;
     u32 lockCount;    /* for recursive */
     u32 ownerThread;  /* simplified - not truly thread-safe ID */
-#ifdef _WIN32
-    CRITICAL_SECTION cs;
-#else
     pthread_mutex_t mtx;
-#endif
 } Sync2MutexInternal;
 
 typedef struct Sync2CondInternal {
     u32 initialized;
     Sync2MutexInternal* mutex;
-#ifdef _WIN32
-    CONDITION_VARIABLE cv;
-#else
     pthread_cond_t cv;
-#endif
 } Sync2CondInternal;
 
 typedef struct Sync2SemInternal {
     u32 initialized;
     s32 value;
     s32 maxValue;
-#ifdef _WIN32
-    HANDLE sem;
-#else
     ps3_sem_t sem;
-#endif
 } Sync2SemInternal;
 
 typedef struct Sync2QueueInternal {
@@ -67,15 +48,9 @@ typedef struct Sync2QueueInternal {
     u32 depth;
     u32 elemSize;
     u8* buffer;
-#ifdef _WIN32
-    CRITICAL_SECTION cs;
-    CONDITION_VARIABLE notFull;
-    CONDITION_VARIABLE notEmpty;
-#else
     pthread_mutex_t mtx;
     pthread_cond_t notFull;
     pthread_cond_t notEmpty;
-#endif
 } Sync2QueueInternal;
 
 /* Compile-time size checks */
@@ -111,16 +86,12 @@ s32 cellSync2MutexInit(CellSync2Mutex* mutex, const CellSync2MutexAttribute* att
     m->recursive = attr ? attr->recursive : 0;
     m->initialized = 1;
 
-#ifdef _WIN32
-    InitializeCriticalSection(&m->cs);
-#else
     pthread_mutexattr_t mattr;
     pthread_mutexattr_init(&mattr);
     if (m->recursive)
         pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&m->mtx, &mattr);
     pthread_mutexattr_destroy(&mattr);
-#endif
 
     return CELL_OK;
 }
@@ -133,31 +104,13 @@ s32 cellSync2MutexLock(CellSync2Mutex* mutex, u64 timeoutUsec)
 
     if (timeoutUsec == 0) {
         /* Non-blocking: try once */
-#ifdef _WIN32
-        if (!TryEnterCriticalSection(&m->cs))
-            return CELL_SYNC2_ERROR_BUSY;
-#else
         if (pthread_mutex_trylock(&m->mtx) != 0)
             return CELL_SYNC2_ERROR_BUSY;
-#endif
     } else if (timeoutUsec == (u64)-1) {
         /* Infinite wait */
-#ifdef _WIN32
-        EnterCriticalSection(&m->cs);
-#else
         pthread_mutex_lock(&m->mtx);
-#endif
     } else {
         /* Timed wait: spin with yield until timeout */
-#ifdef _WIN32
-        ULONGLONG start = GetTickCount64();
-        ULONGLONG deadline_ms = timeoutUsec / 1000;
-        while (!TryEnterCriticalSection(&m->cs)) {
-            if (GetTickCount64() - start >= deadline_ms)
-                return CELL_SYNC2_ERROR_BUSY;
-            SwitchToThread();
-        }
-#else
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += (time_t)(timeoutUsec / 1000000);
@@ -168,7 +121,6 @@ s32 cellSync2MutexLock(CellSync2Mutex* mutex, u64 timeoutUsec)
         }
         if (pthread_mutex_timedlock(&m->mtx, &ts) != 0)
             return CELL_SYNC2_ERROR_BUSY;
-#endif
     }
 
     return CELL_OK;
@@ -180,13 +132,8 @@ s32 cellSync2MutexTryLock(CellSync2Mutex* mutex)
     Sync2MutexInternal* m = (Sync2MutexInternal*)mutex;
     if (!m->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&m->cs))
-        return CELL_SYNC2_ERROR_BUSY;
-#else
     if (pthread_mutex_trylock(&m->mtx) != 0)
         return CELL_SYNC2_ERROR_BUSY;
-#endif
 
     return CELL_OK;
 }
@@ -197,11 +144,7 @@ s32 cellSync2MutexUnlock(CellSync2Mutex* mutex)
     Sync2MutexInternal* m = (Sync2MutexInternal*)mutex;
     if (!m->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    LeaveCriticalSection(&m->cs);
-#else
     pthread_mutex_unlock(&m->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -230,11 +173,7 @@ s32 cellSync2CondInit(CellSync2Cond* cond, CellSync2Mutex* mutex,
     c->mutex = (Sync2MutexInternal*)mutex;
     c->initialized = 1;
 
-#ifdef _WIN32
-    InitializeConditionVariable(&c->cv);
-#else
     pthread_cond_init(&c->cv, NULL);
-#endif
 
     return CELL_OK;
 }
@@ -245,13 +184,6 @@ s32 cellSync2CondWait(CellSync2Cond* cond, u64 timeoutUsec)
     Sync2CondInternal* c = (Sync2CondInternal*)cond;
     if (!c->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
-    if (!SleepConditionVariableCS(&c->cv, &c->mutex->cs, ms))
-        return (GetLastError() == ERROR_TIMEOUT)
-               ? CELL_SYNC2_ERROR_TIMEDOUT
-               : CELL_SYNC2_ERROR_STAT;
-#else
     if (timeoutUsec == 0) {
         pthread_cond_wait(&c->cv, &c->mutex->mtx);
     } else {
@@ -267,7 +199,6 @@ s32 cellSync2CondWait(CellSync2Cond* cond, u64 timeoutUsec)
         if (rc == ETIMEDOUT)
             return CELL_SYNC2_ERROR_TIMEDOUT;
     }
-#endif
 
     return CELL_OK;
 }
@@ -278,11 +209,7 @@ s32 cellSync2CondSignal(CellSync2Cond* cond)
     Sync2CondInternal* c = (Sync2CondInternal*)cond;
     if (!c->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    WakeConditionVariable(&c->cv);
-#else
     pthread_cond_signal(&c->cv);
-#endif
 
     return CELL_OK;
 }
@@ -293,11 +220,7 @@ s32 cellSync2CondSignalAll(CellSync2Cond* cond)
     Sync2CondInternal* c = (Sync2CondInternal*)cond;
     if (!c->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    WakeAllConditionVariable(&c->cv);
-#else
     pthread_cond_broadcast(&c->cv);
-#endif
 
     return CELL_OK;
 }
@@ -327,13 +250,8 @@ s32 cellSync2SemaphoreInit(CellSync2Semaphore* sem, s32 initialValue,
     s->maxValue = attr ? attr->maxValue : 0x7FFFFFFF;
     s->initialized = 1;
 
-#ifdef _WIN32
-    s->sem = CreateSemaphoreW(NULL, initialValue, s->maxValue, NULL);
-    if (!s->sem) return CELL_SYNC2_ERROR_STAT;
-#else
     if (ps3_sem_init(&s->sem, (unsigned)initialValue) != 0)
         return CELL_SYNC2_ERROR_STAT;
-#endif
 
     return CELL_OK;
 }
@@ -346,12 +264,6 @@ s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
     if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
     for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
-        DWORD rc = WaitForSingleObject(s->sem, ms);
-        if (rc == WAIT_TIMEOUT) return CELL_SYNC2_ERROR_TIMEDOUT;
-        if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
-#else
         if (timeoutUsec == 0) {
             ps3_sem_wait(&s->sem);
         } else {
@@ -368,7 +280,6 @@ s32 cellSync2SemaphoreAcquire(CellSync2Semaphore* sem, u32 count,
                 return CELL_SYNC2_ERROR_STAT;
             }
         }
-#endif
     }
 
     return CELL_OK;
@@ -381,16 +292,10 @@ s32 cellSync2SemaphoreTryAcquire(CellSync2Semaphore* sem, u32 count)
     if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
     for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        DWORD rc = WaitForSingleObject(s->sem, 0);
-        if (rc == WAIT_TIMEOUT) return CELL_SYNC2_ERROR_BUSY;
-        if (rc != WAIT_OBJECT_0) return CELL_SYNC2_ERROR_STAT;
-#else
         if (ps3_sem_trywait(&s->sem) != 0) {
             if (errno == EAGAIN) return CELL_SYNC2_ERROR_BUSY;
             return CELL_SYNC2_ERROR_STAT;
         }
-#endif
     }
 
     return CELL_OK;
@@ -403,11 +308,7 @@ s32 cellSync2SemaphoreRelease(CellSync2Semaphore* sem, u32 count)
     if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
     for (u32 i = 0; i < count; i++) {
-#ifdef _WIN32
-        ReleaseSemaphore(s->sem, 1, NULL);
-#else
         ps3_sem_post(&s->sem);
-#endif
     }
 
     return CELL_OK;
@@ -419,15 +320,9 @@ s32 cellSync2SemaphoreGetValue(const CellSync2Semaphore* sem, s32* value)
     Sync2SemInternal* s = (Sync2SemInternal*)sem;
     if (!s->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    /* Windows doesn't have a direct "get value" for semaphores.
-     * Use a 0-timeout wait + release trick, or track internally. */
-    vm_write32((u32)(uintptr_t)value, (u32)s->value); /* approximate */
-#else
     int v;
     ps3_sem_getvalue(&s->sem, &v);
     vm_write32((u32)(uintptr_t)value, (u32)v);
-#endif
 
     return CELL_OK;
 }
@@ -470,15 +365,9 @@ s32 cellSync2QueueInit(CellSync2Queue* queue, void* buffer,
 
     memset(buffer, 0, (size_t)elemSize * depth);
 
-#ifdef _WIN32
-    InitializeCriticalSection(&q->cs);
-    InitializeConditionVariable(&q->notFull);
-    InitializeConditionVariable(&q->notEmpty);
-#else
     pthread_mutex_init(&q->mtx, NULL);
     pthread_cond_init(&q->notFull, NULL);
     pthread_cond_init(&q->notEmpty, NULL);
-#endif
 
     return CELL_OK;
 }
@@ -491,23 +380,6 @@ s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    EnterCriticalSection(&q->cs);
-    DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
-    while (q->count >= q->depth) {
-        if (!SleepConditionVariableCS(&q->notFull, &q->cs, ms)) {
-            LeaveCriticalSection(&q->cs);
-            return CELL_SYNC2_ERROR_TIMEDOUT;
-        }
-    }
-
-    memcpy(q->buffer + (size_t)q->tail * q->elemSize, data, q->elemSize);
-    q->tail = (q->tail + 1) % q->depth;
-    q->count++;
-
-    WakeConditionVariable(&q->notEmpty);
-    LeaveCriticalSection(&q->cs);
-#else
     pthread_mutex_lock(&q->mtx);
     while (q->count >= q->depth) {
         if (timeoutUsec == 0) {
@@ -531,7 +403,6 @@ s32 cellSync2QueuePush(CellSync2Queue* queue, const void* data,
 
     pthread_cond_signal(&q->notEmpty);
     pthread_mutex_unlock(&q->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -543,22 +414,6 @@ s32 cellSync2QueueTryPush(CellSync2Queue* queue, const void* data)
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&q->cs))
-        return CELL_SYNC2_ERROR_BUSY;
-
-    if (q->count >= q->depth) {
-        LeaveCriticalSection(&q->cs);
-        return CELL_SYNC2_ERROR_OVERFLOW;
-    }
-
-    memcpy(q->buffer + (size_t)q->tail * q->elemSize, data, q->elemSize);
-    q->tail = (q->tail + 1) % q->depth;
-    q->count++;
-
-    WakeConditionVariable(&q->notEmpty);
-    LeaveCriticalSection(&q->cs);
-#else
     if (pthread_mutex_trylock(&q->mtx) != 0)
         return CELL_SYNC2_ERROR_BUSY;
 
@@ -573,7 +428,6 @@ s32 cellSync2QueueTryPush(CellSync2Queue* queue, const void* data)
 
     pthread_cond_signal(&q->notEmpty);
     pthread_mutex_unlock(&q->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -586,23 +440,6 @@ s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    EnterCriticalSection(&q->cs);
-    DWORD ms = (timeoutUsec == 0) ? INFINITE : (DWORD)(timeoutUsec / 1000);
-    while (q->count == 0) {
-        if (!SleepConditionVariableCS(&q->notEmpty, &q->cs, ms)) {
-            LeaveCriticalSection(&q->cs);
-            return CELL_SYNC2_ERROR_TIMEDOUT;
-        }
-    }
-
-    memcpy(data, q->buffer + (size_t)q->head * q->elemSize, q->elemSize);
-    q->head = (q->head + 1) % q->depth;
-    q->count--;
-
-    WakeConditionVariable(&q->notFull);
-    LeaveCriticalSection(&q->cs);
-#else
     pthread_mutex_lock(&q->mtx);
     while (q->count == 0) {
         if (timeoutUsec == 0) {
@@ -626,7 +463,6 @@ s32 cellSync2QueuePop(CellSync2Queue* queue, void* data,
 
     pthread_cond_signal(&q->notFull);
     pthread_mutex_unlock(&q->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -638,22 +474,6 @@ s32 cellSync2QueueTryPop(CellSync2Queue* queue, void* data)
     Sync2QueueInternal* q = (Sync2QueueInternal*)queue;
     if (!q->initialized) return CELL_SYNC2_ERROR_NOT_INITIALIZED;
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&q->cs))
-        return CELL_SYNC2_ERROR_BUSY;
-
-    if (q->count == 0) {
-        LeaveCriticalSection(&q->cs);
-        return CELL_SYNC2_ERROR_EMPTY;
-    }
-
-    memcpy(data, q->buffer + (size_t)q->head * q->elemSize, q->elemSize);
-    q->head = (q->head + 1) % q->depth;
-    q->count--;
-
-    WakeConditionVariable(&q->notFull);
-    LeaveCriticalSection(&q->cs);
-#else
     if (pthread_mutex_trylock(&q->mtx) != 0)
         return CELL_SYNC2_ERROR_BUSY;
 
@@ -668,7 +488,6 @@ s32 cellSync2QueueTryPop(CellSync2Queue* queue, void* data)
 
     pthread_cond_signal(&q->notFull);
     pthread_mutex_unlock(&q->mtx);
-#endif
 
     return CELL_OK;
 }

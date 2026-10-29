@@ -22,9 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#if defined(__APPLE__)
-#include <pthread/qos.h>
-#endif
 
 typedef struct {
     const char* name;
@@ -172,11 +169,6 @@ int main(int argc, char** argv)
         else { fprintf(stderr, "usage: %s [--quick] [--only a,b] [--no-interp] [--repeats N] [--csv FILE]\n", argv[0]); return 2; }
     }
 
-#if defined(__APPLE__)
-    /* Ask for a performance core: the default QoS lets macOS run this on an
-     * efficiency core, at a fraction of the speed, whenever it likes. */
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
     /* Guest memory for the DMA and atomic kernels: they transfer to and from
      * BENCH_GUEST_EA (up to 16 KB). */
     ppu_vm_size = BENCH_GUEST_EA + 0x100000u;

@@ -1,8 +1,8 @@
 /*
  * ps3recomp - sys_net module implementation
  *
- * The PS3 BSD socket API (libnet) passed through to host sockets: Winsock2 on
- * Windows, POSIX sockets elsewhere. It is OFF by default. ppu_sysprx.cpp's
+ * The PS3 BSD socket API (libnet) passed through to host POSIX sockets. It is
+ * OFF by default. ppu_sysprx.cpp's
  * offline model answers every libnet import unless PS3_NET_ONLINE is set, in
  * which case ps3_net_host_register() puts these handlers in front of it.
  *
@@ -11,21 +11,10 @@
  * sockaddr_in needs no swap -- its port and address are already in network
  * order in guest memory, which is exactly what the host struct wants.
  *
- * errno is plain BSD (35 = EWOULDBLOCK). Winsock's WSAE* codes are BSD + 10000,
- * so Windows translates by subtraction; Linux numbers differ and get a table.
+ * errno is plain BSD (35 = EWOULDBLOCK) on the host; Linux numbers differ from
+ * the guest's and get a table.
  */
 
-#ifdef _WIN32
-    #define WIN32_LEAN_AND_MEAN
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    typedef SOCKET host_socket_t;
-    typedef WSAPOLLFD host_pollfd;
-    #define HOST_INVALID_SOCKET INVALID_SOCKET
-    #define HOST_SOCKET_ERROR   SOCKET_ERROR
-    #define host_closesocket    closesocket
-    #define host_poll           WSAPoll
-#else
     #include <sys/types.h>
     #include <sys/socket.h>
     #include <netinet/in.h>
@@ -44,7 +33,6 @@
     #define HOST_SOCKET_ERROR   (-1)
     #define host_closesocket    close
     #define host_poll           poll
-#endif
 
 #include "ps3emu/vm_watch.h"
 #include "host_socket_send.h"
@@ -122,13 +110,6 @@ static int32_t fail(int32_t err)
 
 static int32_t host_fail(void)
 {
-#ifdef _WIN32
-    int e = WSAGetLastError();
-    /* WSAE* is the BSD value + 10000; a nonblocking connect says WOULDBLOCK
-     * where BSD says INPROGRESS, and the caller fixes that one up. */
-    if (e >= 10000 && e < 10100) return fail(e - 10000);
-    return fail(SYS_NET_EINVAL);
-#else
     switch (errno) {
         case EBADF:         return fail(SYS_NET_EBADF);
         case ENOMEM:        return fail(SYS_NET_ENOMEM);
@@ -151,16 +132,11 @@ static int32_t host_fail(void)
         case EHOSTUNREACH:  return fail(SYS_NET_EHOSTUNREACH);
         default:            return fail(SYS_NET_EINVAL);
     }
-#endif
 }
 
 static void net_startup(void)
 {
     if (s_net_initialized) return;
-#ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
     for (int i = 0; i < SYS_NET_MAX_SOCKETS; i++) {
         s_sockets[i].host_fd = HOST_INVALID_SOCKET;
         s_sockets[i].in_use = 0;
@@ -224,16 +200,12 @@ static const char* ip_str(const struct in_addr* a, char* buf)
 static void sleep_ms(int ms)
 {
     if (ms <= 0) return;
-#ifdef _WIN32
-    Sleep((DWORD)ms);
-#else
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
-#endif
 }
 
-/* MSG_DONTWAIT on a blocking socket. Winsock has no such flag, so both
- * platforms ask poll whether the call would block instead of passing it on. */
+/* MSG_DONTWAIT on a blocking socket: ask poll whether the call would block
+ * instead of passing the guest's flag to the host. */
 static int would_block(int32_t s, int32_t flags, short ev)
 {
     if (!(flags & SYS_NET_MSG_DONTWAIT) || s_sockets[s].nonblocking) return 0;
@@ -246,13 +218,8 @@ static int would_block(int32_t s, int32_t flags, short ev)
 
 static int set_nonblocking(host_socket_t fd, int on)
 {
-#ifdef _WIN32
-    u_long mode = on ? 1 : 0;
-    return ioctlsocket(fd, FIONBIO, &mode);
-#else
     int fl = fcntl(fd, F_GETFL, 0);
     return fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -319,16 +286,10 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 #define RELAYED_MAX 8
 static struct { host_socket_t fd; uint8_t ip[4]; uint16_t port; } s_relayed[RELAYED_MAX];
 static int s_nrelayed;
-#ifdef _WIN32
-static SRWLOCK s_relayed_lock = SRWLOCK_INIT;
-#  define RELAYED_LOCK()   AcquireSRWLockExclusive(&s_relayed_lock)
-#  define RELAYED_UNLOCK() ReleaseSRWLockExclusive(&s_relayed_lock)
-#else
 #  include <pthread.h>
 static pthread_mutex_t s_relayed_lock = PTHREAD_MUTEX_INITIALIZER;
 #  define RELAYED_LOCK()   pthread_mutex_lock(&s_relayed_lock)
 #  define RELAYED_UNLOCK() pthread_mutex_unlock(&s_relayed_lock)
-#endif
 
 static void relayed_stream(int64_t fd, const uint8_t ip[4], uint16_t port)
 {
@@ -398,9 +359,9 @@ int32_t sys_net_bnet_bind(int32_t s, const sys_net_sockaddr* addr, uint32_t addr
         s_sockets[s].vport = vm_read16(EA(addr) + 8);
         a.sin_port = htons(np_psnr_p2p_port());
         /* ...on every interface. Titles bind the console's own IP (what
-         * cellNetCtl reports), and Windows then refuses to send from that
-         * socket to a peer on 127.0.0.1 (WSAEADDRNOTAVAIL) -- Simpsons
-         * Arcade's every packet failed that way. The port is what peers use. */
+         * cellNetCtl reports), and the host then refuses to send from that
+         * socket to a peer on 127.0.0.1 -- Simpsons Arcade's every packet
+         * failed that way. The port is what peers use. */
         a.sin_addr.s_addr = htonl(INADDR_ANY);
         /* Every P2P stream socket shares that port, the listener and the ones
          * that connect out, as on a console. A connection's source port is
@@ -538,9 +499,6 @@ int32_t sys_net_bnet_connect(int32_t s, const sys_net_sockaddr* addr, uint32_t a
         }
     }
     if (connect(s_sockets[s].host_fd, (struct sockaddr*)&a, sizeof(a)) == HOST_SOCKET_ERROR) {
-#ifdef _WIN32
-        if (WSAGetLastError() == WSAEWOULDBLOCK) return fail(SYS_NET_EINPROGRESS);
-#endif
         int32_t r = host_fail();
         if (net_trace()) printf("[sys_net] connect(%d) failed, errno %d\n", s, s_errno);
         return r;
@@ -578,27 +536,17 @@ static int net_trace(void)
 
 static void trace(const char* op, int32_t s, int n, const struct sockaddr_in* a)
 {
-#ifdef _WIN32
-    int err = n < 0 ? WSAGetLastError() : 0;
-#else
     int err = n < 0 ? errno : 0;
-#endif
     char ip[16] = "-";
     if (a) ip_str(&a->sin_addr, ip);
     /* Wall-clock milliseconds, to line two machines' traces up. */
     unsigned hh, mm, ss, ms;
-#ifdef _WIN32
-    SYSTEMTIME t;
-    GetLocalTime(&t);
-    hh = t.wHour; mm = t.wMinute; ss = t.wSecond; ms = t.wMilliseconds;
-#else
     struct timeval tv;
     struct tm tm;
     gettimeofday(&tv, NULL);
     localtime_r(&tv.tv_sec, &tm);
     hh = (unsigned)tm.tm_hour; mm = (unsigned)tm.tm_min; ss = (unsigned)tm.tm_sec;
     ms = (unsigned)(tv.tv_usec / 1000);
-#endif
     printf("[sys_net %02u:%02u:%02u.%03u] %s(%d) %s:%u -> %d (host error %d)\n", hh, mm, ss, ms,
            op, s, ip, a ? ntohs(a->sin_port) : 0, n, err);
 }
@@ -682,13 +630,8 @@ static int set_timeout(host_socket_t fd, int name, uint32_t val_ea, uint32_t len
 {
     uint64_t us = (len >= 16) ? vm_read64(val_ea) * 1000000ull + vm_read64(val_ea + 8)
                               : (uint64_t)vm_read32(val_ea) * 1000ull;
-#ifdef _WIN32
-    DWORD ms = (DWORD)(us / 1000);
-    return setsockopt(fd, SOL_SOCKET, name, (const char*)&ms, sizeof(ms));
-#else
     struct timeval tv = { (time_t)(us / 1000000), (suseconds_t)(us % 1000000) };
     return setsockopt(fd, SOL_SOCKET, name, &tv, sizeof(tv));
-#endif
 }
 
 int32_t sys_net_bnet_setsockopt(int32_t s, int32_t level, int32_t optname,
@@ -759,14 +702,10 @@ int32_t sys_net_bnet_getsockopt(int32_t s, int32_t level, int32_t optname,
             case SYS_NET_SO_ERROR:
                 if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char*)&val, &hl) == HOST_SOCKET_ERROR)
                     return host_fail();
-#ifdef _WIN32
-                if (val >= 10000 && val < 10100) val -= 10000;
-#else
                 if (val == ECONNREFUSED) val = SYS_NET_ECONNREFUSED;
                 else if (val == ETIMEDOUT) val = SYS_NET_ETIMEDOUT;
                 else if (val == ECONNRESET) val = SYS_NET_ECONNRESET;
                 else if (val == EHOSTUNREACH) val = SYS_NET_EHOSTUNREACH;
-#endif
                 break;
             case SYS_NET_SO_TYPE:
                 if (getsockopt(fd, SOL_SOCKET, SO_TYPE, (char*)&val, &hl) == HOST_SOCKET_ERROR)

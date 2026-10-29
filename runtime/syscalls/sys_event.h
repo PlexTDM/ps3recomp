@@ -2,7 +2,7 @@
  * ps3recomp - Event queue and event flag syscalls
  */
 
-#ifndef SYS_EVENT_H
+#if !defined(SYS_EVENT_H)
 #define SYS_EVENT_H
 
 #include "lv2_syscall_table.h"
@@ -12,14 +12,9 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <time.h>
   #include <errno.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,13 +60,8 @@ typedef struct sys_event_queue_info {
      * arrive; later receives fail the same way rather than re-blocking. */
     int          cancelled;
 
-#ifdef _WIN32
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE not_empty;
-#else
     pthread_mutex_t lock;
     pthread_cond_t  not_empty;
-#endif
 
 } sys_event_queue_info;
 
@@ -111,13 +101,8 @@ typedef struct sys_event_flag_info {
     char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
 
-#ifdef _WIN32
-    CRITICAL_SECTION lock;
-    CONDITION_VARIABLE cv;
-#else
     pthread_mutex_t lock;
     pthread_cond_t  cv;
-#endif
 
 } sys_event_flag_info;
 
@@ -179,4 +164,4 @@ void sys_event_queue_uncancel_by_id(uint32_t queue_id);
 }
 #endif
 
-#endif /* SYS_EVENT_H */
+#endif

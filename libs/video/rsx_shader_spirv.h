@@ -1,11 +1,10 @@
 /*
  * ps3recomp - HLSL -> SPIR-V for the Vulkan backend
  *
- * The decompilers emit HLSL; glslang's HLSL front end lowers it to SPIR-V
- * (the same front end rsx_shader_msl.cpp uses on the way to Metal). Unlike
- * that path, the bindings here are explicit, one descriptor set (set 0) for
- * both stages, register + a per-stage shift, so a pipeline layout can be
- * written down once:
+ * The decompilers emit HLSL; glslang's HLSL front end lowers it to SPIR-V.
+ * The bindings here are explicit, one descriptor set (set 0) for both stages,
+ * register + a per-stage shift, so a pipeline layout can be written down
+ * once:
  *
  *   binding  0      VPConst      (VS b0)         uniform buffer (dynamic)
  *   binding  1      PSConstants  (FS b1)         uniform buffer (dynamic)
@@ -19,7 +18,7 @@
  * The vertex stage's samplers reuse s0..s3, so the stages get different
  * sampler shifts (a draw can filter vertex unit N and fragment unit N
  * differently). Vertex inputs and varyings keep glslang's declaration-order
- * locations, which both decompilers keep in step (as the Metal path).
+ * locations, which both decompilers keep in step.
  */
 #ifndef PS3RECOMP_RSX_SHADER_SPIRV_H
 #define PS3RECOMP_RSX_SHADER_SPIRV_H

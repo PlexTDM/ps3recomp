@@ -4,7 +4,7 @@
  * Real mutex using host OS primitives.
  */
 
-#ifndef SYS_MUTEX_H
+#if !defined(SYS_MUTEX_H)
 #define SYS_MUTEX_H
 
 #include "lv2_syscall_table.h"
@@ -14,14 +14,9 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <time.h>
   #include <errno.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,12 +58,7 @@ typedef struct sys_mutex_info {
     uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
     int      lock_count;  /* recursive lock count */
 
-#ifdef _WIN32
-    CRITICAL_SECTION cs;
-    HANDLE           wait_handle;  /* for timed waits */
-#else
     pthread_mutex_t  mtx;
-#endif
 
 } sys_mutex_info;
 
@@ -88,4 +78,4 @@ void sys_mutex_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_MUTEX_H */
+#endif

@@ -1,6 +1,6 @@
 # Fragment depth texture comparisons
 
-The shared draw engine and legacy Metal path specialize referenced texture
+The shared draw engine specializes referenced texture
 units from TEXTURE_ADDRESS zfunc. Native depth formats with alpha-kill off
 activate comparison only for controls 1 through 6. NEVER (0), ALWAYS (7),
 non-depth textures and alpha-kill keep the existing raw sampling behavior.
@@ -22,8 +22,8 @@ Supported comparison scope is 2D D24_D8 or D16, one mip level, TEX/TXP and
 matching nearest or linear min/mag filtering. Active float-depth formats,
 cubes/other dimensions, multiple mip levels, mismatched filters and
 TXB/TXL/TXD/TEXBEM/TXPBEM reject translation with a bounded diagnostic. The
-engine drops failed pipelines; the legacy Metal path also rejects these
-failures instead of its ordinary built-in shader fallback. Other standalone
+engine drops failed pipelines rather than falling back to its built-in
+shader. Other standalone
 legacy backend paths still need to adopt the metadata API. Texture remapping,
 LOD/aniso extensions and full hardware shadow sampling precision are outside
 this correction's coverage; existing texture/sampler behavior is retained.
@@ -34,8 +34,8 @@ Synthetic tests contain no title programs or data:
   layouts/fetches, sixteen-unit bounded output.
 - `test_shadow_engine.c`: production method dispatch, per-unit shader cache,
   switchback, unused-unit bindings and rejected draw emission.
-- `test_shadow_compare_metal.m`: actual translated GPU comparisons, projected
-  reference, equality, raw endpoint controls and checked legacy failures.
+- `libs/video/tests/test_rsx_draw_engine.c`: translated GPU comparisons,
+  projected reference, equality, raw endpoint controls and checked failures.
 
 Contract references:
 

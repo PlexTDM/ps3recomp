@@ -24,18 +24,17 @@ RSX Command Processor             ← libs/video/rsx_commands.c
   │ Dispatches to registered backend via callbacks
   │
   ├──▶ Null Backend               ← libs/video/rsx_null_backend.c
-  │    Win32 window + GDI clear color (debugging)
+  │    Headless CPU rasteriser into host memory (CI and fallback)
   │
-  ├──▶ D3D12 Backend              ← libs/video/rsx_d3d12_backend.c
-  │    Real GPU rendering (Windows) with compiled shaders
-  │
-  └──▶ Vulkan Backend             ← opt-in (Linux; PS3RECOMP_RSX_VULKAN)
+  └──▶ Vulkan Backend             ← libs/video/rsx_vulkan_backend.c
+       Real GPU rendering (opt-in; PS3RECOMP_RSX_VULKAN)
        Guest shaders on the shared draw engine
 
 Supporting files:
-  libs/video/rsx_primitives.h      ← RSX → D3D12 topology mapping + index conversion
-  libs/video/rsx_vertex_formats.h  ← RSX → DXGI format mapping
-  libs/video/rsx_d3d12_shaders.h   ← Built-in HLSL shaders
+  libs/video/rsx_primitives.h      ← RSX → host topology mapping + expansion
+  libs/video/rsx_vertex_formats.h  ← RSX vertex attribute decoding
+  libs/video/rsx_shader_spirv.cpp  ← HLSL → SPIR-V through glslang
+  libs/video/rsx_draw_engine.c     ← shared register-file draw engine
   libs/video/cellResc.c            ← Resolution scaling (16 functions)
   libs/video/cellVideoOut.c        ← Video output configuration
 ```
@@ -58,7 +57,7 @@ The game interacts with the GPU through `cellGcmSys` — the PS3 SDK's RSX inter
 - `cellGcmSetFlipMode(mode)` — VSYNC or HSYNC.
 - `cellGcmSetFlipHandler(handler)` / `cellGcmSetVBlankHandler(handler)` — Callback registration. In recomp, these store guest function pointers but don't fire automatically (no real VBlank interrupt).
 - `cellGcmResetFlipStatus()` / `cellGcmGetFlipStatus()` — Flip state tracking.
-- `cellGcmGetLastFlipTime()` — Returns host timestamp via `QueryPerformanceCounter` (Windows) or `clock_gettime` (POSIX).
+- `cellGcmGetLastFlipTime()` — Returns a host timestamp from `clock_gettime`.
 
 ### Memory Management
 - `cellGcmMapMainMemory(ea, size, offset)` — Maps main memory for GPU access. Uses a bump allocator with 1MB alignment and tracks mappings in an offset table.
@@ -192,68 +191,64 @@ Register a backend with `rsx_set_backend(&my_backend)`. Only one backend can be 
 
 **File:** `libs/video/rsx_null_backend.c`
 
-Debug backend that creates a Win32 window and displays the RSX clear color via GDI. Shows an FPS counter and debug overlay text. Use this to verify the command pipeline works before switching to D3D12.
+The default backend and the CI path. It keeps a `u32` framebuffer and a depth
+buffer in host memory, executes the guest command stream, and flat-shades
+triangles on the CPU. Nothing is presented to a window: `present()` leaves the
+centre pixel for the host harness to read back. Build `ps3recomp_host` and its
+scene checks to verify the command pipeline without a GPU or display.
 
 ```c
-rsx_null_backend_init(1280, 720, "My Game");  // creates window
+rsx_null_backend_init(1280, 720, "My Game");
 // ... game runs ...
-rsx_null_backend_pump_messages();              // call each frame
+rsx_null_backend_present();                    // finish the frame
 ```
 
-### D3D12 Backend
+### Vulkan Backend (opt-in)
 
-**File:** `libs/video/rsx_d3d12_backend.c` (~990 lines)
+**File:** `libs/video/rsx_vulkan_backend.c`
 
-Real GPU rendering via Direct3D 12. Current capabilities:
+Real GPU rendering, built with `-DPS3RECOMP_RSX_VULKAN=ON`. Vulkan is loaded
+at run time with `dlopen("libvulkan.so.1")`, so the build needs only the
+headers and a machine without a loader fails init cleanly. Only Vulkan 1.0
+core entry points are used.
 
-| Feature | Status | Details |
-|---------|--------|---------|
-| Device creation | **Done** | Feature level 11.0, any D3D12-capable GPU |
-| Swap chain | **Done** | Double-buffered, flip-discard, VSync present |
-| Clear | **Done** | Clears to RSX clear color (ARGB → float4 RGBA) |
-| Root signature | **Done** | Input assembler enabled |
-| Pipeline state | **Done** | Vertex-colored shader (position + color) compiled at init |
-| Vertex buffer | **Done** | 4MB upload heap, persistently mapped, DrawInstanced |
-| Vertex upload | **Done** | Reads position (float3) + color (ubyte4/float4) from guest memory with BE byte-swap |
-| Shader compilation | **Done** | Runtime D3DCompile (vs_5_0 / ps_5_0) |
-| Frame sync | **Done** | Fence-based, per-frame command allocators |
-| Draw calls | **Done** | DrawInstanced with accumulated per-frame vertices |
-| Vertex attribs | **Done** | Logs all enabled attribs (type, size, stride, offset) |
-| Shader logging | **Done** | Logs fragment/vertex program addresses and output mask |
-| Blend state | Logging | Logs blend enable/factors (PSO recreation needed) |
-| Depth/stencil | Logging | Logs depth test/stencil state |
-| Texture binding | Logging | Logs format, dimensions, guest address. Format decode ready. |
-| Texture upload | Scaffold | 25 RSX→DXGI format mappings, upload process documented |
-| RSX shaders | Not started | Need NV40 ISA → HLSL translation |
-| Depth buffer | Not started | Need depth/stencil texture creation |
+There are two draw paths, selected by `PS3RECOMP_RSX_ENGINE`:
 
-**How the D3D12 backend renders a frame:**
+| Path | What it does |
+|------|--------------|
+| `dispatch` (default with guest programs) | The shared register-file draw engine (`rsx_draw_engine.c`) owns surfaces, render-to-texture, MRT, depth textures, vertex compaction and pipeline keys; the backend builds Vulkan pipelines from the guest's own vertex and fragment programs. |
+| `vtable` | The null backend's fixed-function contract: position from attribute 0, flat colour from attribute 3, texture unit 0, depth test. Used to compare the two renderers pixel for pixel. |
+
+**Pipeline:**
 
 ```
-1. Reset command allocator + command list for current frame
-2. Transition render target: PRESENT → RENDER_TARGET
-3. Set render target, viewport, scissor
-4. ClearRenderTargetView with RSX clear color
-5. Bind root signature + PSO + vertex buffer + topology
-6. DrawInstanced with accumulated vertex data
-7. Transition render target: RENDER_TARGET → PRESENT
-8. Present with VSync
-9. Signal fence, advance to next frame
+1. Record the frame's clears, draws, texture uploads and optional window
+   blit into one command buffer
+2. Submit once; two frames are in flight, each with its own command buffer,
+   fence and staging arena
+3. Present is ordered by a semaphore, so the FIFO walker records frame N
+   while the GPU draws N-1
+4. Read the frame back for the host's pixel checks (and PS3RECOMP_VK_DUMP)
 ```
 
-**Shaders** are compiled at init time from inline HLSL strings using `D3DCompile`. The basic vertex-colored shader is:
+Guest programs are decompiled to HLSL by `rsx_vp_decompiler.c` /
+`rsx_fp_decompiler.c` and translated to SPIR-V by glslang
+(`rsx_shader_spirv.cpp`). Textures cover the RSX layouts and formats the
+draw engine decodes, including mip chains and per-unit samplers. Images stay
+in `VK_IMAGE_LAYOUT_GENERAL` for their whole life, so there is no layout
+bookkeeping.
 
-```hlsl
-// Vertex shader
-struct VSInput { float3 pos : POSITION; float4 col : COLOR; };
-struct VSOutput { float4 pos : SV_POSITION; float4 col : COLOR; };
-VSOutput main(VSInput i) { VSOutput o; o.pos = float4(i.pos, 1.0); o.col = i.col; return o; }
+Environment:
 
-// Pixel shader
-float4 main(PSInput i) : SV_TARGET { return i.col; }
-```
-
-Additional shader definitions in `rsx_d3d12_shaders.h`: solid color fill, textured quad.
+| Variable | |
+|---|---|
+| `PS3RECOMP_VK_DEVICE=<n>` | pick physical device n instead of the first non-CPU one |
+| `PS3RECOMP_VK_DUMP=<path>` | write every presented frame as a binary PPM |
+| `PS3RECOMP_VK_WINDOW=1` | show frames in an SDL2 window (rendering stays offscreen) |
+| `PS3RECOMP_VK_FULLSCREEN=1` | borderless full screen with a window |
+| `PS3RECOMP_VK_HOLD=<sec>` | keep the last frame on screen before shutdown |
+| `PS3RECOMP_VK_GUEST_PROGRAMS=1` | run the guest's own shader programs |
+| `PS3RECOMP_RSX_ENGINE=dispatch\|vtable` | pick the draw path explicitly |
 
 ---
 
@@ -261,69 +256,64 @@ Additional shader definitions in `rsx_d3d12_shaders.h`: solid color fill, textur
 
 ### Primitive Type Mapping (`rsx_primitives.h`)
 
-Maps RSX primitive types to D3D12 topologies. D3D12 doesn't support triangle fans, quads, or line loops — these need index buffer conversion:
+Maps RSX primitive types to the topologies every modern host API has. Quads,
+quad strips, triangle fans and polygons have no direct equivalent, so their
+vertices are expanded on the CPU into a triangle list. `LINE_LOOP` is drawn as
+a plain strip (the closing edge is not emitted yet).
 
-| RSX Primitive | Value | D3D12 | Conversion |
-|--------------|-------|-------|------------|
-| Points | 1 | POINTLIST | Direct |
-| Lines | 2 | LINELIST | Direct |
-| Line Loop | 3 | LINESTRIP | Add closing edge index |
-| Line Strip | 4 | LINESTRIP | Direct |
-| Triangles | 5 | TRIANGLELIST | Direct |
-| Triangle Strip | 6 | TRIANGLESTRIP | Direct |
-| Triangle Fan | 7 | TRIANGLELIST | Expand: center + edge pairs |
-| Quads | 8 | TRIANGLELIST | Split: 2 triangles per quad |
-| Quad Strip | 9 | TRIANGLELIST | Expand |
-
-Conversion functions generate index buffers:
-- `rsx_convert_triangle_fan(first, count, indices, max)` — (N-2)×3 indices
-- `rsx_convert_quads(first, count, indices, max)` — (N/4)×6 indices
-- `rsx_convert_line_loop(first, count, indices, max)` — N+1 indices
+| RSX Primitive | Value | Drawn as | Expansion |
+|--------------|-------|----------|-----------|
+| Points | 1 | POINTS | Direct |
+| Lines | 2 | LINES | Direct |
+| Line Loop | 3 | LINE_STRIP | Approximated |
+| Line Strip | 4 | LINE_STRIP | Direct |
+| Triangles | 5 | TRIANGLES | Direct |
+| Triangle Strip | 6 | TRIANGLE_STRIP | Direct |
+| Triangle Fan | 7 | TRIANGLES | CPU expansion |
+| Quads | 8 | TRIANGLES | CPU expansion |
+| Quad Strip | 9 | TRIANGLES | CPU expansion |
 
 ### Vertex Format Mapping (`rsx_vertex_formats.h`)
 
-Maps RSX vertex attribute types (from `NV4097_SET_VERTEX_DATA_ARRAY_FORMAT`) to DXGI formats for D3D12 input layout descriptors:
+Decodes RSX vertex attribute types (from `NV4097_SET_VERTEX_DATA_ARRAY_FORMAT`)
+and the frequency-divider rules. The draw engine fetches attributes into a
+compact host-side vertex buffer (`rsx_vertex_fetch.c`), so the backend does not
+see DXGI or Vulkan format enums at all.
 
-| RSX Type | ID | Component Size | DXGI Formats (1/2/3/4 components) |
-|----------|-----|---------------|----------------------------------|
+| RSX Type | ID | Component Size | Meaning |
+|----------|-----|---------------|---------|
 | None | 0 | - | Disabled |
-| S1 (snorm16) | 1 | 2 bytes | R16_SNORM / R16G16 / - / R16G16B16A16 |
-| F (float32) | 2 | 4 bytes | R32_FLOAT / R32G32 / R32G32B32 / R32G32B32A32 |
-| SF (float16) | 3 | 2 bytes | R16_FLOAT / R16G16 / - / R16G16B16A16 |
-| UB (unorm8) | 4 | 1 byte | R8_UNORM / R8G8 / - / R8G8B8A8 |
-| S32K (s16) | 5 | 2 bytes | (same as S1) |
-| CMP (packed) | 6 | 4 bytes | Custom (11-11-10 bit) |
-| UB256 (uint8) | 7 | 1 byte | R8_UINT / R8G8 / - / R8G8B8A8 |
+| S1 (snorm16) | 1 | 2 bytes | Signed normalized |
+| F (float32) | 2 | 4 bytes | Float |
+| SF (float16) | 3 | 2 bytes | Half float |
+| UB (unorm8) | 4 | 1 byte | Unsigned normalized |
+| S32K (s16) | 5 | 2 bytes | Signed 16-bit |
+| CMP (packed) | 6 | 4 bytes | 11-11-10 packed |
+| UB256 (uint8) | 7 | 1 byte | Unsigned, not normalized |
 
----
+## RSX Shader Translation
 
-## RSX Shader Translation (Future Work)
+The RSX uses a proprietary shader ISA derived from NVIDIA's NV40/NV47
+architecture. Both stages are translated at run time:
 
-The RSX uses a proprietary shader ISA derived from NVIDIA's NV40/NV47 architecture:
+- **Vertex programs** live in transform program memory, loaded through
+  `NV4097_SET_TRANSFORM_PROGRAM_LOAD` (method 0x1E9C); up to 512 instructions.
+- **Fragment programs** live in VRAM or main memory at
+  `NV4097_SET_SHADER_PROGRAM` (method 0x08E4), variable length, terminated by
+  an end instruction.
 
-### Vertex Programs
-- Stored in "transform program memory" on the RSX, loaded via `NV4097_SET_TRANSFORM_PROGRAM_LOAD` (method 0x1E9C).
-- Up to 512 instructions per program.
-- 4-component vector operations (float4).
-- 16 input attributes, 16 output varyings.
+### Translation Pipeline
 
-### Fragment Programs
-- Stored in VRAM or main memory at the address written to `NV4097_SET_SHADER_PROGRAM` (method 0x08E4). The low 2 bits indicate memory location (0=local, 1=main).
-- Variable length (terminated by end instruction).
-- Operates on interpolated fragment values + textures.
+1. **Parse** the NV40 ISA encoding.
+2. **Decompile** to HLSL (`rsx_vp_decompiler.c`, `rsx_fp_decompiler.c`).
+3. **Translate** HLSL to SPIR-V with glslang (`rsx_shader_spirv.cpp`).
+4. **Cache** pipelines by their register-file and program keys, so a title's
+   shaders are built once (asynchronously where possible).
 
-### Translation Strategy
-
-1. **Parse** RSX shader bytecode (NV40 ISA encoding)
-2. **Convert** to an intermediate representation (instruction list with typed operands)
-3. **Emit** HLSL (for D3D12) or GLSL/SPIR-V (for Vulkan)
-4. **Compile** at runtime using `D3DCompile` or `glslang`
-5. **Cache** compiled shaders by content hash to avoid recompilation
-
-**Practical approach for initial ports:** Most PS3 games use only 10-50 unique shader programs. Rather than implementing a full NV40 ISA translator, start by:
-1. Dumping the raw shader bytecode when `SET_SHADER_PROGRAM` / `SET_TRANSFORM_PROGRAM_LOAD` are called
-2. Manually writing equivalent HLSL for each unique shader
-3. Building a per-game shader lookup table
+The fragment path handles the RSX's texture, colour-combine and alpha-test
+state that the games in this tree exercise; see
+[RSX_FRAGMENT_PROGRAM.md](RSX_FRAGMENT_PROGRAM.md) for the supported
+instruction set and the remaining gaps.
 
 **Reference implementations:**
 - RPCS3: `rpcs3/Emu/RSX/Program/RSXVertexProgram.cpp` and `RSXFragmentProgram.cpp`
@@ -361,33 +351,29 @@ Verify that:
 - Display buffers are registered
 - The game loop calls flip functions
 
-### Step 2: D3D12 Backend (Real Rendering)
+### Step 2: Vulkan Backend (Real Rendering)
+
+Build the runtime with `-DPS3RECOMP_RSX_VULKAN=ON`, then register the Vulkan
+backend instead of the null one. With `PS3RECOMP_VK_WINDOW=1` the frame is
+shown in an SDL2 window; without it rendering stays offscreen and the host
+harness can read the frame back.
 
 ```c
-// Replace null backend with D3D12:
-rsx_d3d12_backend_init(1280, 720, "My Game (D3D12)");
+rsx_vulkan_backend_init(1280, 720, "My Game");
 ```
-
-The window should show the RSX clear color. Draw calls are logged to stderr.
 
 ### Step 3: Identify Draw Patterns
 
-Look at the `[D3D12] draw_arrays(prim=5, first=0, count=36)` log messages:
-- `prim=5` = triangles, `prim=6` = triangle strip
-- Check which vertex attributes are enabled and what format they use
-- Note the draw count — small counts suggest UI elements, large counts suggest 3D geometry
+Set `RSX_DRAW_STATS=1` and `RSX_PIPE_LOG=1` to see what reaches the backend:
+primitive type, vertex count, attributes and pipelines. Small counts suggest
+UI elements; large counts suggest 3D geometry.
 
-### Step 4: Wire Vertex Upload
+### Step 4: Guest Programs
 
-Read RSX vertex attribute state from `rsx_state`, translate vertex data from guest memory to the D3D12 vertex buffer, and issue `DrawInstanced`. Use `rsx_to_dxgi_format()` from `rsx_vertex_formats.h` for input layout creation.
-
-### Step 5: Shader Translation
-
-For each unique shader program the game uses:
-1. Dump the bytecode (from the guest address in `SET_SHADER_PROGRAM`)
-2. Write an equivalent HLSL shader
-3. Create a new PSO with the game-specific shader
-4. Map the shader address to the PSO in a lookup table
+Set `PS3RECOMP_VK_GUEST_PROGRAMS=1` to run the title's own vertex and fragment
+programs on the draw engine. `RSX_HLSL_DUMP_DIR=<dir>` writes the translated
+HLSL for inspection; `RSX_ENGINE_SLOW=1` selects the engine's older per-draw
+paths for comparison.
 
 ---
 
@@ -401,8 +387,9 @@ For each unique shader program the game uses:
 | `cellResc.c` | 254 | Resolution scaling (16 functions) |
 | `rsx_commands.c` | 400 | NV47xx FIFO parser + state tracker |
 | `rsx_commands.h` | 300 | Method defines, rsx_state, rsx_backend |
-| `rsx_d3d12_backend.c` | 700 | D3D12 rendering (device, PSO, VB, shaders) |
-| `rsx_d3d12_shaders.h` | 100 | Built-in HLSL shader strings |
-| `rsx_null_backend.c` | 260 | Win32 window + GDI clear |
-| `rsx_primitives.h` | 112 | Topology mapping + index conversion |
-| `rsx_vertex_formats.h` | 115 | Vertex type → DXGI format mapping |
+| `rsx_draw_engine.c` | 4000 | shared register-file draw engine (surfaces, pipelines, draws) |
+| `rsx_vulkan_backend.c` | 4500 | Vulkan device, pipelines, textures, optional window |
+| `rsx_null_backend.c` | 500 | headless CPU rasteriser |
+| `rsx_primitives.h` | 120 | topology mapping + expansion rules |
+| `rsx_vertex_formats.h` | 120 | RSX vertex attribute decoding |
+| `rsx_shader_spirv.cpp` | 200 | HLSL → SPIR-V through glslang |

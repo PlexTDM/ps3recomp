@@ -8,11 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <time.h>
-#endif
 
 static volatile int s_host_on = 0;          /* what the host asked for */
 static volatile float s_host_period = 0.0f; /* the spacing it named, seconds; 0 unknown */
@@ -45,43 +41,18 @@ int rsx_present_pace_on(void)
 
 static double now_s(void)
 {
-#ifdef _WIN32
-    static double inv = 0.0;
-    LARGE_INTEGER q;
-    if (inv == 0.0) { QueryPerformanceFrequency(&q); inv = 1.0 / (double)q.QuadPart; }
-    QueryPerformanceCounter(&q);
-    return (double)q.QuadPart * inv;
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-#endif
 }
 
 /* A millisecond at most, and not exactly: the caller looks at the clock. */
 static void doze(double seconds)
 {
-#ifdef _WIN32
-    static HANDLE timer = NULL;
-    if (!timer) {
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-    }
-    if (timer) {
-        LARGE_INTEGER due;
-        due.QuadPart = -(LONGLONG)(seconds * 1e7);   /* 100 ns units, relative */
-        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject(timer, 20); return; }
-    }
-    Sleep(1);
-#else
     struct timespec ts;
     ts.tv_sec = 0;
     ts.tv_nsec = (long)(seconds * 1e9);
     nanosleep(&ts, NULL);
-#endif
 }
 
 /* Until t, or until the frame is asked for: 1 when it was. Sleeps in slices
@@ -95,9 +66,6 @@ static int wait_until(double t)
         const double left = t - now_s();
         if (left <= 0.0) return 0;
         if (left > 0.0015) doze(left - 0.0008 < 0.001 ? left - 0.0008 : 0.001);
-#ifdef _WIN32
-        else YieldProcessor();
-#endif
     }
 }
 

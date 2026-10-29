@@ -1,8 +1,8 @@
 # ps3recomp - tests/fiber_switch
 #
-# cellFiber cooperative switching on the host's own mechanism: Windows fibers
-# on Windows, ucontext elsewhere. Standalone project with its own build dir,
-# and also added from the top-level CMakeLists under PS3RECOMP_BUILD_TESTS.
+# cellFiber cooperative switching on ucontext. Standalone project with its own
+# build dir, and also added from the top-level CMakeLists under
+# PS3RECOMP_BUILD_TESTS.
 #
 #   cmake -S tests/fiber_switch -B build-fiber -G Ninja
 #   cmake --build build-fiber && ./build-fiber/fiber_switch
@@ -35,16 +35,8 @@ target_include_directories(fiber_switch PRIVATE
     "${PS3RECOMP_TREE_ROOT}/include"
 )
 
-if(MSVC)
-    target_compile_options(fiber_switch PRIVATE /W3 /wd4100)
-    target_compile_definitions(fiber_switch PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-    # Apple deprecated getcontext/makecontext/swapcontext in 10.6 and never
-    # removed them; this suite is the evidence that they still work, so the
-    # warning is noise rather than news.
-    target_compile_options(fiber_switch PRIVATE
-        -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
-endif()
+target_compile_options(fiber_switch PRIVATE
+    -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations)
 
 add_test(NAME fiber_switch COMMAND fiber_switch)
 set_tests_properties(fiber_switch PROPERTIES

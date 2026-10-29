@@ -10,7 +10,6 @@
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_fifo_user_command.c -ffunction-sections
  *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_fifo_user_command
- *   (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
 #include <stdio.h>
@@ -39,15 +38,6 @@ void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
-int  rsx_live_draw_enabled(void) { return 0; }
-void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
-int  rsx_live_draw_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 w, u32 h)
-{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)w; (void)h; return 0; }
-void rsx_live_draw_note_resolve(u32 a, u32 b, u32 c, u32 d) { (void)a; (void)b; (void)c; (void)d; }
-int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h,
-                                u32 i, u32 j, u32 k, u32 l)
-{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; (void)k; (void)l; return 0; }
-
 static unsigned lv2_raised;
 void rsx_raise_user_cmd(uint32_t arg) { (void)arg; lv2_raised++; }
 

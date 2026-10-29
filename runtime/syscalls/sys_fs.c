@@ -13,18 +13,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-#ifdef _WIN32
-  #include <direct.h>
-  #include <io.h>
-  #define stat _stat64
-  #define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
-  #define S_ISREG(m) (((m) & _S_IFREG) != 0)
-#else
   #include <unistd.h>
   #include <dirent.h>
   #include <time.h>     /* nanosleep: the delay in the open-retry loop */
   #include <pthread.h>  /* pthread_self: FS_READ_TIME */
-#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -36,7 +28,7 @@ char            g_sys_fs_root[512] = ".";
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
@@ -46,7 +38,7 @@ static void write_be32(uint32_t addr, uint32_t val)
 static void write_be64(uint32_t addr, uint64_t val)
 {
     uint64_t* p = (uint64_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 56) & 0xFFULL) |
           ((val >> 40) & 0xFF00ULL) |
           ((val >> 24) & 0xFF0000ULL) |
@@ -71,11 +63,7 @@ static void write_be64(uint32_t addr, uint64_t val)
  *   Others         -> <root>/<path>
  * -----------------------------------------------------------------------*/
 static void fs_normalize_sep(char* p) {
-#ifdef _WIN32
-    for (char* c = p; *c; c++) if (*c == '/') *c = '\\';
-#else
     (void)p;
-#endif
 }
 
 /* PS3_VFS_OVERLAY=<dir>: a file that exists under <dir> at the same relative
@@ -363,12 +351,6 @@ int64_t sys_fs_open(ppu_context* ctx)
         size_t _l = strlen(ps3_path);
         fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
                 ps3_path, _l, (_l && ps3_path[_l-1]=='/')?1:0, (uint32_t)ctx->lr); fflush(stderr);
-#ifdef _WIN32
-        { char* mb=(char*)GetModuleHandleA(0); void* bt[30]; unsigned short fr=RtlCaptureStackBackTrace(0,30,bt,0);
-          char ln[820]; int p=snprintf(ln,sizeof ln,"[TITLEOPEN-bt] rva:");
-          for(unsigned short i=0;i<fr;i++) p+=snprintf(ln+p,sizeof(ln)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-          fprintf(stderr,"%s\n",ln); fflush(stderr); }
-#endif
     } }
     /* DIAGNOSTIC (FLOW_TITLEFIX): the game builds the title path with an EMPTY filename
      * (a stale-lift string-construction bug) -> opens the dir. Redirect a bare
@@ -458,16 +440,12 @@ int64_t sys_fs_open(ppu_context* ctx)
     if (!fp && errno != ENOENT &&
         !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC))) {
         for (int _r = 0; !fp && _r < 3000; _r++) {
-#ifdef _WIN32
-            Sleep(1);
-#else
             /* The delay is the retry. 3000 iterations is meant to be about
              * three seconds of waiting for a transient share lock or handle
              * pressure to clear; without it the loop spends microseconds
              * calling fopen 3000 times on a condition that has not changed,
              * and the recovery this exists for never happens. */
             { struct timespec _d = { 0, 1000 * 1000 }; nanosleep(&_d, NULL); }
-#endif
             fp = fopen(host_path, mode);
         }
         if (fp) fprintf(stderr, "[sys_fs] open recovered after retry: %s\n", host_path);
@@ -536,29 +514,18 @@ static int fs_read_time_on(void)
 }
 static double fs_now_ms(void)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER f, t0; LARGE_INTEGER c;
-    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
-    QueryPerformanceCounter(&c);
-    return (double)(c.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-#else
     static double t0 = -1.0;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     const double t = (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
     if (t0 < 0.0) t0 = t;
     return t - t0;
-#endif
 }
 double fs_read_time_start(void) { return fs_read_time_on() ? fs_now_ms() : 0.0; }
 void fs_read_time_log(const char* kind, int fd, uint64_t off, uint64_t size, uint64_t got, double t_start)
 {
     if (!fs_read_time_on()) return;
     const double t = fs_now_ms();
-#ifdef _WIN32
-    const unsigned long tid = (unsigned long)GetCurrentThreadId();
-#else
     const unsigned long tid = (unsigned long)(uintptr_t)pthread_self();
-#endif
     fprintf(stderr, "[fsr] %.3f %s fd=%d off=%llu size=%llu got=%llu %.1f us tid=%lu\n", t_start, kind, fd,
             (unsigned long long)off, (unsigned long long)size, (unsigned long long)got, (t - t_start) * 1000.0, tid);
 }
@@ -735,13 +702,8 @@ int64_t sys_fs_lseek(ppu_context* ctx)
         default: return (int64_t)(int32_t)CELL_EINVAL;
     }
 
-#ifdef _WIN32
-    _fseeki64(f->fp, offset, origin);
-    int64_t pos = _ftelli64(f->fp);
-#else
     fseeko(f->fp, (off_t)offset, origin);
     int64_t pos = (int64_t)ftello(f->fp);
-#endif
 
     if (pos_addr != 0) {
         write_be64(pos_addr, (uint64_t)pos);
@@ -761,12 +723,8 @@ static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
     } else {
         mode |= CELL_FS_S_IFREG;
     }
-#ifndef _WIN32
     if (st->st_mode & S_IWUSR) mode |= CELL_FS_S_IWUSR;
     if (st->st_mode & S_IXUSR) mode |= CELL_FS_S_IXUSR;
-#else
-    mode |= CELL_FS_S_IWUSR; /* assume writable on Windows */
-#endif
 
     /* CellFsStat is 0x34 (52) bytes, 4-byte aligned: the s64/u64 members are
      * be_t<...,4> so there is NO pad after gid (RPCS3: CHECK_SIZE_ALIGN(...,52,4)).
@@ -802,11 +760,7 @@ int64_t sys_fs_stat(ppu_context* ctx)
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
     struct stat st;
-#ifdef _WIN32
-    if (_stat64(host_path, (struct _stat64*)&st) != 0)
-#else
     if (stat(host_path, &st) != 0)
-#endif
     {
         return (int64_t)(int32_t)CELL_ENOENT;
     }
@@ -835,13 +789,8 @@ int64_t sys_fs_fstat(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EBADF;
 
     struct stat st;
-#ifdef _WIN32
-    int fno = _fileno(f->fp);
-    if (_fstat64(fno, (struct _stat64*)&st) != 0)
-#else
     int fno = fileno(f->fp);
     if (fstat(fno, &st) != 0)
-#endif
     {
         return (int64_t)(int32_t)CELL_EBADF;
     }
@@ -878,18 +827,9 @@ int64_t sys_fs_opendir(ppu_context* ctx)
     sys_fs_dir_info* d = &g_sys_fs_dirs[slot];
     memset(d, 0, sizeof(*d));
 
-#ifdef _WIN32
-    char search_path[1024];
-    snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
-    d->find_handle = FindFirstFileA(search_path, &d->find_data);
-    if (d->find_handle == INVALID_HANDLE_VALUE)
-        return (int64_t)(int32_t)CELL_ENOENT;
-    d->first_read = 1;
-#else
     d->dp = opendir(host_path);
     if (!d->dp)
         return (int64_t)(int32_t)CELL_ENOENT;
-#endif
 
     d->active = 1;
     strncpy(d->path, host_path, sizeof(d->path) - 1);
@@ -924,21 +864,6 @@ int64_t sys_fs_readdir(ppu_context* ctx)
     const char* name = NULL;
     int is_dir = 0;
 
-#ifdef _WIN32
-    if (d->first_read) {
-        d->first_read = 0;
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    } else {
-        if (!FindNextFileA(d->find_handle, &d->find_data)) {
-            /* End of directory */
-            if (nread_addr != 0) write_be64(nread_addr, 0);
-            return CELL_OK;
-        }
-        name = d->find_data.cFileName;
-        is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-    }
-#else
     struct dirent* entry = readdir(d->dp);
     if (!entry) {
         if (nread_addr != 0) write_be64(nread_addr, 0);
@@ -955,7 +880,6 @@ int64_t sys_fs_readdir(ppu_context* ctx)
         snprintf(full, sizeof(full), "%s/%s", d->path, name);
         is_dir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
     }
-#endif
 
     if (dirent_addr != 0 && name != NULL) {
         uint8_t* out = (uint8_t*)vm_to_host(dirent_addr);
@@ -992,12 +916,7 @@ int64_t sys_fs_closedir(ppu_context* ctx)
     if (!d->active)
         return (int64_t)(int32_t)CELL_EBADF;
 
-#ifdef _WIN32
-    if (d->find_handle != INVALID_HANDLE_VALUE)
-        FindClose(d->find_handle);
-#else
     if (d->dp) closedir(d->dp);
-#endif
 
     d->active = 0;
     return CELL_OK;
@@ -1021,20 +940,12 @@ int64_t sys_fs_mkdir(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    int rc = _mkdir(host_path);
-#else
     int rc = mkdir(host_path, 0755);
-#endif
 
     if (rc != 0) {
         /* Check if it already exists */
         struct stat st;
-#ifdef _WIN32
-        if (_stat64(host_path, (struct _stat64*)&st) == 0 && S_ISDIR(st.st_mode))
-#else
         if (stat(host_path, &st) == 0 && S_ISDIR(st.st_mode))
-#endif
             return (int64_t)(int32_t)CELL_EEXIST;
         return (int64_t)(int32_t)CELL_ENOENT;
     }
@@ -1085,11 +996,7 @@ int64_t sys_fs_unlink(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    if (_unlink(host_path) != 0)
-#else
     if (unlink(host_path) != 0)
-#endif
         return (int64_t)(int32_t)CELL_ENOENT;
 
     return CELL_OK;
@@ -1111,11 +1018,7 @@ int64_t sys_fs_rmdir(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifdef _WIN32
-    if (_rmdir(host_path) != 0)
-#else
     if (rmdir(host_path) != 0)
-#endif
         return (int64_t)(int32_t)CELL_ENOENT;
 
     return CELL_OK;
@@ -1142,15 +1045,9 @@ int64_t sys_fs_ftruncate(ppu_context* ctx)
 
     fflush(f->fp);
 
-#ifdef _WIN32
-    int fno = _fileno(f->fp);
-    if (_chsize_s(fno, (long long)size) != 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
-#else
     int fno = fileno(f->fp);
     if (ftruncate(fno, (off_t)size) != 0)
         return (int64_t)(int32_t)CELL_EINVAL;
-#endif
 
     return CELL_OK;
 }

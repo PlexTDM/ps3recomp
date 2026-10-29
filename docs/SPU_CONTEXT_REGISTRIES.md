@@ -23,9 +23,9 @@ before release/reset/free. Transient lifted/interpreted jobs and the taskset-pol
 probe now release MFC state alongside existing coherence unregister calls.
 Persistent policy contexts release both before the existing fresh-context reset.
 A completed lifted thread run now unregisters coherence before releasing its MFC
-engine. The existing Windows thread-exit safety net removes matching coherence and MFC
-nodes through separate calls, without nesting their locks. POSIX thread-exit
-stack discovery is not added here; normal transient cleanup applies on both hosts.
+engine. The thread-exit safety net removes matching coherence and MFC nodes through
+separate calls, without nesting their locks. Thread-exit stack discovery is not
+added here; normal transient cleanup applies.
 
 MFC channel lookup uses a shared locked linear search for established engines;
 this retains clear ownership without per-context caches or a new synchronization
@@ -45,5 +45,5 @@ allocation failure. The existing SPU-to-SPU lock-line regression also runs.
 The additional bounded shared-lookup fixture holds a real directory read lock
 while another thread finds an existing engine, checks that release/range cleanup
 remain serialized, and forces simultaneous misses to recheck before publication.
-Production code uses the existing platform lock wrappers and standard allocation;
-Windows/Linux execution has not been verified locally.
+Production code uses the existing platform lock wrappers and standard
+allocation.

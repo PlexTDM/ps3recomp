@@ -14,15 +14,11 @@
  * its own reachable definition or it fails to build against exactly those
  * (older, not yet re-lifted) titles.
  */
-#ifndef PS3RECOMP_PPU_TLS_H
+#if !defined(PS3RECOMP_PPU_TLS_H)
 #define PS3RECOMP_PPU_TLS_H
 
-#ifndef PPU_THREAD_LOCAL
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL __declspec(thread)
-#  else
+#if !defined(PPU_THREAD_LOCAL)
 #    define PPU_THREAD_LOCAL __thread
-#  endif
 #endif
 
-#endif /* PS3RECOMP_PPU_TLS_H */
+#endif

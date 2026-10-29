@@ -60,69 +60,6 @@ static inline u32 rsx_vertex_element_index(u32 vertex_id, u32 base_index,
     return vertex_id / frequency;
 }
 
-/* DXGI format values for D3D12 input layout */
-#define DXGI_FORMAT_R32_FLOAT           41
-#define DXGI_FORMAT_R32G32_FLOAT        16
-#define DXGI_FORMAT_R32G32B32_FLOAT     6
-#define DXGI_FORMAT_R32G32B32A32_FLOAT  2
-#define DXGI_FORMAT_R16_FLOAT           54
-#define DXGI_FORMAT_R16G16_FLOAT        34
-#define DXGI_FORMAT_R16G16B16A16_FLOAT  10
-#define DXGI_FORMAT_R8_UNORM            61
-#define DXGI_FORMAT_R8G8_UNORM          49
-#define DXGI_FORMAT_R8G8B8A8_UNORM      28
-#define DXGI_FORMAT_R8_UINT             62
-#define DXGI_FORMAT_R8G8_UINT           50
-#define DXGI_FORMAT_R8G8B8A8_UINT       30
-#define DXGI_FORMAT_R16_SNORM           56
-#define DXGI_FORMAT_R16G16_SNORM        36
-#define DXGI_FORMAT_R16G16B16A16_SNORM  13
-
-/* Map RSX vertex type + component count to DXGI format.
- * Returns 0 (DXGI_FORMAT_UNKNOWN) for unsupported combinations. */
-static inline u32 rsx_to_dxgi_format(u32 type, u32 num_components)
-{
-    switch (type) {
-    case RSX_VERTEX_TYPE_F:
-        switch (num_components) {
-        case 1: return DXGI_FORMAT_R32_FLOAT;
-        case 2: return DXGI_FORMAT_R32G32_FLOAT;
-        case 3: return DXGI_FORMAT_R32G32B32_FLOAT;
-        case 4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        }
-        break;
-    case RSX_VERTEX_TYPE_SF:
-        switch (num_components) {
-        case 1: return DXGI_FORMAT_R16_FLOAT;
-        case 2: return DXGI_FORMAT_R16G16_FLOAT;
-        case 4: return DXGI_FORMAT_R16G16B16A16_FLOAT;
-        }
-        break;
-    case RSX_VERTEX_TYPE_UB: /* normalized unsigned byte */
-        switch (num_components) {
-        case 1: return DXGI_FORMAT_R8_UNORM;
-        case 2: return DXGI_FORMAT_R8G8_UNORM;
-        case 4: return DXGI_FORMAT_R8G8B8A8_UNORM;
-        }
-        break;
-    case RSX_VERTEX_TYPE_UB256: /* non-normalized unsigned byte */
-        switch (num_components) {
-        case 1: return DXGI_FORMAT_R8_UINT;
-        case 2: return DXGI_FORMAT_R8G8_UINT;
-        case 4: return DXGI_FORMAT_R8G8B8A8_UINT;
-        }
-        break;
-    case RSX_VERTEX_TYPE_S1: /* signed normalized 16-bit */
-        switch (num_components) {
-        case 1: return DXGI_FORMAT_R16_SNORM;
-        case 2: return DXGI_FORMAT_R16G16_SNORM;
-        case 4: return DXGI_FORMAT_R16G16B16A16_SNORM;
-        }
-        break;
-    }
-    return 0; /* DXGI_FORMAT_UNKNOWN */
-}
-
 #ifdef __cplusplus
 }
 #endif

@@ -26,7 +26,6 @@
 #endif
 #include "../win32_compat.h"
 #include "../win32_backtrace.h"
-#include "../msvc_compat.h"
 
 #include <setjmp.h>
 #include <stdio.h>
@@ -881,59 +880,6 @@ static void test_directories_and_process(void)
                                 &pt, (DWORD)sizeof pt));
 }
 
-/* ---- MSVC CRT and intrinsic spellings ------------------------------------ */
-static __declspec(thread) int t_tls_probe;
-
-static void test_msvc_compat(void)
-{
-    CHECK(_byteswap_ushort(0x1122) == 0x2211);
-    CHECK(_byteswap_ulong(0x11223344u) == 0x44332211u);
-    CHECK(_byteswap_uint64(1ull) == 1ull << 56);
-    uint32_t idx = 99;
-    CHECK(_BitScanForward(&idx, 0x80) && idx == 7);
-    CHECK(_BitScanReverse(&idx, 0x8F) && idx == 7);
-    CHECK(!_BitScanForward(&idx, 0));
-    CHECK(_BitScanReverse64(&idx, 1ull << 40) && idx == 40);
-    CHECK(_BitScanForward64(&idx, 1ull << 33) && idx == 33);
-    CHECK(_rotl(0x80000001u, 1) == 3u && _rotr(3u, 1) == 0x80000001u);
-    CHECK(_rotl64(1ull << 63, 1) == 1ull);
-    CHECK(__popcnt(0xFFu) == 8 && __popcnt64(0xFFFFull) == 16);
-    CHECK(__lzcnt(1u) == 31 && __lzcnt(0u) == 32);
-    unsigned long long hi = 0;
-    CHECK(_umul128(1ull << 63, 4, &hi) == 0 && hi == 2);
-    CHECK(__umulh(1ull << 63, 4) == 2);
-
-    char buf[8];
-    CHECK(_stricmp("AbC", "aBc") == 0 && _strnicmp("AbCd", "aBcX", 3) == 0);
-    CHECK(_snprintf(buf, sizeof buf, "%d", 42) == 2 && strcmp(buf, "42") == 0);
-    CHECK(sprintf_s(buf, sizeof buf, "%s", "xy") == 2 && strcmp(buf, "xy") == 0);
-    CHECK(strcpy_s(buf, sizeof buf, "hello") == 0 && strcmp(buf, "hello") == 0);
-    CHECK(strcpy_s(buf, 3, "hello") == ERANGE && buf[0] == '\0');
-    CHECK(strncpy_s(buf, sizeof buf, "abcdef", 3) == 0 && strcmp(buf, "abc") == 0);
-    CHECK(strcat_s(buf, sizeof buf, "de") == 0 && strcmp(buf, "abcde") == 0);
-    char* dup = _strdup("dup"); CHECK(dup && strcmp(dup, "dup") == 0); free(dup);
-
-    FILE* f = NULL;
-    CHECK(fopen_s(&f, "/nonexistent-dir/x", "rb") != 0 && f == NULL);
-    CHECK(fopen_s(&f, "/dev/null", "rb") == 0 && f != NULL);
-    if (f) { CHECK(_fseeki64(f, 0, SEEK_SET) == 0 && _ftelli64(f) == 0); fclose(f); }
-    struct _stat st;
-    CHECK(_stat("/", &st) == 0 && (st.st_mode & _S_IFDIR));
-    CHECK(_access("/", 0) == 0);
-    CHECK(_putenv_s("PS3_COMPAT_TEST", "1") == 0);
-    char env[16];
-    CHECK(GetEnvironmentVariableA("PS3_COMPAT_TEST", env, sizeof env) == 1 && strcmp(env, "1") == 0);
-    CHECK(GetEnvironmentVariableA("PS3_COMPAT_TEST_MISSING", env, sizeof env) == 0);
-    time_t now = time(NULL); struct tm tmv;
-    CHECK(localtime_s(&tmv, &now) == 0 && tmv.tm_year > 100);
-    void* al = _aligned_malloc(100, 64);
-    CHECK(al && ((uintptr_t)al & 63) == 0); _aligned_free(al);
-    t_tls_probe = 5;
-    CHECK(t_tls_probe == 5);
-    CHECK(_countof(buf) == 8);
-    CHECK((void*)_ReturnAddress() != NULL);
-}
-
 /* GetFileAttributesA: existence and directory-ness, through stat(). */
 static void test_file_attributes(void)
 {
@@ -968,7 +914,6 @@ int main(void)
     test_symbols();
     test_module_names();
     test_directories_and_process();
-    test_msvc_compat();
     printf("win32_compat tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail;
 }

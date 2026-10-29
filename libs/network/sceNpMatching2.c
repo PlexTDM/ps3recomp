@@ -44,18 +44,10 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-static SRWLOCK s_lock = SRWLOCK_INIT;
-#  define LOCK()   AcquireSRWLockExclusive(&s_lock)
-#  define UNLOCK() ReleaseSRWLockExclusive(&s_lock)
-#else
 #  include <pthread.h>
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 #  define LOCK()   pthread_mutex_lock(&s_lock)
 #  define UNLOCK() pthread_mutex_unlock(&s_lock)
-#endif
 
 /* ---------------------------------------------------------------------------
  * SDK constants
@@ -525,13 +517,9 @@ static struct { int used; u16 ctx; u64 room; u16 member; u64 due; } s_sig[SIG_PE
 
 static u64 now_ms(void)
 {
-#ifdef _WIN32
-    return GetTickCount64();
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
-#endif
 }
 
 static void establish_later(m2_ctx* c, u16 member)

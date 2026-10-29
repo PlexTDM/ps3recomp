@@ -2,7 +2,7 @@
  * ps3recomp - Semaphore syscalls
  */
 
-#ifndef SYS_SEMAPHORE_H
+#if !defined(SYS_SEMAPHORE_H)
 #define SYS_SEMAPHORE_H
 
 #include "lv2_syscall_table.h"
@@ -12,14 +12,9 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <time.h>
   #include <errno.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,13 +30,8 @@ typedef struct sys_semaphore_info {
     int32_t  max_value;
     int32_t  waiters;    /* threads currently parked in wait() */
 
-#ifdef _WIN32
-    HANDLE   sem_handle;
-    CRITICAL_SECTION value_lock;  /* protects value for get_value/post */
-#else
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
-#endif
 
 } sys_semaphore_info;
 
@@ -62,4 +52,4 @@ void sys_semaphore_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_SEMAPHORE_H */
+#endif

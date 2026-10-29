@@ -16,10 +16,9 @@
  * Deadlines are absolute CLOCK_REALTIME, matching sem_timedwait, so a caller
  * that computed one for sem_timedwait passes it here unchanged.
  */
-#ifndef PS3RECOMP_POSIX_SEM_H
+#if !defined(PS3RECOMP_POSIX_SEM_H)
 #define PS3RECOMP_POSIX_SEM_H
 
-#ifndef _WIN32
 
 #include <errno.h>
 #include <pthread.h>
@@ -113,5 +112,4 @@ static inline int ps3_sem_timedwait(ps3_sem_t* s, const struct timespec* abs_dea
     return 0;
 }
 
-#endif /* !_WIN32 */
-#endif /* PS3RECOMP_POSIX_SEM_H */
+#endif

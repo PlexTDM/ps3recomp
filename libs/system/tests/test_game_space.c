@@ -1,5 +1,5 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_game_space.c
- * -Wl,-dead_strip -o /tmp/test_game_space && /tmp/test_game_space */
+/* clang -std=gnu17 -I include libs/system/tests/test_game_space.c
+ * -Wl,--gc-sections -o /tmp/test_game_space && /tmp/test_game_space */
 #include <sys/statvfs.h>
 #include <assert.h>
 #include <string.h>

@@ -4,7 +4,7 @@
  * Real thread management using host OS threads.
  */
 
-#ifndef SYS_PPU_THREAD_H
+#if !defined(SYS_PPU_THREAD_H)
 #define SYS_PPU_THREAD_H
 
 #include "lv2_syscall_table.h"
@@ -15,13 +15,8 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <sched.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,22 +51,13 @@ typedef struct ppu_thread_info {
     int          proc_out;     /* the host thread is past its last use of this slot
                                 * (set by the thread procedure, under the table lock) */
 
-#ifdef _WIN32
-    HANDLE       host_thread;
-    DWORD        host_tid;
-#else
     pthread_t    host_thread;
     int          host_detached;   /* pthread_detach has been called on it: once only */
-#endif
 
     /* For join synchronization */
-#ifdef _WIN32
-    HANDLE       finish_event;
-#else
     pthread_mutex_t finish_mutex;
     pthread_cond_t  finish_cond;
     int             finished;
-#endif
 
 } ppu_thread_info;
 
@@ -110,4 +96,4 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_PPU_THREAD_H */
+#endif

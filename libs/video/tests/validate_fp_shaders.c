@@ -8,14 +8,14 @@
  *   - which opcodes are still unhandled, and how often,
  *   - a histogram of every opcode seen across the corpus.
  *
- * This is real-data validation of the decompiler (no synthetic input, no
- * D3D12). D3DCompile of the generated HLSL is a separate, Windows-only step.
+ * This is real-data validation of the decompiler (no synthetic input, no host
+ * GPU). Compiling the generated HLSL is a separate step.
  *
  * Build:
  *   gcc -std=c11 -O2 -I../../../include -I.. \
- *       validate_fp_shaders.c ../rsx_fp_decompiler.c -o vfp.exe
+ *       validate_fp_shaders.c ../rsx_fp_decompiler.c -o vfp
  * Run:
- *   ./vfp.exe "F:/Emulador/Rpcs3/cache/<title>/.../shaders_cache/raw"
+ *   ./vfp /path/to/rpcs3/shaders_cache/raw
  */
 
 #include "rsx_fp_decompiler.h"
@@ -23,10 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#include <windows.h>
-#include <d3dcompiler.h>
-#endif
 
 /* NV40 FP opcode field + END bit + CONST-source detection (mirrors the
  * decompiler/program_size walk) so we can build a full opcode histogram. */
@@ -116,26 +112,6 @@ int main(int argc, char** argv)
         }
         if (file_unhandled) with_unhandled++; else clean++;
 
-#ifdef _WIN32
-        /* Real test: does the generated HLSL actually compile? */
-        {
-            ID3DBlob* code = NULL; ID3DBlob* err = NULL;
-            HRESULT hr = D3DCompile(hlsl, strlen(hlsl), name, NULL, NULL,
-                                    "main", "ps_5_0", 0, 0, &code, &err);
-            if (SUCCEEDED(hr)) {
-                compiled++;
-                if (code) code->lpVtbl->Release(code);
-            } else {
-                compile_fail++;
-                if (shown < 4) {
-                    printf("  [D3DCompile FAIL] %s: %s\n", name,
-                           err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
-                    shown++;
-                }
-            }
-            if (err) err->lpVtbl->Release(err);
-        }
-#endif
     }
     closedir(d);
 
@@ -145,10 +121,6 @@ int main(int argc, char** argv)
     printf("with unhandled op: %d\n", with_unhandled);
     printf("decode errors    : %d\n", decode_err);
     printf("no PROGRAM_END   : %d  (decoded up to file end)\n", no_end);
-#ifdef _WIN32
-    printf("D3DCompile OK    : %d  (%.1f%%)\n", compiled, total ? 100.0*compiled/total : 0);
-    printf("D3DCompile FAIL  : %d\n", compile_fail);
-#endif
 
     printf("\n=== opcode histogram (count / unhandled-files) ===\n");
     for (int op = 0; op < 64; op++) {

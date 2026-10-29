@@ -19,24 +19,6 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 
-#if defined(_WIN32)
-#  define WIN32_LEAN_AND_MEAN
-#  include <windows.h>
-#  include <intrin.h>
-#  define LS_RELAX() _mm_pause()
-static SRWLOCK            s_ls_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE s_ls_cv   = CONDITION_VARIABLE_INIT;
-#  define LS_LOCK()       AcquireSRWLockExclusive(&s_ls_lock)
-#  define LS_UNLOCK()     ReleaseSRWLockExclusive(&s_ls_lock)
-#  define LS_WAIT()       SleepConditionVariableSRW(&s_ls_cv, &s_ls_lock, INFINITE, 0)
-#  define LS_BROADCAST()  WakeAllConditionVariable(&s_ls_cv)
-static uint64_t ls_now_ns(void)
-{
-    static LARGE_INTEGER freq; if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (uint64_t)((c.QuadPart * 1000000000ull) / (uint64_t)freq.QuadPart);
-}
-#else
 #  include <pthread.h>
 #  include <time.h>
 #  if defined(__x86_64__) || defined(__i386__)
@@ -57,7 +39,6 @@ static uint64_t ls_now_ns(void)
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
-#endif
 
 volatile int g_yz_lockstep_on = -1;
 

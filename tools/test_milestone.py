@@ -23,8 +23,6 @@ import shutil
 import subprocess
 import sys
 
-from msvc_env import find_vcvars
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRATCH = os.path.join(ROOT, "scratch")
 
@@ -39,14 +37,9 @@ DRIVER = r"""
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#  include <windows.h>
-   typedef HANDLE thr_t;
-#else
-#  include <pthread.h>
-#  include <unistd.h>
-   typedef pthread_t thr_t;
-#endif
+#include <pthread.h>
+#include <unistd.h>
+typedef pthread_t thr_t;
 
 #define MS_CKPT_SECS 2   /* must match runtime/milestone.c */
 
@@ -66,11 +59,7 @@ static void worker_body(void)
         ps3_ms(k_shared[i %% N_KEYS]);
 }
 
-#ifdef _WIN32
-static DWORD __stdcall worker(LPVOID p) { (void)p; worker_body(); return 0; }
-#else
 static void* worker(void* p) { (void)p; worker_body(); return NULL; }
-#endif
 
 int main(int argc, char** argv)
 {
@@ -91,31 +80,16 @@ int main(int argc, char** argv)
     ps3_ms_kv("scalar:answer", 43);   /* last value wins */
     ps3_ms_kv("scalar:big", 1234567890123LL);
 
-    for (i = 0; i < N_THREADS; i++) {
-#ifdef _WIN32
-        th[i] = CreateThread(NULL, 0, worker, NULL, 0, NULL);
-#else
+    for (i = 0; i < N_THREADS; i++)
         pthread_create(&th[i], NULL, worker, NULL);
-#endif
-    }
-    for (i = 0; i < N_THREADS; i++) {
-#ifdef _WIN32
-        WaitForSingleObject(th[i], INFINITE);
-        CloseHandle(th[i]);
-#else
+    for (i = 0; i < N_THREADS; i++)
         pthread_join(th[i], NULL);
-#endif
-    }
 
     if (strcmp(mode, "--nodump") == 0) {
         /* What a watchdog kill looks like: keep working past the checkpoint
          * interval, then straight out with no atexit handlers. The counts on
          * disk have to come from the periodic checkpoint, not from the dump. */
-#ifdef _WIN32
-        Sleep(1000 * (MS_CKPT_SECS + 1));
-#else
         sleep(MS_CKPT_SECS + 1);
-#endif
         worker_body();
         fflush(NULL);
         _exit(0);
@@ -127,26 +101,6 @@ int main(int argc, char** argv)
 
 def build(driver_c, exe):
     """Compile the driver + the real milestone.c. Returns (ok, message)."""
-    if os.name == "nt":
-        clang = shutil.which("clang-cl") or r"C:\Program Files\LLVM\bin\clang-cl.exe"
-        if not os.path.exists(clang) and not shutil.which("clang-cl"):
-            return False, "clang-cl not found"
-        vcvars = find_vcvars()
-        if not vcvars:
-            return False, "vcvars64.bat not found"
-        bat = os.path.join(SCRATCH, "milestone_build.bat")
-        log = os.path.join(SCRATCH, "milestone_build.log")
-        with open(bat, "w") as f:
-            f.write("@echo off\n")
-            f.write('call "%s" >nul 2>nul\n' % vcvars)
-            f.write('cd /d "%s"\n' % ROOT)
-            f.write('"%s" /nologo /W3 /I include /Fe:"%s" "%s" runtime\\milestone.c '
-                    '> "%s" 2>&1\n' % (clang, exe, driver_c, log))
-        rc = subprocess.run(["cmd", "/c", bat], cwd=ROOT).returncode
-        if rc != 0:
-            return False, open(log).read() if os.path.exists(log) else "compile failed"
-        return True, ""
-
     cc = os.environ.get("CC") or shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     if not cc:
         return False, "no C compiler found (set CC)"
@@ -210,7 +164,7 @@ def main():
 
     os.makedirs(SCRATCH, exist_ok=True)
     driver_c = os.path.join(SCRATCH, "milestone_driver.c")
-    exe = os.path.join(SCRATCH, "milestone_driver" + (".exe" if os.name == "nt" else ""))
+    exe = os.path.join(SCRATCH, "milestone_driver")
     out = os.path.join(SCRATCH, "milestone_out.txt")
 
     with open(driver_c, "w") as f:

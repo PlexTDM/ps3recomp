@@ -12,10 +12,6 @@
 // macOS keeps the ucontext routines behind _XOPEN_SOURCE (deprecated, still
 // present); _DARWIN_C_SOURCE keeps the rest of the system headers visible.
 // Both must come before the first system header.
-#if defined(__APPLE__)
-#  define _XOPEN_SOURCE 600
-#  define _DARWIN_C_SOURCE
-#endif
 #include "ppu_recomp.h"
 #include <cstdio>
 #include <cstdlib>

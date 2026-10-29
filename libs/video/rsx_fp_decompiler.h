@@ -2,11 +2,12 @@
  * ps3recomp - RSX Fragment Program (NV40 ISA) → HLSL decompiler
  *
  * Translates an RSX fragment shader (NVIDIA NV40 "nvfx" fragment program
- * encoding) into an HLSL pixel shader source string suitable for D3DCompile.
+ * encoding) into an HLSL pixel shader source string, which the Vulkan backend
+ * translates to SPIR-V with glslang.
  *
  * See docs/RSX_FRAGMENT_PROGRAM.md for the instruction encoding reference
- * (sourced from Mesa/nouveau nvfx_shader.h). This module is self-contained:
- * it has no D3D12 dependency and can be built/tested standalone.
+ * (sourced from Mesa/nouveau nvfx_shader.h). This module is self-contained
+ * and can be built/tested standalone.
  */
 
 #ifndef PS3RECOMP_RSX_FP_DECOMPILER_H
@@ -67,7 +68,7 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
- * shader. D3D12 has no fixed-function alpha test, so the comparison is
+ * shader. The host API has no fixed-function alpha test, so the comparison is
  * emitted immediately before the shader's final color return. `func` uses
  * the CELL_GCM comparison values 0x200..0x207 and `ref` is normalized to the
  * render target's component representation. Returns 1 when a test was
@@ -198,7 +199,7 @@ u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
 }
 #endif
 
-/* Kept from this tree (see the .c) -- used by rsx_d3d12_backend.c. */
+/* Used by the draw engine and the Vulkan backend. */
 int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_out);
 u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes);
 /* The texture units a program samples (TEX, TXP, TXD, TXL, TXB, TEXBEM,

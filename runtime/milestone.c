@@ -10,7 +10,7 @@
  * Atomics are the __atomic builtins rather than C11 <stdatomic.h>, matching
  * runtime/platform/win32_compat.h: _Atomic and atomic_load_explicit are C-only
  * spellings and this tree is mixed C/C++. All four supported toolchains are
- * gcc or clang (clang-cl on Windows), so the builtins are always available.
+ * gcc or clang, so the builtins are always available.
  */
 #include "ps3emu/milestone.h"
 

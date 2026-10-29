@@ -12,18 +12,18 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| sysPrxForUser | Core Runtime | **Complete** | Real host threads, lwmutex (CRITICAL_SECTION/pthread), lwcond (CV/pthread_cond), heap alloc, printf/snprintf, string/mem ops |
+| sysPrxForUser | Core Runtime | **Complete** | Real host threads, lwmutex (pthread mutex), lwcond (pthread cond), heap alloc, printf/snprintf, string/mem ops |
 | cellSysmodule | Module Loader | **Complete** | Load/unload tracking, 55+ module ID constants, name lookup |
 | cellSysutil | System Utility | **Complete** | Callbacks, system params, BGM playback, system cache, disc game check, license area |
-| sys_ppu_thread | Kernel Threading | **Complete** | Real host threads (CreateThread/pthreads), join, detach, priority, rename |
+| sys_ppu_thread | Kernel Threading | **Complete** | Real host threads (pthreads), join, detach, priority, rename |
 | sys_fs | Kernel Filesystem | **Complete** | Full file I/O with PS3-to-host path mapping, directory ops, stat, big-endian output |
 | sys_memory | Kernel Memory | **Complete** | Bump allocator from VM, containers, shared memory, mmapper |
 | sys_event | Kernel Events | **Complete** | Event queues (circular buffer), ports (connect/send), 64-bit event flags (AND/OR wait) |
-| sys_mutex | Kernel Mutex | **Complete** | CRITICAL_SECTION/pthread_mutex, recursive, timed lock, deadlock detection |
-| sys_cond | Kernel Condvar | **Complete** | CONDITION_VARIABLE/pthread_cond, timed wait, signal, broadcast |
-| sys_semaphore | Kernel Semaphore | **Complete** | Win32 Semaphore/POSIX sem_t, timeout, multi-count post |
-| sys_rwlock | Kernel RWLock | **Complete** | SRWLock/pthread_rwlock, full read/write/try variants |
-| sys_timer | Kernel Timer | **Complete** | QueryPerformanceCounter/clock_gettime, periodic event timers, usleep, timebase freq |
+| sys_mutex | Kernel Mutex | **Complete** | pthread_mutex, recursive, timed lock, deadlock detection |
+| sys_cond | Kernel Condvar | **Complete** | pthread_cond, timed wait, signal, broadcast |
+| sys_semaphore | Kernel Semaphore | **Complete** | POSIX sem_t, timeout, multi-count post |
+| sys_rwlock | Kernel RWLock | **Complete** | pthread_rwlock, full read/write/try variants |
+| sys_timer | Kernel Timer | **Complete** | clock_gettime, periodic event timers, usleep, timebase freq |
 | sys_interrupt | Kernel Interrupt | **Complete** | Interrupt tag/thread management, EOI (stub — no real interrupts) |
 
 ## Filesystem
@@ -37,7 +37,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellPad | Gamepad | **Complete** | XInput (Windows) / SDL2 backends, analog sticks, triggers, pressure buttons, rumble |
+| cellPad | Gamepad | **Complete** | SDL2 backend, analog sticks, triggers, pressure buttons, rumble |
 | cellKb | Keyboard | **Complete** | Key event injection, raw/ASCII modes, modifier/LED tracking |
 | cellMouse | Mouse | **Complete** | Delta accumulation, buttons, wheel, buffered ring-buffer mode |
 
@@ -46,7 +46,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | cellGcmSys | RSX System | **Complete** | Command buffer control, local mem allocator, IO mapping with offset tables, flip handler/VBlank callbacks, tile/zcull config, report/label areas, timestamps, 27+ functions |
-| RSX Command Processor | GPU Commands | **Complete** | NV47xx FIFO parsing, state tracking (surfaces, viewport, scissor, blend, depth/stencil, cull, color mask, alpha test, 16 texture units, 16 vertex attribs, shader programs), draw arrays/indexed dispatch, rsx_backend callback interface. **D3D12 backend renders real titles** — the guest's own NV4097 vertex and fragment programs, indexed draws, per-draw constants and textures, render-to-texture, MRT. A Metal backend covers macOS. Vulkan is still unwritten, and is what Linux and Android need. |
+| RSX Command Processor | GPU Commands | **Complete** | NV47xx FIFO parsing, state tracking (surfaces, viewport, scissor, blend, depth/stencil, cull, color mask, alpha test, 16 texture units, 16 vertex attribs, shader programs), draw arrays/indexed dispatch, rsx_backend callback interface. **Vulkan backend renders real titles** — the guest's own NV4097 vertex and fragment programs, indexed draws, per-draw constants and textures, render-to-texture, MRT. The null backend is the headless fallback and CI path. |
 | cellResc | Resolution | **Complete** | Init, display modes, buffer management, aspect ratio, interlace, flip/vblank handlers |
 | cellVideoOut | Video Output | **Complete** | Resolution config, device info, all PS3 resolution IDs, default 720p |
 
@@ -54,7 +54,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellAudio | Audio Output | **Complete** | WASAPI (Win) / SDL2 backends, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
+| cellAudio | Audio Output | **Complete** | SDL2 backend, mixing thread @ 5.33ms, multi-port mixing, 7.1 downmix |
 | cellVoice | Voice Chat | **Complete** | Port management, connect/disconnect, start/stop, read/write (no actual voice data) |
 | cellMic | Microphone | **Complete** | Init/end, all queries report no microphone attached |
 
@@ -92,12 +92,12 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 | Module | Category | Status | Notes |
 |---|---|---|---|
 | sys_net | BSD Sockets | **Complete** | Full BSD socket API — socket, bind, listen, accept, connect, send/recv/sendto/recvfrom, poll, select, setsockopt/getsockopt, shutdown, close, gethostbyname, inet_aton, errno |
-| cellNet | Network Core | **Complete** | Winsock/POSIX init, DNS resolver with real getaddrinfo, async poll |
+| cellNet | Network Core | **Complete** | POSIX socket init, DNS resolver with real getaddrinfo, async poll |
 | cellNetCtl | Network Control | **Complete** | Real host IP detection, NAT type, connection state, handler callbacks |
-| cellHttp | HTTP Client | **Complete** | Real HTTP/1.1 via native sockets (Winsock2/POSIX), DNS resolve, send/recv, header parsing, Content-Length, custom headers, timeouts |
+| cellHttp | HTTP Client | **Complete** | Real HTTP/1.1 via POSIX sockets, DNS resolve, send/recv, header parsing, Content-Length, custom headers, timeouts |
 | cellHttps | HTTPS Client | **Complete** | TLS/SSL client stub — init/end lifecycle, CA cert and client cert management, verify level config, no actual TLS (needs crypto lib) |
 | cellHttpUtil | HTTP Utility | **Complete** | URL parsing/building, percent-encoding, form encoding, Base64 codec |
-| cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via BCryptGenRandom/urandom |
+| cellSsl | SSL/TLS | **Complete** | Init/end lifecycle, certificate stubs, RNG via urandom |
 | cellRudp | Reliable UDP | **Complete** | Context management, bind/close work, connect/send/recv return NOT_CONNECTED |
 
 ## PSN / NP
@@ -132,10 +132,10 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 | Module | Category | Status | Notes |
 |---|---|---|---|
-| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (CRITICAL_SECTION/pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md |
+| cellSpurs | SPURS | Partial | Management APIs, workloads, tasks, tasksets, event flags with real blocking (pthread condvars). Tasks, job chains and workloads run lifted SPU code; see SPU_LIFTER.md |
 | cellSpursJq | SPURS Job Queue | **Complete** | Job queue create/destroy, push with completion tracking, wait/tryWait with proper BUSY returns, port create/destroy, 16 max queues |
 | cellDaisy | Daisy Chain | **Complete** | Lock-free FIFO pipes with real ring buffer, push/pop/try variants, 32 max pipes, 256 max depth, count/free queries |
-| cellFiber | Fiber | **Complete** | PPU fibers via Windows Fibers/ucontext, create/delete/switch/yield/sleep/wakeup |
+| cellFiber | Fiber | **Complete** | PPU fibers via ucontext, create/delete/switch/yield/sleep/wakeup |
 | cellSync | Sync Primitives | **Complete** | Atomic spinlock mutex, counter barrier, RWM, bounded queue, lock-free queue |
 | cellSync2 | Sync Primitives 2 | **Complete** | OS-backed mutex/cond/semaphore/queue with timeouts |
 
@@ -181,7 +181,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
 
 ## Next Priorities
 
-1. **Metal and Vulkan at D3D12 parity** — the shared draw engine runs guest shaders on both; a title has yet to run on either from this tree
+1. **Vulkan coverage** — the shared draw engine runs the title's guest shaders; the remaining work is the unhandled state listed in [BUILDING.md](BUILDING.md#guest-programs-and-the-draw-engine)
 2. **cellSpurs** — the remaining SPURS surface (Taskset2, workload edge cases)
 3. **cellAdec / cellDmux / cellSail** — Real audio decode and PAMF demux on the run-time FFmpeg loader cellVdec uses (`libs/codec/ffmpeg_runtime.c`)
 4. **cellJpgEnc / cellPngEnc** — Integrate stb_image_write for actual encoding

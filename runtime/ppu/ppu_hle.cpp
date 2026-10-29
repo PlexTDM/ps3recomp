@@ -529,8 +529,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     /* The host return address, named only when a profiler reads it: naming
      * it here was a binary search over every lifted function per call. */
     ppu_prof_stamp_ra(ctx, __builtin_return_address(0));
-    /* PPU_WAITPROF: nothing below touches the thread-local name when it is off
-     * -- on macOS every thread-local access is a call, on every HLE call. */
+    /* PPU_WAITPROF: nothing below touches the thread-local name when it is
+     * off -- a thread-local access can be a call on every HLE call. */
     const int _wp_on = ppu_waitprof_on();
     const unsigned _site = _wp_on ? ppu_prof_resolve_host(__builtin_return_address(0)) : 0;
     struct _WpGuard { unsigned tid, site; uint64_t t0; const char* prev; int on;
@@ -600,12 +600,6 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if(((v>=0x00010000u&&v<0x00900000u)||(v>=0x30000000u&&v<0x30100000u)) && v!=0x008969A8u){
               if(v!=prev){ p+=snprintf(b+p,sizeof(b)-p," %08X",v); prev=v; found++; } } }
           fprintf(stderr,"%s\n",b); }
-#ifdef _WIN32
-        { void* bt[40]; unsigned short fr=RtlCaptureStackBackTrace(0,40,bt,0);
-          char* mb=(char*)GetModuleHandleA(0); char line[1100]; int p=snprintf(line,sizeof line,"[exit-chain] HOST-bt rva:");
-          for(int i=0;i<fr;i++) p+=snprintf(line+p,sizeof(line)-p," %llX",(unsigned long long)((char*)bt[i]-mb));
-          fprintf(stderr,"%s\n",line); }
-#endif
     }
     /* PPC64 ELFv1 cross-module ABI: the caller restores its TOC right after the
      * call with `ld r2, 0x28(r1)`, expecting the import stub to have saved the

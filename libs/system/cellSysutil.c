@@ -78,23 +78,11 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 /* Dialog and other one-shot completions carry their own OPD, rather than a
  * registered sysutil slot. Detach one batch before invoking guest code so a
  * callback may safely enqueue another completion for the next poll. */
-#ifdef _WIN32
-#include <windows.h>
-static SRWLOCK s_completion_lock = SRWLOCK_INIT;
-#define COMPLETION_LOCK() AcquireSRWLockExclusive(&s_completion_lock)
-#define COMPLETION_UNLOCK() ReleaseSRWLockExclusive(&s_completion_lock)
-#else
 #include <pthread.h>
 static pthread_mutex_t s_completion_lock = PTHREAD_MUTEX_INITIALIZER;
 #define COMPLETION_LOCK() pthread_mutex_lock(&s_completion_lock)
 #define COMPLETION_UNLOCK() pthread_mutex_unlock(&s_completion_lock)
-#endif
-/* MinGW GCC ignores __declspec(thread), so it is for MSVC only. */
-#if defined(_MSC_VER)
-#define COMPLETION_TLS __declspec(thread)
-#else
 #define COMPLETION_TLS _Thread_local
-#endif
 
 typedef struct GuestCompletion {
     struct GuestCompletion* next;

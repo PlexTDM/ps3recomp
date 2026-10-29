@@ -3,9 +3,9 @@
  *
  * Deterministic lv2 sync-primitive stress suite.
  * Exercises runtime/syscalls/sys_mutex.c, sys_cond.c, sys_semaphore.c,
- * sys_event.c directly (as C functions taking a ppu_context*), on Win32
- * threads -- real ones on Windows, runtime/platform/win32_compat.h's
- * elsewhere -- with NO dependency on the yakuza runner or the recompiled game.
+ * sys_event.c directly (as C functions taking a ppu_context*), on the
+ * runtime's host threads through runtime/platform/win32_compat.h,
+ * with NO dependency on the yakuza runner or the recompiled game.
  *
  * Usage: sync_stress [seed]   (default seed 0)
  *
@@ -13,13 +13,8 @@
  * stderr for the FAIL dump: which test, which thread/object, and counters).
  */
 
-/* Win32 threads and interlocked ops on every host: a passthrough to
- * <windows.h> on Windows, the runtime's own shim elsewhere. */
+/* Host threads and interlocked ops through the runtime's shim. */
 #include "../../runtime/platform/win32_compat.h"
-#include "../../runtime/platform/msvc_compat.h"   /* __declspec(thread), __stdcall */
-#ifdef _WIN32
-#include <process.h>
-#endif
 
 #include <stdint.h>
 #include <stdio.h>
@@ -62,7 +57,7 @@ static uint32_t guest_alloc(uint32_t size)
 /* Per-host-thread guest thread id (the runtime keys mutex ownership / cond
  * ownership checks off ppu_context.thread_id, and sys_cond.c / sys_semaphore.c
  * / sys_event.c's diagnostic levers key off yz_thread_current_id()). */
-static __declspec(thread) uint32_t t_tid = 0;
+static __thread uint32_t t_tid = 0;
 uint32_t yz_thread_current_id(void) { return t_tid; }
 
 static LONG volatile g_next_tid = 1;
@@ -245,7 +240,7 @@ typedef struct {
     int iters_for_me;
 } t1_arg;
 
-static unsigned __stdcall t1_producer(void* p)
+static unsigned t1_producer(void* p)
 {
     t1_arg* arg = (t1_arg*)p;
     t1_shared* sh = arg->sh;
@@ -268,7 +263,7 @@ static unsigned __stdcall t1_producer(void* p)
     return 0;
 }
 
-static unsigned __stdcall t1_consumer(void* p)
+static unsigned t1_consumer(void* p)
 {
     t1_arg* arg = (t1_arg*)p;
     t1_shared* sh = arg->sh;
@@ -329,7 +324,7 @@ static unsigned __stdcall t1_consumer(void* p)
  * (a stuck consumer thread can't be safely cancelled out of a CRITICAL_
  * SECTION/CV wait, so "detect and report, then terminate" is the only sound
  * way to bound this test's runtime on a genuine lost wakeup). */
-static unsigned __stdcall t1_watchdog(void* p)
+static unsigned t1_watchdog(void* p)
 {
     t1_shared* sh = (t1_shared*)p;
     for (;;) {
@@ -381,7 +376,7 @@ typedef struct {
     LONG volatile parked_at_ms; /* set just before the consumer waits */
 } t1b_shared;
 
-static unsigned __stdcall t1b_consumer(void* p)
+static unsigned t1b_consumer(void* p)
 {
     t1b_shared* sh = (t1b_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -399,7 +394,7 @@ static unsigned __stdcall t1b_consumer(void* p)
     return 0;
 }
 
-static unsigned __stdcall t1b_watchdog(void* p)
+static unsigned t1b_watchdog(void* p)
 {
     t1b_shared* sh = (t1b_shared*)p;
     for (;;) {
@@ -569,7 +564,7 @@ static int test1_no_lost_wakeup(void)
  * wait itself, but we also assert the wall-clock elapsed matches order of
  * magnitude). Semaphore timed waits get the same treatment.
  * ========================================================================= */
-static unsigned __stdcall t2_signal_after_delay(void* p);
+static unsigned t2_signal_after_delay(void* p);
 
 static int test2_timed_wait_semantics(void)
 {
@@ -659,7 +654,7 @@ static int test2_timed_wait_semantics(void)
     return ok ? 0 : 1;
 }
 
-static unsigned __stdcall t2_signal_after_delay(void* p)
+static unsigned t2_signal_after_delay(void* p)
 {
     typedef struct { uint32_t mid, cid; } signaler_arg;
     signaler_arg* a = (signaler_arg*)p;
@@ -693,7 +688,7 @@ typedef struct {
     LONG volatile stop;
 } t3_shared;
 
-static unsigned __stdcall t3_poster(void* p)
+static unsigned t3_poster(void* p)
 {
     typedef struct { t3_shared* sh; int units_for_me; uint32_t seed; } t3_parg;
     t3_parg* arg = (t3_parg*)p;
@@ -720,7 +715,7 @@ static unsigned __stdcall t3_poster(void* p)
     return 0;
 }
 
-static unsigned __stdcall t3_waiter(void* p)
+static unsigned t3_waiter(void* p)
 {
     typedef struct { t3_shared* sh; int units_for_me; } t3_warg;
     t3_warg* arg = (t3_warg*)p;
@@ -739,7 +734,7 @@ static unsigned __stdcall t3_waiter(void* p)
     return 0;
 }
 
-static unsigned __stdcall t3_monitor(void* p)
+static unsigned t3_monitor(void* p)
 {
     t3_shared* sh = (t3_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -871,7 +866,7 @@ typedef struct {
     LONG volatile last_seq[T4_SOURCES];
 } t4a_shared;
 
-static unsigned __stdcall t4a_source(void* p)
+static unsigned t4a_source(void* p)
 {
     typedef struct { t4a_shared* sh; int source_idx; } t4a_sarg;
     t4a_sarg* arg = (t4a_sarg*)p;
@@ -890,7 +885,7 @@ static unsigned __stdcall t4a_source(void* p)
     return 0;
 }
 
-static unsigned __stdcall t4a_receiver(void* p)
+static unsigned t4a_receiver(void* p)
 {
     t4a_shared* sh = (t4a_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -980,7 +975,7 @@ typedef struct {
     CRITICAL_SECTION seen_lock;      /* bookkeeping only -- NOT an ordering oracle */
 } t4b_shared;
 
-static unsigned __stdcall t4b_source(void* p)
+static unsigned t4b_source(void* p)
 {
     typedef struct { t4b_shared* sh; int source_idx; } t4b_sarg;
     t4b_sarg* arg = (t4b_sarg*)p;
@@ -999,7 +994,7 @@ static unsigned __stdcall t4b_source(void* p)
     return 0;
 }
 
-static unsigned __stdcall t4b_receiver(void* p)
+static unsigned t4b_receiver(void* p)
 {
     t4b_shared* sh = (t4b_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1131,7 +1126,7 @@ typedef struct {
     LONG volatile counter;
 } t6_shared;
 
-static unsigned __stdcall t6_owner(void* p)
+static unsigned t6_owner(void* p)
 {
     t6_shared* sh = (t6_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1157,7 +1152,7 @@ static unsigned __stdcall t6_owner(void* p)
     return 0;
 }
 
-static unsigned __stdcall t6_prober(void* p)
+static unsigned t6_prober(void* p)
 {
     t6_shared* sh = (t6_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1189,7 +1184,7 @@ static unsigned __stdcall t6_prober(void* p)
     return 1;
 }
 
-static unsigned __stdcall t6_worker(void* p)
+static unsigned t6_worker(void* p)
 {
     t6_shared* sh = (t6_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1264,9 +1259,9 @@ static int test6_recursive_mutex(void)
  * The write lock has an owner, and three answers depend on it: a second
  * wlock or trywlock by the owner is CELL_EDEADLK (never a block, because the
  * host lock is not recursive), and a wunlock by anyone else is CELL_EPERM
- * with the owner's lock left standing. The POSIX branch used to carry none
- * of that: the re-lock blocked forever on Darwin and a foreign wunlock
- * released whatever the caller happened to hold.
+ * with the owner's lock left standing. The old POSIX branch used to carry none
+ * of that: the re-lock blocked forever and a foreign wunlock released whatever
+ * the caller happened to hold.
  *
  * The owner's sequence runs on its own thread so a regression shows up as a
  * FAIL with a message rather than wedging the whole suite.
@@ -1283,7 +1278,7 @@ typedef struct {
     LONG volatile torn_reads;
 } t5_shared;
 
-static unsigned __stdcall t5_owner(void* p)
+static unsigned t5_owner(void* p)
 {
     t5_shared* sh = (t5_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1309,7 +1304,7 @@ static unsigned __stdcall t5_owner(void* p)
     return 0;
 }
 
-static unsigned __stdcall t5_helper(void* p)
+static unsigned t5_helper(void* p)
 {
     t5_shared* sh = (t5_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1336,7 +1331,7 @@ static unsigned __stdcall t5_helper(void* p)
     return 0;
 }
 
-static unsigned __stdcall t5_writer(void* p)
+static unsigned t5_writer(void* p)
 {
     t5_shared* sh = (t5_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;
@@ -1355,7 +1350,7 @@ static unsigned __stdcall t5_writer(void* p)
     return 0;
 }
 
-static unsigned __stdcall t5_reader(void* p)
+static unsigned t5_reader(void* p)
 {
     t5_shared* sh = (t5_shared*)p;
     uint32_t tid = alloc_tid(); t_tid = tid;

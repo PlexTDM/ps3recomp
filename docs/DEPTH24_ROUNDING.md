@@ -39,5 +39,4 @@ clang -std=c11 -Wno-comment -I include -I libs/video \
 
 The unchanged parent fails 26 checks; the change passes all 126 at both default
 optimization and `-O2`. The existing complete draw-engine suite also passes.
-This is independent of the Metal depth-readback change and requires no GPU or
-original game data.
+This requires no GPU or original game data.

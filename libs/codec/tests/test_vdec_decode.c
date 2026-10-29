@@ -36,6 +36,7 @@ uint32_t ppu_vm_size;
 uint32_t ppu_hle_inject_base = 0x01000000u;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;
+int g_spu_coh_armed;   /* ppu_memory.h's VM_WRITE_COH: no SPU here */
 void ppu_resv_break_store(uint64_t ea) { (void)ea; }
 void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
 int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }

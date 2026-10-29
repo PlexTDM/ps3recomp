@@ -24,8 +24,8 @@ Primary contracts are pinned to RPCS3 ffba2bf09ef3980638f9327b25240d81414034ab:
 
 Synthetic tests `test_rsx_framebuffer_srgb.c` exercise real engine dispatch,
 eligibility, cache transitions, atomic failures, MRT output and alpha-test
-composition. The companion Metal fixture consumes its generated synthetic
-HLSL and observes float targets to prevent quantization hiding an error.
+composition. The generated synthetic HLSL is consumed by the draw-engine tests, whose float
+targets prevent quantization hiding an error.
 This verifies translated GPU execution, not original RSX hardware or an
 application scene. Texture gamma is a separately controlled operation and
 must be honored when enabled to preserve an encoded copy's original math.

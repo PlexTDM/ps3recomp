@@ -2,8 +2,7 @@
  * ps3recomp - cellSync2 HLE
  *
  * Extended synchronization primitives with timeout and priority support.
- * Implemented using host OS primitives (Windows SRWLOCK/CONDITION_VARIABLE,
- * pthreads mutex/cond/sem on Unix).
+ * Implemented using pthreads mutex/cond and the portable semaphore shim.
  */
 
 #ifndef PS3RECOMP_CELL_SYNC2_H

@@ -29,7 +29,8 @@ Run existing game ports, compare behavior with RPCS3, and report discrepancies. 
 ### Prerequisites
 - **Python 3.10+** — for recompiler tools
 - **CMake 3.20+** — build system
-- **C17/C++20 compiler** — MSVC 19.x (VS 2019+), GCC 12+, or Clang 15+
+- **C17/C++20 compiler** — GCC 12+ or Clang 15+
+- **SDL2** development headers
 - **Git** — version control
 
 ### Building from Source
@@ -42,12 +43,6 @@ pip install -r requirements.txt
 # Build the runtime library
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
-```
-
-On Windows with Visual Studio:
-```bash
-cmake -B build
-cmake --build build --config Release
 ```
 
 ### Running Tests
@@ -102,7 +97,7 @@ ps3recomp/
 
 ### General
 - No trailing whitespace
-- LF line endings (Git handles CRLF on Windows)
+- LF line endings
 - 4-space indentation (no tabs) in C/C++
 - Keep files under 500 lines when practical (HLE modules should be self-contained)
 

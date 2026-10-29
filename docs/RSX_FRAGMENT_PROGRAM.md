@@ -77,14 +77,14 @@ pack/unpack (PK*/UP*), DDX/DDY beyond XY, DST/LIT/DP2A/TXD/TXB, branching
 differences (H registers are treated as full-precision float4).
 
 ### Integration TODO (not done this increment)
-1. Wire `rsx_fp_decompile()` into the D3D12 backend: hash the bytecode at
-   `fragment_program_addr`, decompile once, compile with `D3DCompile`, cache
-   the PS blob, and fold the shader identity into the `PsoKey` so the PSO
-   cache builds a pipeline per (shader × blend × depth).
+1. **DONE.** `rsx_fp_decompile()` feeds the shared draw engine: the bytecode at
+   `fragment_program_addr` is decompiled to HLSL, translated to SPIR-V by
+   glslang, and the shader identity is folded into the pipeline key so the
+   Vulkan backend builds one pipeline per (shader × blend × depth).
 2. **DONE.** Interpolated inputs COL0/COL1/FOG/TEXCOORD0..7 (+ WPOS via
    SV_POSITION) are plumbed through the passthrough VS + 12-element input
    layout; `input_expr` maps INPUT_SRC accordingly. TC8/TC9/FACING still → 0.
    Caveat: passthrough-VP model (raw attributes forwarded; the vertex program
    is not translated).
-3. Upload fragment-program constants to a constant buffer (the inline CONST
-   slots) and bind textures (depends on `d3d12_bind_texture`, still a stub).
+3. **DONE.** Fragment-program constants go to a dynamic uniform buffer and
+   textures bind through the Vulkan backend's per-unit descriptors.

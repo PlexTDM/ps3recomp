@@ -3,9 +3,6 @@
  */
 
 #include <setjmp.h>
-#if defined(__APPLE__)
-#include <pthread/qos.h>
-#endif
 
 /* sys_ppu_thread_exit never returns on hardware. Returning CELL_OK to the
  * guest lets it run on past the call: Twisted Metal has a thread that exits
@@ -14,11 +11,7 @@
  * instead. PS3_NO_THREAD_EXIT_UNWIND=1 restores the old behaviour. */
 /* MinGW GCC ignores __declspec(thread) ("'thread' attribute directive
  * ignored"), which would make these two process-wide: MSVC only. */
-#if defined(_MSC_VER)
-#  define PPU_TLS __declspec(thread)
-#else
 #  define PPU_TLS __thread
-#endif
 static PPU_TLS jmp_buf s_exit_jmp;
 static PPU_TLS int     s_exit_armed = 0;
 
@@ -28,20 +21,13 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
-#ifndef _WIN32
 #include <errno.h>
-#endif
 
 /* Host stack reserved per guest thread, for pthread_attr_setstacksize. The
  * same 256 MB the Win32 branch hands _beginthreadex a few hundred lines
  * down; keep the two in step so a stack-depth bug reproduces on both. */
 #define PPU_HOST_STACK_BYTES  (256u * 1024u * 1024u)
 
-#ifdef _WIN32
-#include <process.h>   /* _beginthreadex: CRT-aware thread creation (raw CreateThread
-                        * leaves per-thread CRT state uninit -> buffered fread() silently
-                        * returns 0 on those threads). */
-#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -51,33 +37,16 @@ vm_stack_alloc        g_vm_stack_alloc;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
 
 /* Simple mutex for thread table access */
-#ifdef _WIN32
-static CRITICAL_SECTION s_table_lock;
-static int              s_table_lock_init = 0;
-#else
 static pthread_mutex_t  s_table_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 static void table_lock(void)
 {
-#ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_table_lock);
-#else
     pthread_mutex_lock(&s_table_lock);
-#endif
 }
 
 static void table_unlock(void)
 {
-#ifdef _WIN32
-    LeaveCriticalSection(&s_table_lock);
-#else
     pthread_mutex_unlock(&s_table_lock);
-#endif
 }
 
 /* Find a free slot. Returns index or -1. Must be called under lock.
@@ -141,71 +110,16 @@ static ppu_thread_info* find_thread(uint64_t thread_id)
 /* ---------------------------------------------------------------------------
  * Host thread entry point
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-static DWORD WINAPI ppu_host_thread_proc(LPVOID param)
-#else
 static void* ppu_host_thread_proc(void* param)
-#endif
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
-#ifdef _WIN32
-    /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
-     * main thread. Deep recompiled call chains DO overflow even a 256 MB stack
-     * (a lifter bug that turns a tail call into recursion is unbounded), and
-     * without the guarantee the handler faults while reporting -- the process
-     * then dies silently with an access violation INSIDE the handler and the
-     * backtrace that would name the recursing function is lost. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-#endif
 
     /* Register this thread's context for lwarx/stwcx cross-thread reservation
      * invalidation (ppu_loader.cpp) -- so a concurrent stwcx breaks this thread's
      * reservation and prevents ABA corruption of the guest's lock-free lists. */
     { extern void ppu_resv_register(ppu_context*); ppu_resv_register(&info->ctx); }
 
-#if defined(__APPLE__)
-    pthread_setname_np(info->name);   /* for sample, Instruments, [stutter-cpu] */
-    /* PPU_QOS_INTERACTIVE=<prefix>[,<prefix>...]: a guest thread whose name
-     * starts with one of them runs at user-interactive QoS. On the PS3 the
-     * guest's priorities are strict, so its audio loop runs the moment it
-     * wakes; here every guest thread is equal, and on Apple Silicon a busy
-     * moment can put the audio loop behind the game's heavy threads or on an
-     * efficiency core, where it writes its blocks late -- gaps in the sound
-     * exactly when the picture stutters. The title names its audio threads. */
-    { const char* list = getenv("PPU_QOS_INTERACTIVE");
-      while (list && *list) {
-          const char* end = strchr(list, ',');
-          const size_t n = end ? (size_t)(end - list) : strlen(list);
-          if (n && strncmp(info->name, list, n) == 0) {
-              pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-              fprintf(stderr, "[THREAD %llu] \"%s\" runs at user-interactive QoS\n",
-                      (unsigned long long)info->ctx.thread_id, info->name);
-              break;
-          }
-          list = end ? end + 1 : NULL;
-      } }
-#elif defined(_WIN32)
-    /* The same, with Windows priorities: THREAD_PRIORITY_HIGHEST puts the
-     * sound driver's threads ahead of the game's heavy ones in the scheduler,
-     * as user-interactive QoS does on macOS. The name goes to the thread
-     * description, which the VS profiler, WPA and Superluminal show. */
-    { wchar_t wname[64];
-      if (MultiByteToWideChar(CP_UTF8, 0, info->name, -1, wname, 64) > 0)
-          SetThreadDescription(GetCurrentThread(), wname); }
-    { const char* list = getenv("PPU_QOS_INTERACTIVE");
-      while (list && *list) {
-          const char* end = strchr(list, ',');
-          const size_t n = end ? (size_t)(end - list) : strlen(list);
-          if (n && strncmp(info->name, list, n) == 0) {
-              SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-              fprintf(stderr, "[THREAD %llu] \"%s\" runs at THREAD_PRIORITY_HIGHEST\n",
-                      (unsigned long long)info->ctx.thread_id, info->name);
-              break;
-          }
-          list = end ? end + 1 : NULL;
-      } }
-#endif
 
     fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX hosttid=%lu\n",
             (unsigned long long)info->ctx.thread_id,
@@ -267,17 +181,10 @@ static void* ppu_host_thread_proc(void* param)
     { static int stall = -1;
       if (stall < 0) { const char* e = getenv("PPU_THREAD_END_STALL_US"); stall = e ? atoi(e) : 0; }
       if (stall > 0) {
-#ifdef _WIN32
-          Sleep((DWORD)((stall + 999) / 1000));
-#else
           struct timespec ts = { stall / 1000000, (long)(stall % 1000000) * 1000L };
           nanosleep(&ts, NULL);
-#endif
       } }
     table_lock();
-#ifdef _WIN32
-    HANDLE done = info->finish_event;     /* read before the slot can be anyone else's */
-#endif
     if (info->state == PPU_THREAD_STATE_DETACHED) {
         /* Detached threads self-clean */
         stack_give(info);
@@ -292,23 +199,15 @@ static void* ppu_host_thread_proc(void* param)
      * whatever a joiner needs is done now, under the lock (the same order as
      * sys_ppu_thread_exit takes the two; the joiner holds only the second). */
     if (info->state != PPU_THREAD_STATE_FREE) {
-#ifndef _WIN32
         pthread_mutex_lock(&info->finish_mutex);
         info->finished = 1;
         pthread_cond_signal(&info->finish_cond);
         pthread_mutex_unlock(&info->finish_mutex);
-#endif
         info->proc_out = 1;
     }
     table_unlock();
 
-#ifdef _WIN32
-    /* Signal anyone waiting for join */
-    if (done) SetEvent(done);
-    return 0;
-#else
     return NULL;
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -318,22 +217,7 @@ static void* ppu_host_thread_proc(void* param)
  * [arg+0x10] owner link BEFORE the main thread finishes linking it -> null -> spin.
  * Fix: create workers SUSPENDED and resume them only when a thread first blocks on
  * an event-queue wait (by then the creator has finished initialization). */
-#ifdef _WIN32
-static HANDLE g_gate_pending[256];
-static int    g_gate_n = 0;
-static int    g_gate_on = -1;
-void ydkj_release_pending_threads(void)
-{
-    if (g_gate_on <= 0) return;
-    table_lock();
-    int n = g_gate_n; g_gate_n = 0;
-    for (int i = 0; i < n; i++) if (g_gate_pending[i]) ResumeThread(g_gate_pending[i]);
-    table_unlock();
-    if (n) fprintf(stderr, "[THREADGATE] released %d pending worker thread(s) on first block\n", n);
-}
-#else
 void ydkj_release_pending_threads(void) {}
-#endif
 
 /* ---------------------------------------------------------------------------
 
@@ -357,12 +241,8 @@ uint64_t ppu_thread_register_main(void)
         t->state    = PPU_THREAD_STATE_RUNNING;
         t->joinable = 0;                    /* nobody joins the main thread */
         strncpy(t->name, "main", sizeof(t->name) - 1);
-#ifdef _WIN32
-        t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-#else
         pthread_mutex_init(&t->finish_mutex, NULL);
         pthread_cond_init(&t->finish_cond, NULL);
-#endif
     }
     table_unlock();
     return 1;
@@ -386,30 +266,14 @@ uint64_t ppu_thread_register_main(void)
  * one BLOCKED in a wait (cpu delta ~= 0). Returns 0 if unknown. */
 unsigned long long ppu_thread_cpu_us(unsigned tid)
 {
-#ifdef _WIN32
-    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;   /* main (tid 1) not in table */
-    ppu_thread_info* t = &g_ppu_threads[tid - 1];
-    if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) return 0;
-    FILETIME c, e, k, u;
-    if (!GetThreadTimes(t->host_thread, &c, &e, &k, &u)) return 0;
-    ULARGE_INTEGER ku, uu;
-    ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
-    uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
-    return (ku.QuadPart + uu.QuadPart) / 10ull;      /* 100ns -> us */
-#else
     (void)tid; return 0;
-#endif
 }
 /* ppu_prof_resolve_host, set by ppu_loader.cpp where it is linked in (the
  * replay and the runtime's tests have no lifted code to name). Defined here
  * and in ppu_loader.cpp as one mergeable definition, so a program with
  * either file alone links: the replay has no ppu_loader.cpp, the lifter's
  * tests no sys_ppu_thread.c. */
-#if defined(_MSC_VER)
-__declspec(selectany) uint32_t (*g_ppu_prof_resolve)(void* ra) = 0;
-#else
 __attribute__((weak)) uint32_t (*g_ppu_prof_resolve)(void* ra) = 0;
-#endif
 static unsigned prof_site(void* ra, unsigned fallback)
 {
     return ra && g_ppu_prof_resolve ? (unsigned)g_ppu_prof_resolve(ra) : fallback;
@@ -540,20 +404,16 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     }
 
     /* Create synchronization for join */
-#ifdef _WIN32
-    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-#else
     pthread_mutex_init(&t->finish_mutex, NULL);
     pthread_cond_init(&t->finish_cond, NULL);
     t->finished = 0;
-#endif
 
     /* Write thread ID to output pointer */
     if (tid_out_addr != 0) {
         uint64_t* out = (uint64_t*)vm_to_host(tid_out_addr);
         /* Store as big-endian u64 */
         uint64_t be_id = thread_id;
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         be_id = ((be_id >> 56) & 0xFF) |
                 ((be_id >> 40) & 0xFF00) |
                 ((be_id >> 24) & 0xFF0000) |
@@ -597,33 +457,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
      * guest call is a real host call, so deep guest call chains nest deeply on
      * the host stack and overflow the 1 MB default. Reserve 256 MB (committed
      * lazily by the OS via STACK_SIZE_PARAM_IS_A_RESERVATION). */
-#ifdef _WIN32
-    if (g_gate_on < 0) g_gate_on = getenv("PPU_THREADGATE") ? 1 : 0;
-    /* Gate only guest worker threads (game .text entry), never libsre/system threads. */
-    unsigned _initflag = STACK_SIZE_PARAM_IS_A_RESERVATION;
-    int _gate_this = (g_gate_on > 0 && entry >= 0x10000 && entry < 0x10000000);
-    if (_gate_this) _initflag |= CREATE_SUSPENDED;
-    t->host_thread = (HANDLE)_beginthreadex(NULL, 256u * 1024 * 1024,
-                                  (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
-                                  _initflag, (unsigned*)&t->host_tid);
-    if (t->host_thread == NULL) {
-        stack_give(t);
-        t->state = PPU_THREAD_STATE_FREE;
-        CloseHandle(t->finish_event);
-        table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
-    }
-    if (_gate_this && g_gate_n < 256) g_gate_pending[g_gate_n++] = t->host_thread;
-    /* The guest's top priorities (0 is highest, 3071 lowest) are its audio and
-     * I/O pollers. At normal host priority they wake late under a busy frame:
-     * The Simpsons Arcade Game's music thread (prio 0) polls the audio read
-     * index every 2.5 ms and misses a 5.3 ms block whenever it is delayed, and
-     * each miss is an audible gap. A mild boost, not TIME_CRITICAL: these
-     * threads sleep between polls.
-     * ponytail: two host levels only; map the full range if a title needs it. */
-    if (priority < 256)
-        SetThreadPriority(t->host_thread, THREAD_PRIORITY_ABOVE_NORMAL);
-#else
     /* Same reservation, for the same reason. This is the HOST stack the
      * recompiled C frames run on, not the guest stack (allocated above out of
      * guest VM), and the default is nowhere near enough: 512 KB on Darwin,
@@ -670,7 +503,6 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         pthread_detach(t->host_thread);
         t->host_detached = 1;
     }
-#endif
 
     table_unlock();
     return CELL_OK;
@@ -706,14 +538,10 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
             t->state = PPU_THREAD_STATE_FINISHED;
         }
 
-#ifdef _WIN32
-        SetEvent(t->finish_event);
-#else
         pthread_mutex_lock(&t->finish_mutex);
         t->finished = 1;
         pthread_cond_signal(&t->finish_cond);
         pthread_mutex_unlock(&t->finish_mutex);
-#endif
     }
     table_unlock();
 
@@ -748,21 +576,17 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     table_unlock();
 
     /* Wait for completion */
-#ifdef _WIN32
-    WaitForSingleObject(t->finish_event, INFINITE);
-#else
     pthread_mutex_lock(&t->finish_mutex);
     while (!t->finished) {
         pthread_cond_wait(&t->finish_cond, &t->finish_mutex);
     }
     pthread_mutex_unlock(&t->finish_mutex);
-#endif
 
     /* Write exit status */
     if (status_addr != 0) {
         int64_t es = t->exit_status;
         int64_t* out = (int64_t*)vm_to_host(status_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         uint64_t u = (uint64_t)es;
         u = ((u >> 56) & 0xFF) |
             ((u >> 40) & 0xFF00) |
@@ -779,23 +603,6 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
 
     /* Clean up */
-#ifdef _WIN32
-    /* The thread signalled from inside sys_ppu_thread_exit and is still on
-     * its way out through the thread procedure, which takes the table lock
-     * and reads this slot. Wait for the host thread itself, with the lock
-     * released, as the pthread_join below does. (Not for ever: a thread
-     * whose exit did not unwind would never end, and the epilogue no longer
-     * needs the slot left alone to get its state right.) */
-    const int out = WaitForSingleObject(t->host_thread, 10000) == WAIT_OBJECT_0;
-    if (!out)
-        fprintf(stderr, "[SYS] sys_ppu_thread_join(tid=%llu): the host thread has not ended 10 s after it signalled\n",
-                (unsigned long long)tid);
-    table_lock();
-    CloseHandle(t->host_thread);
-    CloseHandle(t->finish_event);
-    t->host_thread = NULL;
-    t->finish_event = NULL;
-#else
     /* Reap the host thread with the table lock RELEASED.
      *
      * pthread_join blocks until the thread procedure returns, and that
@@ -817,7 +624,6 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     pthread_mutex_destroy(&t->finish_mutex);
     pthread_cond_destroy(&t->finish_cond);
     const int out = 1;
-#endif
     if (out) stack_give(t);   /* a thread still in its guest code keeps its stack */
     t->state = PPU_THREAD_STATE_FREE;
     table_unlock();
@@ -843,20 +649,6 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
 
     if (t->state == PPU_THREAD_STATE_FINISHED) {
         /* Already finished, free it */
-#ifdef _WIN32
-        if (WaitForSingleObject(t->host_thread, 0) != WAIT_OBJECT_0) {
-            /* Not out of the thread procedure yet: its epilogue frees the slot. */
-            t->state = PPU_THREAD_STATE_DETACHED;
-            t->joinable = 0;
-            table_unlock();
-            return CELL_OK;
-        }
-        CloseHandle(t->host_thread);
-        CloseHandle(t->finish_event);
-        t->host_thread = NULL;
-        t->finish_event = NULL;
-        stack_give(t);
-#else
         if (!t->host_detached) {
             pthread_detach(t->host_thread);
             t->host_detached = 1;
@@ -875,17 +667,14 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         pthread_mutex_destroy(&t->finish_mutex);
         pthread_cond_destroy(&t->finish_cond);
         stack_give(t);
-#endif
         t->state = PPU_THREAD_STATE_FREE;
     } else {
         t->state = PPU_THREAD_STATE_DETACHED;
         t->joinable = 0;
-#ifndef _WIN32
         if (!t->host_detached) {
             pthread_detach(t->host_thread);
             t->host_detached = 1;
         }
-#endif
     }
 
     table_unlock();
@@ -1295,11 +1084,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
           }
       } }
     (void)ctx;
-#ifdef _WIN32
-    SwitchToThread();
-#else
     sched_yield();
-#endif
     return CELL_OK;
 }
 
@@ -1325,7 +1110,7 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
         if (prio_addr != 0) {
             int32_t prio = 1000;
             int32_t* out = (int32_t*)vm_to_host(prio_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
             uint32_t u = (uint32_t)prio;
             u = ((u >> 24) & 0xFF) | ((u >> 8) & 0xFF00) |
                 ((u <<  8) & 0xFF0000) | ((u << 24) & 0xFF000000u);
@@ -1340,7 +1125,7 @@ int64_t sys_ppu_thread_get_priority(ppu_context* ctx)
     if (prio_addr != 0) {
         int32_t prio = t->priority;
         int32_t* out = (int32_t*)vm_to_host(prio_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         uint32_t u = (uint32_t)prio;
         u = ((u >> 24) & 0xFF) | ((u >> 8) & 0xFF00) |
             ((u <<  8) & 0xFF0000) | ((u << 24) & 0xFF000000u);
@@ -1422,7 +1207,7 @@ int64_t sys_ppu_thread_get_join_state(ppu_context* ctx)
 
     if (out_addr != 0) {
         int32_t* out = (int32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         uint32_t u = (uint32_t)joinable;
         u = ((u >> 24) & 0xFF) | ((u >> 8) & 0xFF00) |
             ((u <<  8) & 0xFF0000) | ((u << 24) & 0xFF000000u);
@@ -1453,7 +1238,7 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
         /* For the main thread, return sensible defaults */
         if (out_addr != 0) {
             uint32_t* out = (uint32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
             /* byteswap both fields */
             uint32_t sa = VM_STACK_BASE;
             uint32_t ss = VM_PPU_STACK_SIZE;
@@ -1473,7 +1258,7 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
 
     if (out_addr != 0) {
         uint32_t* out = (uint32_t*)vm_to_host(out_addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         uint32_t sa = t->stack_addr;
         uint32_t ss = t->stack_size;
         sa = ((sa >> 24) & 0xFF) | ((sa >> 8) & 0xFF00) |
@@ -1503,12 +1288,6 @@ void sys_ppu_thread_init(lv2_syscall_table* tbl)
     /* Clear thread table */
     memset(g_ppu_threads, 0, sizeof(g_ppu_threads));
 
-#ifdef _WIN32
-    if (!s_table_lock_init) {
-        InitializeCriticalSection(&s_table_lock);
-        s_table_lock_init = 1;
-    }
-#endif
 
     lv2_syscall_register(tbl, SYS_PPU_THREAD_CREATE,              sys_ppu_thread_create);
     lv2_syscall_register(tbl, SYS_PPU_THREAD_EXIT,                sys_ppu_thread_exit);

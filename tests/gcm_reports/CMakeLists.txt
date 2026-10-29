@@ -12,9 +12,7 @@ add_executable(test_gcm_reports
     "${PROJECT_SOURCE_DIR}/runtime/host/host_stubs.c"
 )
 target_link_libraries(test_gcm_reports PRIVATE ps3recomp_runtime)
-if(NOT WIN32)
-    target_link_libraries(test_gcm_reports PRIVATE m)
-endif()
+target_link_libraries(test_gcm_reports PRIVATE m)
 target_include_directories(test_gcm_reports PRIVATE
     "${PROJECT_SOURCE_DIR}/libs/video"
     "${PROJECT_SOURCE_DIR}/include"

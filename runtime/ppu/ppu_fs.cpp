@@ -32,11 +32,7 @@
  * `extern "C"` inside a function body is ill-formed in C++. */
 extern "C" void ydkj_host_bt(const char* tag);
 #include <fcntl.h>
-#ifdef _WIN32
-#include <io.h>          /* open/close on MinGW */
-#else
 #include <unistd.h>
-#endif
 #ifndef O_BINARY
 #define O_BINARY 0       /* POSIX has no text/binary distinction */
 #endif
@@ -50,25 +46,10 @@ extern "C" void ydkj_host_bt(const char* tag);
  * with EOVERFLOW, UCRT's _stat64i32 (llvm-mingw) returns the size truncated, so
  * the same title took different paths depending on the toolchain. POSIX LP64
  * is unaffected. */
-#ifdef _WIN32
-#  define FS_SEEK64(f, o, w) _fseeki64((f), (int64_t)(o), (w))
-#  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
-typedef struct _stat64 fs_stat64_t;
-/* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
-static int FS_STAT64(const char* p, fs_stat64_t* s)
-{
-    char t[1100]; size_t n = strlen(p);
-    if (n >= sizeof t) return _stat64(p, s);
-    memcpy(t, p, n + 1);
-    while (n > 1 && (t[n - 1] == '/' || t[n - 1] == '\\') && t[n - 2] != ':') t[--n] = 0;
-    return _stat64(t, s);
-}
-#else
 #  define FS_SEEK64(f, o, w) fseeko((f), (off_t)(o), (w))
 #  define FS_TELL64(f)       ((int64_t)ftello(f))
 #  define FS_STAT64(p, s)    stat((p), (s))
 typedef struct stat fs_stat64_t;
-#endif
 
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
@@ -457,9 +438,6 @@ static void cellFsRead(ppu_context* ctx)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
     if (getenv("PS3_FSLOG")) { static int _fd=0; if (_fd < 20 && ++_fd) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
-#ifdef _WIN32
-    if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if (_b < 2 && ++_b){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
-#endif
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
      * the end of the log and look identical to reads that never happen.
@@ -752,12 +730,7 @@ static void cellFsClosedir(ppu_context* ctx)
     ctx->gpr[3] = CELL_OK;
 }
 
-#ifdef _WIN32
-#include <direct.h>
-#define HOST_MKDIR(p) _mkdir(p)
-#else
 #define HOST_MKDIR(p) mkdir((p), 0777)
-#endif
 
 /* Create `path` and any missing parent dirs on the host. Returns 0 on
  * success or if the directory already exists. */
@@ -838,11 +811,7 @@ static void cellFsSdataOpenByFd(ppu_context* ctx)
  * submit call returns. A title that submits, THEN arms the thing the callback
  * signals, would miss it -- move completion to a worker thread if one shows up.
  */
-#ifdef _WIN32
-#  define HOST_FSEEK64(f,off) _fseeki64((f), (__int64)(off), SEEK_SET)
-#else
 #  define HOST_FSEEK64(f,off) fseeko((f), (off_t)(off), SEEK_SET)
-#endif
 
 static uint32_t guest_be32(uint32_t a)
 {

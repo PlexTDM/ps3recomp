@@ -6,8 +6,7 @@
  * calls to this buffer via cellGcm, and the RSX processes them.
  *
  * In recompilation, we intercept the command buffer and translate
- * NV47xx methods to the host graphics API (D3D12 on Windows, Vulkan
- * on Linux/macOS).
+ * NV47xx methods to the host graphics API (Vulkan, or the null backend).
  *
  * Architecture:
  *   Game code → cellGcmSys (state tracking) → command buffer → RSX processor
@@ -400,7 +399,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data);
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size);
 
 /* ---------------------------------------------------------------------------
- * Backend callbacks — implemented per-platform (D3D12, Vulkan, null)
+ * Backend callbacks — implemented by the Vulkan and null backends
  * -----------------------------------------------------------------------*/
 
 typedef struct rsx_backend {

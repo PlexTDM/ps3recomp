@@ -15,20 +15,12 @@
 #include <errno.h>
 #include <sys/stat.h>
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
-#  define HOST_STAT     _stat64
-#  define HOST_STAT_T   struct __stat64
-#else
 #  include <unistd.h>
 #  include <sys/types.h>
 #  include <sys/statvfs.h>
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -122,11 +114,7 @@ static int dir_exists(const char* path)
     HOST_STAT_T st;
     if (HOST_STAT(path, &st) != 0)
         return 0;
-#ifdef _WIN32
-    return (st.st_mode & _S_IFDIR) != 0;
-#else
     return S_ISDIR(st.st_mode);
-#endif
 }
 
 /* Content may not exist on first boot. Query its nearest existing ancestor
@@ -136,15 +124,6 @@ static s32 content_free_kb(void)
     char path[CELL_GAME_PATH_MAX];
     snprintf(path, sizeof(path), "%s", s_content_path[0] ? s_content_path : ".");
     for (;;) {
-#ifdef _WIN32
-        ULARGE_INTEGER available;
-        if (GetDiskFreeSpaceExA(path, &available, NULL, NULL)) {
-            u64 kb = available.QuadPart / 1024;
-            return kb > INT32_MAX ? INT32_MAX : (s32)kb;
-        }
-        DWORD error = GetLastError();
-        if (error != ERROR_PATH_NOT_FOUND && error != ERROR_FILE_NOT_FOUND) break;
-#else
         struct statvfs info;
         if (statvfs(path, &info) == 0) {
             u64 block = info.f_frsize ? info.f_frsize : info.f_bsize;
@@ -154,23 +133,10 @@ static s32 content_free_kb(void)
             return (s32)((count * block) / 1024);
         }
         if (errno != ENOENT && errno != ENOTDIR) break;
-#endif
         size_t len = strlen(path);
-#ifdef _WIN32
-        if (len == 3 && path[1] == ':' && (path[2] == '/' || path[2] == '\\')) break;
-#endif
         while (len > 1 && (path[len - 1] == '/' || path[len - 1] == '\\'))
             path[--len] = 0;
         char* slash = strrchr(path, '/');
-#ifdef _WIN32
-        char* backslash = strrchr(path, '\\');
-        if (backslash && (!slash || backslash > slash)) slash = backslash;
-        if (slash == path + 2 && path[1] == ':') {
-            if (!slash[1]) break;
-            slash[1] = 0;
-            continue;
-        }
-#endif
         if (!slash) {
             if (strcmp(path, ".") == 0) break;
             strcpy(path, ".");
@@ -340,11 +306,6 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     snprintf(s_tmp_path, sizeof(s_tmp_path),
              "%s/%s_TMP", content_root(), s_title_id);
 
-#ifdef _WIN32
-    for (char* p = s_content_info_path; *p; p++) if (*p == '/') *p = '\\';
-    for (char* p = s_usrdir_path; *p; p++) if (*p == '/') *p = '\\';
-    for (char* p = s_tmp_path; *p; p++) if (*p == '/') *p = '\\';
-#endif
 
     /* The HLE bridge passes the GUEST addresses of these out-params (the PPC
      * r3-r6 values), not host pointers. Translate through vm_base and write

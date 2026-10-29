@@ -95,21 +95,15 @@ static void sys_mem_release(uint32_t addr, uint32_t size)
 }
 
 /* Guest threads are real host threads; serialize the bump allocator. */
-#ifdef _WIN32
-static SRWLOCK s_bump_lock = SRWLOCK_INIT;
-static void bump_lock(void)   { AcquireSRWLockExclusive(&s_bump_lock); }
-static void bump_unlock(void) { ReleaseSRWLockExclusive(&s_bump_lock); }
-#else
 #include <pthread.h>
 static pthread_mutex_t s_bump_mtx = PTHREAD_MUTEX_INITIALIZER;
 static void bump_lock(void)   { pthread_mutex_lock(&s_bump_mtx); }
 static void bump_unlock(void) { pthread_mutex_unlock(&s_bump_mtx); }
-#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif

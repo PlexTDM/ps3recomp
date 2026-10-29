@@ -13,10 +13,6 @@
  *                                 the system temp directory)
  */
 #include "ppu_fs.cpp"
-#ifdef _WIN32
-#  include <windows.h>
-#  include <winioctl.h>
-#endif
 
 /* ---- link stubs: nothing on the paths this test drives calls them ---- */
 extern "C" {
@@ -52,24 +48,10 @@ static const uint64_t MARK_OFF  = (5ULL << 30) + 8;
  * code under test. Returns 0 when the sparse file is ready. */
 static int make_sparse(const char* path)
 {
-#ifdef _WIN32
-    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    DWORD got = 0;
-    /* Without the sparse flag NTFS would write gigabytes of zeros. */
-    if (!DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &got, NULL)) { CloseHandle(h); return -2; }
-    LARGE_INTEGER at; at.QuadPart = (LONGLONG)MARK_OFF;
-    DWORD wr = 0;
-    int ok = SetFilePointerEx(h, at, NULL, FILE_BEGIN) && WriteFile(h, "MARKtail", 8, &wr, NULL) && wr == 8;
-    CloseHandle(h);
-    return ok ? 0 : -1;
-#else
     FILE* f = fopen(path, "wb");
     if (!f) return -1;
     int ok = fseeko(f, (off_t)MARK_OFF, SEEK_SET) == 0 && fwrite("MARKtail", 1, 8, f) == 8;
     return (fclose(f) == 0 && ok) ? 0 : -1;
-#endif
 }
 
 int main(int argc, char** argv)
@@ -79,10 +61,6 @@ int main(int argc, char** argv)
     vm_base = mem; ppu_vm_size = sizeof mem;
 
     const char* dir = argc > 1 ? argv[1] : NULL;
-#ifdef _WIN32
-    char tmp[MAX_PATH];
-    if (!dir) { DWORD n = GetTempPathA(sizeof tmp, tmp); if (n && n < sizeof tmp) { tmp[n - 1] = 0; dir = tmp; } }
-#endif
     if (!dir) dir = getenv("TMPDIR");
     if (!dir) dir = "/tmp";
     char host[1100];

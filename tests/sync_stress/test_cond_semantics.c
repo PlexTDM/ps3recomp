@@ -21,11 +21,7 @@ static DWORD WINAPI signaler(void* raw) {
     Sleep(20);
     if (raw) {
         /* Host spurious wake: no guest signal has selected this waiter. */
-#ifdef _WIN32
-        WakeAllConditionVariable(&g_sys_conds[cid-1].cv);
-#else
         pthread_cond_broadcast(&g_sys_conds[cid-1].cv);
-#endif
     } else {
         int32_t rc=call(sys_mutex_lock,&c,mid,200000,0);
         if (rc==CELL_OK) {

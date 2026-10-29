@@ -1,5 +1,5 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_dialog_abort.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_dialog_abort && /tmp/test_dialog_abort */
+/* clang -std=gnu17 -I include libs/system/tests/test_dialog_abort.c
+ * libs/system/cellSysutil.c -Wl,--gc-sections -pthread -o /tmp/test_dialog_abort && /tmp/test_dialog_abort */
 #include "../cellMsgDialog.c"
 #include <stdlib.h>
 

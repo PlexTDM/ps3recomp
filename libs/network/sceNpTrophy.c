@@ -22,17 +22,10 @@
 /* HLE args arrive as guest effective addresses; translate before deref. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
-#ifdef _WIN32
-#include <direct.h>
-#include <io.h>
-#define mkdir_p(path) _mkdir(path)
-#define PATH_SEP '\\'
-#else
 #include <sys/stat.h>
 #include <unistd.h>
 #define mkdir_p(path) mkdir(path, 0755)
 #define PATH_SEP '/'
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state

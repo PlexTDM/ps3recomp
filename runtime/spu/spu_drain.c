@@ -9,13 +9,8 @@
 #include <setjmp.h>
 /* Plain setjmp/longjmp save and restore the signal mask on macOS -- a system
  * call each, on every SPURS job. Nothing in the SPU runtime touches the mask. */
-#ifndef _WIN32
 #define SPU_SETJMP(env)     _setjmp(env)
 #define SPU_LONGJMP(env, v) _longjmp(env, v)
-#else
-#define SPU_SETJMP(env)     setjmp(env)
-#define SPU_LONGJMP(env, v) longjmp(env, v)
-#endif
 /* SPU_NOUNWIND(env), right after setjmp's first return: on Windows x64 a
  * longjmp unwinds every frame back to the setjmp through RtlUnwindEx unless
  * the buffer's Frame is 0 -- then it restores the registers and jumps
@@ -24,11 +19,7 @@
  * the unwind (_NLG_Return2, RtlVirtualUnwind2) was 6-8% of the walker. The
  * frames in between are lifted SPU code and this C runtime: no __try, no
  * destructors, nothing an unwind would run. */
-#if defined(_WIN32) && defined(_M_X64)
-#define SPU_NOUNWIND(env)   (((_JUMP_BUFFER*)(env))->Frame = 0)
-#else
 #define SPU_NOUNWIND(env)   ((void)0)
-#endif
 
 /* See spu_context.h `irq_frame`. */
 typedef struct spu_irq_frame {

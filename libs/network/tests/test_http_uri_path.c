@@ -11,10 +11,6 @@
  *   cc -std=gnu17 -I include -o test_http_uri_path libs/network/tests/test_http_uri_path.c
  * Driven by tools/test_http_uri_path.py.
  */
-#ifdef _WIN32
-#include <stdio.h>
-int main(void) { puts("SKIP: POSIX sockets only"); return 0; }
-#else
 #include "../cellHttp.c"
 #include <arpa/inet.h>
 
@@ -113,4 +109,3 @@ int main(void)
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
-#endif

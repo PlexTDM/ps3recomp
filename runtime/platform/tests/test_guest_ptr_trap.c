@@ -66,11 +66,7 @@ static sigjmp_buf            g_escape;
  * Darwin turns a Mach EXC_BAD_ACCESS into SIGBUS whenever the page WAS mapped
  * and its protection refused the access, and into SIGSEGV only when nothing was
  * mapped at the address at all. Linux reports both as SIGSEGV. */
-#if defined(__APPLE__)
-#  define PS3_RESERVED_FAULT_SIGNAL SIGBUS
-#else
 #  define PS3_RESERVED_FAULT_SIGNAL SIGSEGV
-#endif
 
 static void record_and_escape(int sig, siginfo_t* si, void* uctx)
 {
@@ -170,9 +166,6 @@ static void test_reserved_window(void)
     /* si_code does not discriminate on Darwin: a protection fault reports 1,
      * the value that spells BUS_ADRALN, for an access that is perfectly
      * aligned. Nothing may key off it. */
-#if defined(__APPLE__)
-    CHECK(g_code == 1);
-#endif
 
     /* Nothing mapped at all is the OTHER case, and it is SIGSEGV on both
      * hosts -- so swapping SIGSEGV for SIGBUS would be as wrong as the reverse.

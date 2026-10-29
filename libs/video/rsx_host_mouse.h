@@ -7,12 +7,9 @@
  * focus, the cursor is hidden and held inside the window; it is let go the
  * moment the focus is.
  *
- * Windows: the D3D12 and Vulkan engines hand their window and its messages
- * to rsx_host_mouse_attach / rsx_host_mouse_message. macOS: the Metal
- * backend has the window and implements the calls itself; motion is the
- * events' own (points, with the system's tracking speed in them, as every
- * pointing device there reports), and Escape never closed that window.
- * Elsewhere the calls do nothing and there is never any motion.
+ * On this Linux-only tree the implementation is inert: no window feeds it,
+ * so every call does nothing and there is never any motion. An SDL2 window
+ * would hand its events to rsx_host_mouse_attach / rsx_host_mouse_message.
  */
 #ifndef PS3RECOMP_RSX_HOST_MOUSE_H
 #define PS3RECOMP_RSX_HOST_MOUSE_H

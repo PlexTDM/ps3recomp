@@ -1,17 +1,13 @@
 /*
  * ps3recomp - cellFiber HLE implementation
  *
- * Implements PPU fibers using Windows Fibers API or POSIX ucontext.
- * Each CellFiber maps to a native fiber for true cooperative switching.
+ * Implements PPU fibers using POSIX ucontext.
+ * Each CellFiber maps to a native context for true cooperative switching.
  */
 
-/* Darwin gates the ucontext routines AND the shape of ucontext_t itself on
- * _XOPEN_SOURCE, so this has to come before the first system header any
+/* The ucontext routines need _XOPEN_SOURCE before the first system header any
  * include below reaches -- see the static assertion further down for what
  * defining it late costs. Nothing above this line. */
-#if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
-#  define _XOPEN_SOURCE 600
-#endif
 
 #include "cellFiber.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
@@ -19,30 +15,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <ucontext.h>
 
-#if defined(__APPLE__)
-/* getcontext() points uc_mcontext at ucontext_t's own __mcontext_data member
- * and writes uc_mcsize (816) bytes there. That member is declared only when
- * _XOPEN_SOURCE was defined before <sys/_types/_ucontext.h> was first pulled
- * in; without it the struct is the 64-byte header alone and every getcontext,
- * swapcontext and makecontext writes 752 bytes off the end of it -- over
- * FiberSlot::stack, over the next FiberSlot in the array, and past
- * s_scheduler_context into whatever .bss follows. The symptom is not a crash
- * at the write but a fiber that starts with somebody else's argument, or a
- * slot that reports itself in use having never been created.
- *
- * The define above is the fix; this is the tripwire, because moving an
- * #include up here would silently undo it. */
-_Static_assert(sizeof(ucontext_t) > 64,
-               "ucontext_t has no embedded machine state: _XOPEN_SOURCE was "
-               "defined too late and getcontext will write past the struct");
-#endif
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -56,42 +30,20 @@ typedef struct FiberSlot {
     u32        stack_size;
     char       name[32];
     u32        priority;
-#ifdef _WIN32
-    LPVOID     native_fiber;
-#else
     ucontext_t context;
     u8*        stack;
-#endif
 } FiberSlot;
 
 static FiberSlot s_fibers[CELL_FIBER_MAX_FIBERS];
 static int s_initialized = 0;
 static s32 s_current_fiber = -1; /* index into s_fibers, or -1 for scheduler */
 
-#ifdef _WIN32
-static LPVOID s_scheduler_fiber = NULL;
-#else
 static ucontext_t s_scheduler_context;
-#endif
 
 /* ---------------------------------------------------------------------------
  * Fiber trampoline
  * -----------------------------------------------------------------------*/
 
-#ifdef _WIN32
-static void CALLBACK fiber_trampoline(LPVOID param)
-{
-    u32 idx = (u32)(uintptr_t)param;
-    FiberSlot* f = &s_fibers[idx];
-    f->state = CELL_FIBER_STATE_RUNNING;
-    f->entry(f->arg);
-    f->state = CELL_FIBER_STATE_TERMINATED;
-
-    /* Return to scheduler when fiber function returns */
-    s_current_fiber = -1;
-    SwitchToFiber(s_scheduler_fiber);
-}
-#else
 static void fiber_trampoline(int idx_lo, int idx_hi)
 {
     u32 idx = ((u32)idx_hi << 16) | (u32)(u16)idx_lo;
@@ -102,7 +54,6 @@ static void fiber_trampoline(int idx_lo, int idx_hi)
     s_current_fiber = -1;
     setcontext(&s_scheduler_context);
 }
-#endif
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -118,16 +69,7 @@ s32 cellFiberPpuInitialize(void)
     memset(s_fibers, 0, sizeof(s_fibers));
     s_current_fiber = -1;
 
-#ifdef _WIN32
-    /* Convert the current thread to a fiber so we can switch */
-    s_scheduler_fiber = ConvertThreadToFiber(NULL);
-    if (!s_scheduler_fiber) {
-        /* Already a fiber (e.g., re-init) */
-        s_scheduler_fiber = GetCurrentFiber();
-    }
-#else
     getcontext(&s_scheduler_context);
-#endif
 
     s_initialized = 1;
     return CELL_OK;
@@ -142,20 +84,11 @@ s32 cellFiberPpuFinalize(void)
 
     for (int i = 0; i < CELL_FIBER_MAX_FIBERS; i++) {
         if (s_fibers[i].in_use) {
-#ifdef _WIN32
-            if (s_fibers[i].native_fiber)
-                DeleteFiber(s_fibers[i].native_fiber);
-#else
             free(s_fibers[i].stack);
-#endif
             s_fibers[i].in_use = 0;
         }
     }
 
-#ifdef _WIN32
-    ConvertFiberToThread();
-    s_scheduler_fiber = NULL;
-#endif
 
     s_initialized = 0;
     return CELL_OK;
@@ -208,14 +141,6 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
     printf("[cellFiber] CreateFiber(id=%d, name=%s, stack=%u)\n",
            idx, f->name[0] ? f->name : "(unnamed)", f->stack_size);
 
-#ifdef _WIN32
-    f->native_fiber = CreateFiber(f->stack_size, fiber_trampoline,
-                                   (LPVOID)(uintptr_t)idx);
-    if (!f->native_fiber) {
-        f->in_use = 0;
-        return (s32)CELL_FIBER_ERROR_NOMEM;
-    }
-#else
     f->stack = (u8*)malloc(f->stack_size);
     if (!f->stack) {
         f->in_use = 0;
@@ -227,7 +152,6 @@ s32 cellFiberPpuCreateFiber(CellFiber* fiber, CellFiberEntry entry,
     f->context.uc_link = &s_scheduler_context;
     makecontext(&f->context, (void (*)(void))fiber_trampoline, 2,
                 (int)(idx & 0xFFFF), (int)(idx >> 16));
-#endif
 
     vm_write32((u32)(uintptr_t)fiber, (u32)idx);
     return CELL_OK;
@@ -247,12 +171,7 @@ s32 cellFiberPpuDeleteFiber(CellFiber fiber)
 
     printf("[cellFiber] DeleteFiber(id=%u)\n", idx);
 
-#ifdef _WIN32
-    if (s_fibers[idx].native_fiber)
-        DeleteFiber(s_fibers[idx].native_fiber);
-#else
     free(s_fibers[idx].stack);
-#endif
 
     s_fibers[idx].in_use = 0;
     return CELL_OK;
@@ -282,9 +201,6 @@ s32 cellFiberPpuSwitchFiber(CellFiber fiber)
     s_current_fiber = (s32)idx;
     s_fibers[idx].state = CELL_FIBER_STATE_RUNNING;
 
-#ifdef _WIN32
-    SwitchToFiber(s_fibers[idx].native_fiber);
-#else
     /* SwitchToFiber saves the running fiber's state into the running fiber,
      * whichever one that is; swapcontext has to be told. A switch issued from
      * inside a fiber saves that fiber, and only a switch issued from the
@@ -301,7 +217,6 @@ s32 cellFiberPpuSwitchFiber(CellFiber fiber)
                        ? &s_fibers[prev].context
                        : &s_scheduler_context;
     swapcontext(from, &s_fibers[idx].context);
-#endif
 
     return CELL_OK;
 }
@@ -315,11 +230,7 @@ s32 cellFiberPpuYieldFiber(void)
     s32 prev = s_current_fiber;
     s_current_fiber = -1;
 
-#ifdef _WIN32
-    SwitchToFiber(s_scheduler_fiber);
-#else
     swapcontext(&s_fibers[prev].context, &s_scheduler_context);
-#endif
     (void)prev;
 
     return CELL_OK;
@@ -333,11 +244,7 @@ s32 cellFiberPpuExitFiber(void)
     s_fibers[s_current_fiber].state = CELL_FIBER_STATE_TERMINATED;
     s_current_fiber = -1;
 
-#ifdef _WIN32
-    SwitchToFiber(s_scheduler_fiber);
-#else
     setcontext(&s_scheduler_context);
-#endif
 
     return CELL_OK; /* unreachable */
 }
@@ -389,11 +296,7 @@ s32 cellFiberPpuSleep(void)
     s32 prev = s_current_fiber;
     s_current_fiber = -1;
 
-#ifdef _WIN32
-    SwitchToFiber(s_scheduler_fiber);
-#else
     swapcontext(&s_fibers[prev].context, &s_scheduler_context);
-#endif
     (void)prev;
 
     return CELL_OK;

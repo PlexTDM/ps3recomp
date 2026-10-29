@@ -34,11 +34,9 @@ Yes, under the same principles as all clean-room recompilation projects:
 
 ### What platforms are supported?
 
-- **Windows** (primary) — MSVC, XInput, WASAPI
-- **Linux** — GCC/Clang, SDL2
-- **macOS** — Clang, SDL2
-
-Windows gets the most testing. Linux and macOS should work but may need minor fixes.
+Linux, with GCC or Clang and SDL2. The runtime keeps its Win32-shaped call
+sites behind a POSIX compatibility shim; there is no Windows or macOS build in
+this tree.
 
 ---
 
@@ -50,7 +48,7 @@ Windows gets the most testing. Linux and macOS should work but may need minor fi
 2. **Disassemble** PowerPC instructions into structured IR
 3. **Lift** each function to equivalent C code (register file → local variables, memory ops → `vm_read`/`vm_write`)
 4. **Link** the generated C with ps3recomp's runtime library (VM, syscalls, HLE modules)
-5. **Compile** with MSVC/GCC/Clang to produce a native x86-64 executable
+5. **Compile** with GCC or Clang to produce a native x86-64 executable
 
 ### What about the SPUs?
 
@@ -82,7 +80,7 @@ See [NID_SYSTEM.md](NID_SYSTEM.md) for the deep dive.
 
 The RSX (Reality Synthesizer) is an NV47-class GPU. Games write GPU commands to a command buffer via cellGcmSys. Currently:
 - **cellGcmSys is fully implemented** — display buffers, memory mapping, tile/zcull config, flip control
-- **Command buffer parsing is not** — translating NV47 methods to Vulkan/D3D12 draw calls is the largest remaining task
+- **Command buffer parsing is implemented** — NV47 methods are translated to the shared draw engine and the Vulkan or null backend
 
 ### How accurate does recompilation need to be?
 
@@ -100,11 +98,9 @@ The RSX (Reality Synthesizer) is an NV47-class GPU. Games write GPU commands to 
 uint8_t* vm_base = nullptr;
 ```
 
-**`/bigobj required`** (MSVC)
-Large generated source files (>65K sections) need the `/bigobj` compiler flag:
-```cmake
-target_compile_options(my_game PRIVATE /bigobj)
-```
+**Compiler runs out of memory on a lifted file**
+Large generated translation units can need over a gigabyte each. Build with a
+lower `-j`, or split the lifter output into smaller files.
 
 **`incompatible pointer types`**
 Runtime headers are C; if you're including them from C++, wrap with:
@@ -127,7 +123,7 @@ The game called a function your HLE modules don't handle. Either:
 
 **`vm_init failed`**
 The runtime couldn't allocate the 4GB virtual address space. Check:
-- Sufficient virtual memory available (Windows: increase pagefile; Linux: check `ulimit -v`)
+- Sufficient virtual memory available (check `ulimit -v`)
 - You're building 64-bit, not 32-bit
 
 **Crash in recompiled code (no HLE log)**
@@ -179,8 +175,8 @@ Within 2-3x of the original PS3 performance on modern hardware, often faster. Th
 ### The generated .cpp file is huge — compilation tips
 
 - **Split into batches** — the lifter can output multiple smaller files instead of one giant one
-- **Use `/bigobj`** on MSVC for files with >65K sections
-- **Parallel compilation** — let MSBuild/Ninja use multiple cores
+- **Parallel compilation** — let Ninja or Make use multiple cores, but keep
+  `-j` low enough that the largest files do not exhaust memory
 - **Incremental builds** — only recompile changed files
 - **Release builds** — debug builds of 156 MB source files can take 30+ minutes; Release is faster
 

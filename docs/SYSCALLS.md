@@ -28,23 +28,23 @@ Complete documentation for all implemented PS3 LV2 (Lv-2 kernel) system calls in
 
 ## Overview
 
-The LV2 kernel provides system services to PS3 games through the `sc` (System Call) instruction. ps3recomp implements these syscalls as native host OS calls, translating PS3 semantics to Windows (Win32 API) or POSIX (pthread, mmap) equivalents.
+The LV2 kernel provides system services to PS3 games through the `sc` (System Call) instruction. ps3recomp implements these syscalls as native host OS calls, translating PS3 semantics to POSIX (pthread, mmap, sem) equivalents. A few entry points keep their Win32 names through `runtime/platform/win32_compat.h`, which implements them over POSIX.
 
 **Implementation files:** `runtime/syscalls/sys_*.c` and `runtime/syscalls/sys_*.h`
 
 ### Platform Mapping
 
-| PS3 Concept | Windows Implementation | POSIX Implementation |
-|---|---|---|
-| PPU Threads | `CreateThread` | `pthread_create` |
-| Mutexes | `CRITICAL_SECTION` | `pthread_mutex` |
-| Condition Variables | `CONDITION_VARIABLE` | `pthread_cond` |
-| Semaphores | `CreateSemaphoreW` | POSIX `sem_t` |
-| Read-Write Locks | `SRWLOCK` | `pthread_rwlock` |
-| Event Flags | Manual (bitmask + CV) | Manual (bitmask + CV) |
-| Timers | `QueryPerformanceCounter` | `clock_gettime` |
-| Memory | `VirtualAlloc` | `mmap` |
-| File I/O | Win32 file API | POSIX file API |
+| PS3 Concept | Host Implementation |
+|---|---|
+| PPU Threads | `pthread_create` |
+| Mutexes | `pthread_mutex` |
+| Condition Variables | `pthread_cond` |
+| Semaphores | POSIX `sem_t` |
+| Read-Write Locks | `pthread_rwlock` |
+| Event Flags | Manual (bitmask + condvar) |
+| Timers | `clock_gettime` |
+| Memory | `mmap` / `mprotect` |
+| File I/O | POSIX file API |
 
 ---
 
@@ -119,8 +119,7 @@ Creates a new PPU thread with its own register context and stack.
 2. Allocates a guest stack via `vm_stack_allocate()`
 3. Sets up the new context: `r1` = stack top, `r3` = arg, `cia` = entry
 4. Creates a host thread:
-   - Windows: `CreateThread(NULL, 0, thread_wrapper, ctx, 0, NULL)`
-   - POSIX: `pthread_create(&handle, NULL, thread_wrapper, ctx)`
+   - `pthread_create(&handle, NULL, thread_wrapper, ctx)`
 5. Writes the thread ID to the output pointer
 
 **Returns:** `CELL_OK` on success, `CELL_EAGAIN` if thread limit reached, `CELL_ENOMEM` if stack allocation fails.
@@ -132,8 +131,7 @@ Terminates the calling thread. The exit code is in `r3`.
 #### `sys_ppu_thread_yield` (43)
 
 Yields the current thread's time slice.
-- Windows: `SwitchToThread()`
-- POSIX: `sched_yield()`
+- `sched_yield()`
 
 #### `sys_ppu_thread_join` (44)
 
@@ -158,8 +156,7 @@ Returns the stack base address and size for a thread.
 #### `sys_ppu_thread_rename` (56)
 
 Sets the thread's debug name.
-- Windows: `SetThreadDescription()` (Win10+)
-- POSIX: `pthread_setname_np()`
+- `pthread_setname_np()`
 
 ---
 
@@ -170,7 +167,7 @@ Sets the thread's debug name.
 
 ### Implementation
 
-Mutexes are backed by `CRITICAL_SECTION` (Windows) or `pthread_mutex_t` (POSIX). Each mutex handle maps to an entry in a static table.
+Mutexes are backed by `pthread_mutex_t`. Each mutex handle maps to an entry in a static table.
 
 **Features:**
 - Recursive locking (configurable at creation)
@@ -197,7 +194,7 @@ Mutexes are backed by `CRITICAL_SECTION` (Windows) or `pthread_mutex_t` (POSIX).
 
 ### Implementation
 
-Backed by `CONDITION_VARIABLE` (Windows) or `pthread_cond_t` (POSIX). Each condvar is associated with a specific mutex.
+Backed by `pthread_cond_t`. Each condvar is associated with a specific mutex.
 
 ### Syscalls
 
@@ -219,8 +216,7 @@ Backed by `CONDITION_VARIABLE` (Windows) or `pthread_cond_t` (POSIX). Each condv
 
 ### Implementation
 
-- Windows: `CreateSemaphoreW` / `WaitForSingleObject` / `ReleaseSemaphore`
-- POSIX: `sem_init` / `sem_wait` / `sem_post`
+- `sem_init` / `sem_wait` / `sem_post`
 
 ### Syscalls
 
@@ -242,8 +238,7 @@ Backed by `CONDITION_VARIABLE` (Windows) or `pthread_cond_t` (POSIX). Each condv
 
 ### Implementation
 
-- Windows: `SRWLOCK` (Slim Reader/Writer Lock — non-recursive, very fast)
-- POSIX: `pthread_rwlock_t`
+- `pthread_rwlock_t`
 
 Multiple readers can hold the lock simultaneously. Writers get exclusive access.
 
@@ -368,9 +363,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 #define PS3_TIMEBASE_FREQUENCY  79800000ULL
 ```
 
-**Platform time sources:**
-- Windows: `QueryPerformanceCounter` / `QueryPerformanceFrequency`
-- POSIX: `clock_gettime(CLOCK_MONOTONIC)` / `CLOCK_REALTIME`
+**Time source:** `clock_gettime(CLOCK_MONOTONIC)` / `CLOCK_REALTIME`.
 
 ### Syscalls
 
@@ -390,9 +383,7 @@ PS3 time is measured in **timebase ticks** at 79,800,000 Hz (79.8 MHz). This is 
 
 ### High-Resolution Timing
 
-For `sys_time_get_current_time`:
-- Windows: `QueryPerformanceCounter` → convert to seconds/nanoseconds
-- POSIX: `clock_gettime(CLOCK_REALTIME, &ts)`
+For `sys_time_get_current_time`: `clock_gettime(CLOCK_REALTIME, &ts)`.
 
 ---
 

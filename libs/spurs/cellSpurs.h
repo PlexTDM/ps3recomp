@@ -5,7 +5,7 @@
  * Maps SPU concepts onto host threads for HLE execution.
  */
 
-#ifndef PS3RECOMP_CELL_SPURS_H
+#if !defined(PS3RECOMP_CELL_SPURS_H)
 #define PS3RECOMP_CELL_SPURS_H
 
 #include "ps3emu/ps3types.h"
@@ -163,9 +163,7 @@ struct CellSpursTaskAttribute {
 /* Guest-owned exit container: unlike the legacy host records above, both its
  * 128-byte size and its guest address alignment are part of the API. */
 struct CellSpursTaskExitCode {
-#if defined(_MSC_VER)
-    __declspec(align(128)) u8 reserved[128];
-#elif defined(__cplusplus)
+#if defined(__cplusplus)
     alignas(128) u8 reserved[128];
 #else
     _Alignas(128) u8 reserved[128];
@@ -321,4 +319,4 @@ s32 cellSpursEventFlagGetDirection(CellSpursEventFlag* eventFlag,
 }
 #endif
 
-#endif /* PS3RECOMP_CELL_SPURS_H */
+#endif

@@ -1176,7 +1176,29 @@ static int rsx_fp_decompile_internal(
         { static int fwd = -1; if (fwd < 0) fwd = getenv("RSX_SHADOW_FORWARD") ? 1 : 0;
           if (!fwd) { static const char* flip[8] = { ">", ">", "==", ">=", "<", "!=", "<=", ">" };
                       op = flip[s_shadow_func[u] & 7u]; } }
-        if (s_shadow_func[u] == 7u)
+        /* RSX_SHADOW_DEBUG: replace the compare with a value that paints the
+         * shadow factor, to see where the projection lands and what it reads. */
+        const char* dbg = getenv("RSX_SHADOW_DEBUG");
+        if (dbg && *dbg) {
+            if (!strcmp(dbg, "zero"))
+                snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)0.0; }\n", u);
+            else if (!strcmp(dbg, "one"))
+                snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)1.0; }\n", u);
+            else if (!strcmp(dbg, "z"))
+                snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return float4(c.z, c.z, c.z, 1.0); }\n", u);
+            else if (!strcmp(dbg, "x"))
+                snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return float4(c.x, c.x, c.x, 1.0); }\n", u);
+            else if (!strcmp(dbg, "y"))
+                snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return float4(c.y, c.y, c.y, 1.0); }\n", u);
+            else
+                snprintf(fn, sizeof fn,
+                    "float4 rsx_shadow%u(float3 c) {\n"
+                    "    float w, h; %s.GetDimensions(w, h);\n"
+                    "    int2 i = clamp((int2)floor(c.xy * float2(w, h)), int2(0, 0), int2((int)w - 1, (int)h - 1));\n"
+                    "    float d = %s.Load(int3(i, 0)).x;\n"
+                    "    return float4(d, d, d, 1.0);\n"
+                    "}\n", u, tn, tn);
+        } else if (s_shadow_func[u] == 7u)
             snprintf(fn, sizeof fn, "float4 rsx_shadow%u(float3 c) { return (float4)1.0; }\n", u);
         else
             /* The four texels of the bilinear footprint, fetched by integer

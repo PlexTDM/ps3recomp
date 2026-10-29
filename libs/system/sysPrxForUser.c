@@ -15,15 +15,10 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <pthread.h>
 #include <unistd.h>
 #include <sched.h>
 #include <errno.h>   /* ETIMEDOUT: its value differs per host, so never inline it */
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal: Lightweight mutex table
@@ -34,11 +29,7 @@ typedef struct {
     int in_use;
     int recursive;
     char name[8];
-#ifdef _WIN32
-    CRITICAL_SECTION cs;
-#else
     pthread_mutex_t mtx;
-#endif
 } LwMutexSlot;
 
 static LwMutexSlot s_lwmutex[MAX_LWMUTEX];
@@ -47,26 +38,16 @@ static u32 s_lwmutex_next = 0;
 /* Guards slot allocation in the create paths now that guest threads are
  * real host threads. Lock/unlock/signal stay lock-free: they only touch
  * the slot the caller already owns. */
-#ifdef _WIN32
-static SRWLOCK s_slot_lock = SRWLOCK_INIT;
-static void slot_lock(void)   { AcquireSRWLockExclusive(&s_slot_lock); }
-static void slot_unlock(void) { ReleaseSRWLockExclusive(&s_slot_lock); }
-#else
 static pthread_mutex_t s_slot_lock = PTHREAD_MUTEX_INITIALIZER;
 static void slot_lock(void)   { pthread_mutex_lock(&s_slot_lock); }
 static void slot_unlock(void) { pthread_mutex_unlock(&s_slot_lock); }
-#endif
 
 /* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
 void sys_lwmutex_reset_all(void)
 {
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
         if (s_lwmutex[i].in_use) {
-#ifdef _WIN32
-            DeleteCriticalSection(&s_lwmutex[i].cs);
-#else
             pthread_mutex_destroy(&s_lwmutex[i].mtx);
-#endif
         }
     }
     memset(s_lwmutex, 0, sizeof(s_lwmutex));
@@ -81,11 +62,7 @@ void sys_lwmutex_reset_all(void)
 typedef struct {
     int in_use;
     u32 lwmutex_id; /* index into s_lwmutex */
-#ifdef _WIN32
-    CONDITION_VARIABLE cv;
-#else
     pthread_cond_t cv;
-#endif
 } LwCondSlot;
 
 static LwCondSlot s_lwcond[MAX_LWCOND];
@@ -104,31 +81,18 @@ typedef struct {
     u64 exitcode;
     int joined;
     int detached;
-#ifdef _WIN32
-    HANDLE handle;
-#else
     pthread_t pt;
-#endif
 } PrxThreadSlot;
 
 static PrxThreadSlot s_threads[MAX_PRX_THREADS];
 static u64 s_next_thread_id = 0x10000; /* start high to avoid collision with sys_ppu_thread */
 
-#ifdef _WIN32
-static DWORD WINAPI prx_thread_entry(LPVOID param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return 0;
-}
-#else
 static void* prx_thread_entry(void* param)
 {
     PrxThreadSlot* t = (PrxThreadSlot*)param;
     t->entry(t->arg);
     return NULL;
 }
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal: Heap table
@@ -172,13 +136,6 @@ void sys_process_exit(s32 exitcode)
     g_sys_process_exit_code   = exitcode;
     g_sys_process_exit_called = 1;
     printf("[sysPrxForUser] sys_process_exit(code=%d)\n", exitcode);
-#ifdef _WIN32
-    /* The RSX present thread runs at ~60Hz; a title that finishes in a few ms
-     * would tear down before the first frame is ever presented. Hold
-     * indefinitely with CELLMARK_HOLD so the last rendered frame is
-     * visible / capturable. */
-    if (getenv("CELLMARK_HOLD")) { for (;;) Sleep(1000); }
-#endif
     /* YDKJ_NOEXIT (diagnostic): the title self-exits after ~2 frames on a
      * teardown assert triggered by incomplete SPU/SPURS state (a timing race).
      * Ignoring the exit on the calling thread lets the render loop keep running
@@ -187,11 +144,7 @@ void sys_process_exit(s32 exitcode)
         printf("[sysPrxForUser] sys_process_exit IGNORED (YDKJ_NOEXIT) -- parking thread\n");
         fflush(stdout);
         for (;;) {
-#ifdef _WIN32
-            Sleep(1000);
-#else
             struct timespec ts = {1,0}; nanosleep(&ts,0);
-#endif
         }
     }
     exit(exitcode);
@@ -433,16 +386,12 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex,
             if (attr)
                 memcpy(m->name, attr->name, 8);
 
-#ifdef _WIN32
-            InitializeCriticalSection(&m->cs);
-#else
             pthread_mutexattr_t mattr;
             pthread_mutexattr_init(&mattr);
             if (m->recursive)
                 pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
             pthread_mutex_init(&m->mtx, &mattr);
             pthread_mutexattr_destroy(&mattr);
-#endif
 
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
@@ -531,33 +480,16 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 
     u32 slot = lwmutex->sleep_queue - 1;
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use) {
-#ifdef _WIN32
-        printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
-               "sleep_queue=0x%08X (%s) [host tid %lu] -> ESRCH\n",
-               YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
-               slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use",
-               GetCurrentThreadId());
-#else
         printf("[sysPrxForUser] sys_lwmutex_lock FAIL guest=0x%08X "
                "sleep_queue=0x%08X (%s) -> ESRCH\n",
                YZ_GUEST_ADDR(lwmutex), lwmutex->sleep_queue,
                slot >= MAX_LWMUTEX ? "bad slot" : "slot not in use");
-#endif
         { extern char* getenv(const char*); static int _lk=-1; if(_lk<0)_lk=getenv("FLOW_LOCKOK")?1:0;
           if(_lk) return CELL_OK; }   /* diag: treat uninit lwmutex as acquired, see if boot proceeds */
         return CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
-        fprintf(stderr, "[LWMTX] tid %lu BLOCKING on lwmutex slot %u (guest 0x%08X)\n",
-                GetCurrentThreadId(), slot, YZ_GUEST_ADDR(lwmutex));
-        EnterCriticalSection(&s_lwmutex[slot].cs);
-        fprintf(stderr, "[LWMTX] tid %lu acquired slot %u\n", GetCurrentThreadId(), slot);
-    }
-#else
     pthread_mutex_lock(&s_lwmutex[slot].mtx);
-#endif
 
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
@@ -576,13 +508,8 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
         return CELL_ESRCH;
 
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs))
-        return CELL_EBUSY;
-#else
     if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
         return CELL_EBUSY;
-#endif
 
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
@@ -602,24 +529,15 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
     if (lwmutex->recursive_count == 0)
         lwmutex->lock_var = 0;
 
-#ifdef _WIN32
-    LeaveCriticalSection(&s_lwmutex[slot].cs);
-#else
     pthread_mutex_unlock(&s_lwmutex[slot].mtx);
-#endif
     return CELL_OK;
 }
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
     YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
-#ifdef _WIN32
-    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
-           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
-#else
     printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X)\n",
            lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0);
-#endif
 
     if (!lwmutex) return CELL_EFAULT;
 
@@ -632,19 +550,10 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
     /* lv2 refuses to destroy a held lwmutex (CELL_EBUSY) - games rely on
      * this when tearing down a heap another thread is still allocating
      * from: the EBUSY keeps the lock (and the heap) alive. */
-#ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
-        printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
-        return CELL_EBUSY;
-    }
-    LeaveCriticalSection(&s_lwmutex[slot].cs);
-    DeleteCriticalSection(&s_lwmutex[slot].cs);
-#else
     if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
         return CELL_EBUSY;
     pthread_mutex_unlock(&s_lwmutex[slot].mtx);
     pthread_mutex_destroy(&s_lwmutex[slot].mtx);
-#endif
     s_lwmutex[slot].in_use = 0;
 
     memset(lwmutex, 0, sizeof(*lwmutex));
@@ -677,11 +586,7 @@ s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
             c->in_use = 1;
             c->lwmutex_id = lwmutex->sleep_queue - 1;
 
-#ifdef _WIN32
-            InitializeConditionVariable(&c->cv);
-#else
             pthread_cond_init(&c->cv, NULL);
-#endif
 
             lwcond->lwcond_queue = slot + 1;
             s_lwcond_next = (slot + 1) % MAX_LWCOND;
@@ -702,11 +607,7 @@ s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
     if (slot >= MAX_LWCOND || !s_lwcond[slot].in_use)
         return CELL_ESRCH;
 
-#ifdef _WIN32
-    WakeConditionVariable(&s_lwcond[slot].cv);
-#else
     pthread_cond_signal(&s_lwcond[slot].cv);
-#endif
     return CELL_OK;
 }
 
@@ -719,11 +620,7 @@ s32 sys_lwcond_signal_all(sys_lwcond_t_hle* lwcond)
     if (slot >= MAX_LWCOND || !s_lwcond[slot].in_use)
         return CELL_ESRCH;
 
-#ifdef _WIN32
-    WakeAllConditionVariable(&s_lwcond[slot].cv);
-#else
     pthread_cond_broadcast(&s_lwcond[slot].cv);
-#endif
     return CELL_OK;
 }
 
@@ -741,16 +638,6 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     if (mslot >= MAX_LWMUTEX || !s_lwmutex[mslot].in_use)
         return CELL_ESRCH;
 
-#ifdef _WIN32
-    DWORD ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
-    if (!SleepConditionVariableCS(&s_lwcond[cslot].cv,
-                                   &s_lwmutex[mslot].cs, ms))
-    {
-        if (GetLastError() == ERROR_TIMEOUT)
-            return CELL_ETIMEDOUT;
-        return CELL_EFAULT;
-    }
-#else
     if (timeout == 0) {
         pthread_cond_wait(&s_lwcond[cslot].cv, &s_lwmutex[mslot].mtx);
     } else {
@@ -764,14 +651,13 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
         }
         int rc = pthread_cond_timedwait(&s_lwcond[cslot].cv,
                                          &s_lwmutex[mslot].mtx, &ts);
-        /* ETIMEDOUT, not the 110 that was written here: 110 is Linux's value
-         * and Darwin's is 60, so on macOS a real timeout fell through and the
-         * guest was told CELL_OK -- that its condition had been signalled. A
-         * lwcond poll loop then proceeds on state nobody produced. */
+        /* ETIMEDOUT, not the numeric 110: the value is host-specific, and a
+         * timeout mistaken for success told the guest its condition had been
+         * signalled. A lwcond poll loop then proceeds on state nobody
+         * produced. */
         if (rc == ETIMEDOUT)
             return CELL_ETIMEDOUT;
     }
-#endif
 
     return CELL_OK;
 }
@@ -785,9 +671,7 @@ s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
 
     u32 slot = lwcond->lwcond_queue - 1;
     if (slot < MAX_LWCOND && s_lwcond[slot].in_use) {
-#ifndef _WIN32
         pthread_cond_destroy(&s_lwcond[slot].cv);
-#endif
         s_lwcond[slot].in_use = 0;
     }
 
@@ -1093,18 +977,6 @@ s32 sys_get_random_number(void* buf, u64 size)
     if (!buf || size == 0) return CELL_EFAULT;
     buf = yz_g2h(buf);   /* guest EA -> host pointer before the OS fills it */
 
-#ifdef _WIN32
-    /* Use BCryptGenRandom on Windows */
-    #include <bcrypt.h>
-    NTSTATUS status = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)size,
-                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (status != 0) {
-        /* Fallback: fill with simple pseudo-random */
-        u8* p = (u8*)buf;
-        for (u64 i = 0; i < size; i++)
-            p[i] = (u8)(rand() & 0xFF);
-    }
-#else
     /* Use /dev/urandom on Unix */
     FILE* f = fopen("/dev/urandom", "rb");
     if (f) {
@@ -1115,7 +987,6 @@ s32 sys_get_random_number(void* buf, u64 size)
         for (u64 i = 0; i < size; i++)
             p[i] = (u8)(rand() & 0xFF);
     }
-#endif
 
     return CELL_OK;
 }

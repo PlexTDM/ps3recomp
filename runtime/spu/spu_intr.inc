@@ -73,11 +73,7 @@ static void ps3_intr_raise(uint32_t tag)
 {
     for (int i = 0; i < PS3_INTR_MAX; i++) {
         if (s_intr[i].used && s_intr[i].tag == tag) {
-#ifdef _WIN32
-            InterlockedExchange(&s_intr[i].pending, 1);
-#else
             s_intr[i].pending = 1;
-#endif
             return;
         }
     }
@@ -117,11 +113,7 @@ int ps3_intr_wait(uint64_t thread)
                         b->tag, (unsigned long long)thread);
             return 1;
         }
-#ifdef _WIN32
-        Sleep(1);
-#else
         { struct timespec ts = {0, 200 * 1000}; nanosleep(&ts, 0); }
-#endif
     }
 }
 

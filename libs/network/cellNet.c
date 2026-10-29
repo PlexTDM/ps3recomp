@@ -1,8 +1,7 @@
 /*
  * ps3recomp - cellNet HLE implementation
  *
- * Network core initialization. On Windows, initializes Winsock.
- * Provides DNS resolver stubs.
+ * Network core initialization and DNS resolver stubs.
  */
 
 #include "cellNet.h"
@@ -10,15 +9,8 @@
 #include <string.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
 #include <netdb.h>
 #include <arpa/inet.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state

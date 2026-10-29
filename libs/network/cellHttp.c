@@ -1,9 +1,9 @@
 /*
  * ps3recomp - cellHttp HLE implementation
  *
- * Real HTTP client using native sockets (Winsock2 on Windows, POSIX elsewhere).
- * Resolves hostnames, connects via TCP, sends HTTP/1.1 requests, and receives
- * responses with header parsing and body streaming.
+ * Real HTTP client using native POSIX sockets. Resolves hostnames, connects
+ * via TCP, sends HTTP/1.1 requests, and receives responses with header parsing
+ * and body streaming.
  */
 
 #include "cellHttp.h"
@@ -15,14 +15,6 @@
 /* ---------------------------------------------------------------------------
  * Platform socket abstraction
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-typedef SOCKET http_socket_t;
-#define HTTP_INVALID_SOCKET INVALID_SOCKET
-#define http_closesocket closesocket
-#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -32,7 +24,6 @@ typedef SOCKET http_socket_t;
 typedef int http_socket_t;
 #define HTTP_INVALID_SOCKET (-1)
 #define http_closesocket close
-#endif
 #include "host_socket_send.h"
 
 /* Guest-EA marshalling: the generic HLE adapter passes PPC r3.. verbatim, so
@@ -46,9 +37,6 @@ extern uint8_t* vm_base;
  * -----------------------------------------------------------------------*/
 
 static int s_http_initialized = 0;
-#ifdef _WIN32
-static int s_wsa_initialized = 0;
-#endif
 
 typedef struct {
     int                  in_use;
@@ -114,20 +102,11 @@ static void http_apply_timeout(http_socket_t sock, int send, u32 usec)
     if (sock == HTTP_INVALID_SOCKET)
         return;
 
-#ifdef _WIN32
-    /* Winsock SO_RCVTIMEO/SO_SNDTIMEO takes milliseconds as DWORD */
-    DWORD ms = usec / 1000;
-    if (ms == 0 && usec > 0)
-        ms = 1;
-    setsockopt(sock, SOL_SOCKET, send ? SO_SNDTIMEO : SO_RCVTIMEO,
-               (const char*)&ms, sizeof(ms));
-#else
     struct timeval tv;
     tv.tv_sec  = usec / 1000000;
     tv.tv_usec = usec % 1000000;
     setsockopt(sock, SOL_SOCKET, send ? SO_SNDTIMEO : SO_RCVTIMEO,
                &tv, sizeof(tv));
-#endif
 }
 
 /* Close the socket in a transaction slot if open, reset state. */
@@ -275,16 +254,6 @@ s32 cellHttpInit(void* pool, u32 poolSize)
     if (s_http_initialized)
         return CELL_HTTP_ERROR_ALREADY_INITIALIZED;
 
-#ifdef _WIN32
-    if (!s_wsa_initialized) {
-        WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            printf("[cellHttp] WSAStartup failed\n");
-            return CELL_HTTP_ERROR_UNKNOWN;
-        }
-        s_wsa_initialized = 1;
-    }
-#endif
 
     memset(s_clients, 0, sizeof(s_clients));
     memset(s_transactions, 0, sizeof(s_transactions));
@@ -321,12 +290,6 @@ s32 cellHttpEnd(void)
 
     s_http_initialized = 0;
 
-#ifdef _WIN32
-    if (s_wsa_initialized) {
-        WSACleanup();
-        s_wsa_initialized = 0;
-    }
-#endif
 
     return CELL_OK;
 }

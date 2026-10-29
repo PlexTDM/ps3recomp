@@ -17,13 +17,8 @@
 #include <string.h>
 
 /* Yield hint for spin-wait loops */
-#ifdef _WIN32
-#include <windows.h>
-#define SYNC_YIELD() SwitchToThread()
-#else
 #include <sched.h>
 #define SYNC_YIELD() sched_yield()
-#endif
 
 /* =========================================================================
  * Mutex
@@ -48,11 +43,7 @@ static inline uint32_t sync_bswap32(uint32_t v)
  * them; not fixed blind here. */
 
 static int sync_trace(void){ static int v=-1; if(v<0){const char*e=getenv("SYNC_TRACE"); v=e?1:0;} return v; }
-#ifdef _WIN32
-#define SYNC_TID() ((unsigned long)GetCurrentThreadId())
-#else
 #define SYNC_TID() ((unsigned long)0)
-#endif
 
 /* SYNC_WATCH=<hex ea>: log every HLE operation on that one mutex with its word
  * before the op, so a PPU re-initialise under an SPU waiter is visible. */

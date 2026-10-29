@@ -13,10 +13,6 @@
  *   cc -std=gnu17 -I include -o test_http_response_getters libs/network/tests/test_http_response_getters.c
  * Driven by tools/test_http_response_getters.py.
  */
-#ifdef _WIN32
-#include <stdio.h>
-int main(void) { puts("SKIP: POSIX sockets only"); return 0; }
-#else
 #include "../cellHttp.h"
 s32 cellHttpResponseGetStatusCode(CellHttpTransId, s32*) __attribute__((weak));
 s32 cellHttpResponseGetContentLength(CellHttpTransId, u64*) __attribute__((weak));
@@ -172,4 +168,3 @@ int main(void)
     printf("%s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
 }
-#endif

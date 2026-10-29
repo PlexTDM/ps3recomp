@@ -31,31 +31,10 @@ extern "C" {
  * intrinsic (no runtime library symbol needed); elsewhere use the C11
  * equivalent, which lowers to the same LL/SC or lock-xchg on every target.
  * ===========================================================================*/
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
-/* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
- * pause, and yield after a long wait. The bare exchange loop let GH3's four
- * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
-void spu_lockline_lock(void)
-{
-    unsigned spins = 0;
-    while (_InterlockedExchange(&g_lockline, 1)) {
-        do {
-            _mm_pause();
-            if (++spins >= 4096) { spins = 0; SwitchToThread(); }
-        } while (g_lockline);
-    }
-}
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
-#else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
 void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
 void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
-#endif
 
 /* ===========================================================================
  * The reserved-line bitmap

@@ -6,18 +6,13 @@
  * [WAIT] lines/minute of an LBP intro run showed up as harsh ~1 Hz hitches
  * in user-visible runs while file-redirected runs played smoothly.
  */
-#ifndef PS3_LOG_H
+#if !defined(PS3_LOG_H)
 #define PS3_LOG_H
 
 #include <stdio.h>
 #include <stdlib.h>
-#ifdef _WIN32
-#include <io.h>
-#define PS3_ISATTY_STDERR() _isatty(_fileno(stderr))
-#else
 #include <unistd.h>
 #define PS3_ISATTY_STDERR() isatty(fileno(stderr))
-#endif
 
 #ifdef __cplusplus
 static inline int ps3_log_verbose(void)
@@ -30,8 +25,8 @@ static __inline int ps3_log_verbose(void)
      * log, so be verbose.
      *
      * That default has a sharp edge worth knowing about. The per-event lines are
-     * emitted from every guest thread through one FILE lock, and Windows locks
-     * are not fair, so at the ~6k lines/s a SPURS audio loop produces a thread
+     * emitted from every guest thread through one FILE lock, and that lock is
+     * not fair, so at the ~6k lines/s a SPURS audio loop produces a thread
      * can starve on the lock for seconds. Tokyo Jungle presents four frames in
      * 40 s with the log discarded and one with it redirected to a file -- the
      * logging changes what the title does. Measure timing-sensitive behaviour
@@ -45,4 +40,4 @@ static __inline int ps3_log_verbose(void)
     return v;
 }
 
-#endif /* PS3_LOG_H */
+#endif

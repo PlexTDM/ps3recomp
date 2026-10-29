@@ -1,4 +1,4 @@
-/* Present-time passes shared by the D3D12 and Vulkan engines (HLSL; the
+/* Present-time passes for the Vulkan engine (HLSL; the
  * Vulkan engine lowers it through glslang). Fullscreen triangle, t0 the
  * frame, s1 a linear clamp sampler (s0 is the helpers' point one).
  *

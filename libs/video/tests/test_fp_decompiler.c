@@ -1,7 +1,7 @@
 /*
  * Standalone unit test for the RSX fragment-program decompiler.
  *
- * Build (no D3D12 dependency), from this directory:
+ * Build (no graphics-API dependency), from this directory:
  *   cc -std=c11 -Wall -Wextra -I../../../include \
  *       test_fp_decompiler.c ../rsx_fp_decompiler.c -o test_fp
  *

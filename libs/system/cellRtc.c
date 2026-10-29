@@ -13,12 +13,7 @@
 #include <stdlib.h>   /* abs */
 #include <time.h>
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <sys/timeb.h>
-#else
 #  include <sys/time.h>
-#endif
 
 /* Seconds between PS3 epoch (0001-01-01) and Unix epoch (1970-01-01) */
 #define PS3_UNIX_EPOCH_DIFF  62135596800ULL
@@ -33,15 +28,9 @@
 /* Get current Unix time in microseconds */
 static u64 get_host_time_usec(void)
 {
-#ifdef _WIN32
-    struct _timeb tb;
-    _ftime_s(&tb);
-    return (u64)tb.time * USEC_PER_SEC + (u64)tb.millitm * 1000ULL;
-#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (u64)tv.tv_sec * USEC_PER_SEC + (u64)tv.tv_usec;
-#endif
 }
 
 /* Convert Unix time_t to PS3 tick */
@@ -187,11 +176,7 @@ s32 cellRtcGetCurrentClock(CellRtcDateTime* pClock, s32 iTimeZone)
     u32 usec = (u32)(host_usec % USEC_PER_SEC);
 
     struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
     gmtime_r(&t, &tm_val);
-#endif
     CellRtcDateTime dt;
     tm_to_datetime(&tm_val, usec, &dt);
     rtc_dt_write(pClock, &dt);
@@ -208,11 +193,7 @@ s32 cellRtcGetCurrentClockLocalTime(CellRtcDateTime* pClock)
     u32 usec = (u32)(host_usec % USEC_PER_SEC);
 
     struct tm local_tm;
-#ifdef _WIN32
-    localtime_s(&local_tm, &t);
-#else
     localtime_r(&t, &local_tm);
-#endif
 
     CellRtcDateTime dt_l;
     tm_to_datetime(&local_tm, usec, &dt_l);
@@ -230,11 +211,7 @@ s32 cellRtcGetCurrentClockUtc(CellRtcDateTime* pClock)
     u32 usec = (u32)(host_usec % USEC_PER_SEC);
 
     struct tm utc_tm;
-#ifdef _WIN32
-    gmtime_s(&utc_tm, &t);
-#else
     gmtime_r(&t, &utc_tm);
-#endif
 
     CellRtcDateTime dt_u;
     tm_to_datetime(&utc_tm, usec, &dt_u);
@@ -358,13 +335,8 @@ s32 cellRtcConvertLocalTimeToUtc(const CellRtcTick* pLocalTime, CellRtcTick* pUt
     /* Get local-to-UTC offset using the C runtime */
     time_t now = time(NULL);
     struct tm local_tm, utc_tm;
-#ifdef _WIN32
-    localtime_s(&local_tm, &now);
-    gmtime_s(&utc_tm, &now);
-#else
     localtime_r(&now, &local_tm);
     gmtime_r(&now, &utc_tm);
-#endif
 
     time_t local_t = mktime(&local_tm);
     time_t utc_t   = mktime(&utc_tm);
@@ -381,13 +353,8 @@ s32 cellRtcConvertUtcToLocalTime(const CellRtcTick* pUtc, CellRtcTick* pLocalTim
 
     time_t now = time(NULL);
     struct tm local_tm, utc_tm;
-#ifdef _WIN32
-    localtime_s(&local_tm, &now);
-    gmtime_s(&utc_tm, &now);
-#else
     localtime_r(&now, &local_tm);
     gmtime_r(&now, &utc_tm);
-#endif
 
     time_t local_t = mktime(&local_tm);
     time_t utc_t   = mktime(&utc_tm);
@@ -408,11 +375,7 @@ s32 cellRtcFormatRfc2822(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
 
     time_t t = (time_t)unix_time;
     struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
     gmtime_r(&t, &tm_val);
-#endif
 
     s32 tz_h = iTimeZoneMinutes / 60;
     s32 tz_m = abs(iTimeZoneMinutes) % 60;
@@ -441,11 +404,7 @@ s32 cellRtcFormatRfc3339(char* pszDateTime, const CellRtcTick* pTick, s32 iTimeZ
 
     time_t t = (time_t)unix_time;
     struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
     gmtime_r(&t, &tm_val);
-#endif
 
     if (iTimeZoneMinutes == 0) {
         sprintf(rtc_str(pszDateTime), "%04d-%02d-%02dT%02d:%02d:%02dZ",
@@ -503,11 +462,7 @@ s32 cellRtcSetTick(CellRtcDateTime* pDateTime, const CellRtcTick* pTick)
 
     time_t t = (time_t)unix_time;
     struct tm tm_val;
-#ifdef _WIN32
-    gmtime_s(&tm_val, &t);
-#else
     gmtime_r(&t, &tm_val);
-#endif
 
     {
         CellRtcDateTime dt_s;
@@ -525,11 +480,7 @@ s32 cellRtcGetTick(const CellRtcDateTime* pDateTime, CellRtcTick* pTick)
     CellRtcDateTime dt_g;
     rtc_dt_read(pDateTime, &dt_g);
     struct tm t = datetime_to_tm(&dt_g);
-#ifdef _WIN32
-    time_t tt = _mkgmtime(&t);
-#else
     time_t tt = timegm(&t);
-#endif
 
     rtc_tick_write(pTick, time_t_to_tick((s64)tt) + dt_g.microsecond);
     return CELL_OK;

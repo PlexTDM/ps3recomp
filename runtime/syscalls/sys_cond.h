@@ -2,7 +2,7 @@
  * ps3recomp - Condition variable syscalls
  */
 
-#ifndef SYS_COND_H
+#if !defined(SYS_COND_H)
 #define SYS_COND_H
 
 #include "lv2_syscall_table.h"
@@ -13,13 +13,8 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <time.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,13 +32,8 @@ typedef struct sys_cond_info {
     int      initialized;
     struct sys_cond_waiter* waiters;
 
-#ifdef _WIN32
-    CONDITION_VARIABLE cv;
-    CRITICAL_SECTION signal_lock;
-#else
     pthread_cond_t     cv;
     pthread_mutex_t    signal_lock;
-#endif
 
 } sys_cond_info;
 
@@ -64,4 +54,4 @@ void sys_cond_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_COND_H */
+#endif

@@ -265,11 +265,6 @@ static int64_t sys_tty_read(ppu_context* ctx)
 #define MAX_SPU_GROUPS   32
 #define MAX_SPU_THREADS  (MAX_SPU_GROUPS * 8)
 
-#ifdef _WIN32
-#  include <windows.h>
-typedef HANDLE spu_thread_handle_t;
-typedef HANDLE spu_thread_event_t;
-#else
 #  include <pthread.h>
 #  include <errno.h>
 typedef pthread_t spu_thread_handle_t;
@@ -278,7 +273,6 @@ typedef struct {
     pthread_cond_t  cv;
     int             done;
 } spu_thread_event_t;
-#endif
 
 typedef struct {
     int      in_use;
@@ -571,11 +565,7 @@ static int32_t ydkj_hle_spurs_kernel(uint32_t tid, uint32_t args_ea,
         return g_ydkj_spurs_kernel_run(tid, args_ea);   /* run the lifted kernel */
     /* Keep the group running so the SPURS handler sees a live SPU. */
     for (int i = 0; i < 1200; i++) {
-#ifdef _WIN32
-        Sleep(50);
-#else
         struct timespec ts = {0, 50*1000*1000}; nanosleep(&ts, 0);
-#endif
     }
     return 0;
 }
@@ -686,7 +676,6 @@ static size_t spu_host_stack_bytes(void)
                                    : (size_t)16 * 1024 * 1024;
 }
 
-#ifndef _WIN32
 /* pthread_create with that stack, falling back to the host default if the size
  * is refused -- a thread with a small stack beats no thread at all. */
 static void spu_spawn_host_thread(spu_thread_handle_t* out,
@@ -701,22 +690,14 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
     if (rc != 0)
         pthread_create(out, NULL, fn, arg);
 }
-#endif
 
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
  * that belongs to the group state machine: apply the classified stop to the
  * thread and, for a GROUP_EXIT, to the group, then release group_join. */
-#ifdef _WIN32
-static DWORD WINAPI spu_exec_thread_proc(LPVOID arg)
-#else
 static void* spu_exec_thread_proc(void* arg)
-#endif
 {
-#ifdef _WIN32
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
-#endif
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
@@ -732,30 +713,17 @@ static void* spu_exec_thread_proc(void* arg)
             g->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
         }
     }
-#ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
-    return 0;
-#else
     pthread_mutex_lock(&t->finish_event.mu);
     t->running = 0;
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
-#endif
 }
 
 /* Host-thread entry for a PPU-fallback SPU thread. */
-#ifdef _WIN32
-static DWORD WINAPI spu_fallback_thread_proc(LPVOID arg)
-#else
 static void* spu_fallback_thread_proc(void* arg)
-#endif
 {
-#ifdef _WIN32
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }  /* let SO reach the reporter */
-#endif
     spu_thread_t* t = (spu_thread_t*)arg;
     int32_t rc = 0;
     if (t->fb_handler) {
@@ -774,18 +742,12 @@ static void* spu_fallback_thread_proc(void* arg)
                 t->tid, rc, t->connected_queue);
     }
     /* Mark complete and signal anyone waiting in group_join. */
-#ifdef _WIN32
-    t->running = 0;
-    SetEvent(t->finish_event);
-    return 0;
-#else
     pthread_mutex_lock(&t->finish_event.mu);
     t->running = 0;
     t->finish_event.done = 1;
     pthread_cond_broadcast(&t->finish_event.cv);
     pthread_mutex_unlock(&t->finish_event.mu);
     return NULL;
-#endif
 }
 
 /* Load a sys_spu_image's segments into a 256 KB local store. COPY segments
@@ -985,7 +947,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         /* Arm a page-guard on the instance page so we catch the libsre function
          * that writes the CellSpurs struct (WWATCH misses memcpy/DMA writes).
          * Its own lever, so it still arms with the dump off; it protects a page
-         * rather than reading one, and is a no-op away from Windows. */
+         * rather than reading one. */
         if (getenv("YDKJ_GUARD_INST")) { extern void ppu_guard_page(uint32_t); ppu_guard_page(0x40009D00); }
         fflush(stderr);
       } }
@@ -1020,20 +982,10 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
                 t->running = 1;
-#ifdef _WIN32
-                if (!t->finish_event)
-                    t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-                else
-                    ResetEvent(t->finish_event);
-                t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
-                                              spu_exec_thread_proc, t,
-                                              STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-#else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
                 t->finish_event.done = 0;
                 spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
-#endif
                 fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
                         "args=0x%08X -> LIFTED SPU execution (image %d, "
                         "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
@@ -1140,21 +1092,10 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             instant++;
             continue;
         }
-#ifdef _WIN32
-        /* Manual-reset event so multiple group_join callers all see "set" */
-        if (!t->finish_event)
-            t->finish_event = CreateEventA(NULL, TRUE, FALSE, NULL);
-        else
-            ResetEvent(t->finish_event);
-        t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
-                                      spu_fallback_thread_proc, t,
-                                      STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-#else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
         spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t);
-#endif
         /* Start handshake for a persistent worker: do not let group_start
          * return until the worker has published its live context.
          *
@@ -1170,11 +1111,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
          * Bounded, so a worker that dies during init cannot hang group_start. */
         if (fb == spu_registry_fallback) {
             for (int spin = 0; spin < 2000 && !t->live_ctx && t->running; spin++)
-#ifdef _WIN32
-                Sleep(1);
-#else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
             if (!t->live_ctx)
                 fprintf(stderr, "[SPU] group_start tid=0x%X: worker never published "
                         "a context -- mailbox writes will fall back to re-runs\n",
@@ -1241,14 +1178,6 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
             spu_thread_t* t = &s_spu_threads[idx];
             if (!t->in_use) continue;
             if (t->running) {
-#ifdef _WIN32
-                if (t->finish_event)
-                    WaitForSingleObject(t->finish_event, INFINITE);
-                if (t->host_thread) {
-                    CloseHandle(t->host_thread);
-                    t->host_thread = NULL;
-                }
-#else
                 pthread_mutex_lock(&t->finish_event.mu);
                 while (!t->finish_event.done)
                     pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
@@ -1256,7 +1185,6 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
                 pthread_join(t->host_thread, NULL);
                 pthread_mutex_destroy(&t->finish_event.mu);
                 pthread_cond_destroy(&t->finish_event.cv);
-#endif
             }
             if (t->exit_status < worst) worst = t->exit_status;
         }
@@ -1506,11 +1434,7 @@ static int64_t sys_spu_thread_write_spu_mb_handler(ppu_context* ctx)
             spu_ch_wake(c);                       /* only it can drain the slot */
             int waited = 0;
             while (spu_channel_has_data(&c->ch_in_mbox) && waited < 250) {
-#ifdef _WIN32
-                Sleep(1);
-#else
                 { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-#endif
                 waited++;
             }
             if (spu_channel_has_data(&c->ch_in_mbox)) {
@@ -2045,30 +1969,6 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
                         fprintf(stderr, "[SPU] import dumped: %s (%u bytes)\n", path, ext); }
           }
       } }
-#ifdef _WIN32
-    /* LBP retries this import in a tight loop (134x observed) with no other
-     * syscall in between -- something it derives from the filled struct keeps
-     * it unsatisfied. Print the guest caller chain for the first few so the
-     * retry loop can be identified. */
-    { static int _bt_n = 0;
-      if (_bt_n < 3 && ++_bt_n) {
-          /* Matches func_entry in the generated ppu_recomp.h. */
-          struct lv2_bt_fentry { uint64_t addr; void* func; const char* name; };
-          extern const struct lv2_bt_fentry function_table[];
-          extern const uint64_t function_table_count;
-          void* bt[24]; unsigned short fr = RtlCaptureStackBackTrace(0, 24, bt, 0);
-          char ln[800]; int p = snprintf(ln, sizeof ln, "[SPU]   import bt:");
-          for (int i = 0; i < fr; i++) {
-              uintptr_t t = (uintptr_t)bt[i]; uint32_t bg = 0; uintptr_t bh = 0;
-              for (uint64_t k = 0; k < function_table_count; k++) {
-                  uintptr_t h = (uintptr_t)function_table[k].func;
-                  if (h <= t && h > bh) { bh = h; bg = (uint32_t)function_table[k].addr; }
-              }
-              if (bg && (t - bh) < 0x14000) p += snprintf(ln + p, sizeof(ln) - p, " %08X", bg);
-          }
-          fprintf(stderr, "%s\n", ln);
-      } }
-#endif
     fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
@@ -2420,11 +2320,7 @@ static int64_t sys_usbd_receive_event_handler(ppu_context* ctx)
     if (a1) { vm_write_be32(a1, 0); vm_write_be32(a1 + 4, 0); }
     if (a2) { vm_write_be32(a2, 0); vm_write_be32(a2 + 4, 0); }
     if (a3) { vm_write_be32(a3, 0); vm_write_be32(a3 + 4, 0); }
-#ifdef _WIN32
-    Sleep(20);
-#else
     { struct timespec ts = {0, 20*1000*1000}; nanosleep(&ts, 0); }
-#endif
     return CELL_OK;
 }
 

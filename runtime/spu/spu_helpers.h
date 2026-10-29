@@ -10,7 +10,7 @@
  * widths and big-endian conventions match runtime/spu/spu_context.h.
  */
 
-#ifndef SPU_HELPERS_H
+#if !defined(SPU_HELPERS_H)
 #define SPU_HELPERS_H
 
 #include "spu_context.h"
@@ -21,17 +21,7 @@
 extern "C" {
 #endif
 
-#ifdef _MSC_VER
-#include <intrin.h>
-static inline int spu_clz32(uint32_t x) {
-    unsigned long idx;
-    if (!x) return 32;
-    _BitScanReverse(&idx, x);
-    return 31 - (int)idx;
-}
-#else
 static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
-#endif
 
 /* Architectural SPU barrier -- the lifted `sync`/`dsync`/`syncc` emission.
  * SPU ISA v1.2 §13 (+ the per-instruction pages): order all earlier LS and
@@ -41,11 +31,7 @@ static inline int spu_clz32(uint32_t x) { return x ? __builtin_clz(x) : 32; }
  * across an empty statement (the PPU twin of this bug is LESSONS #11d). A
  * full fence: the locked exchange forces total order and is opaque to the
  * optimizer. */
-#ifdef _MSC_VER
-static inline void spu_arch_fence(void) { long spu_fence_tmp = 0; _InterlockedExchange(&spu_fence_tmp, 1); }
-#else
 static inline void spu_arch_fence(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
-#endif
 
 /* SPU byte position -> our _u8 index.
  * Our u128 is HOST-NATIVE little-endian (_u32[i]=SPU word i as a value via
@@ -1790,4 +1776,4 @@ static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
 #endif
 
-#endif /* SPU_HELPERS_H */
+#endif

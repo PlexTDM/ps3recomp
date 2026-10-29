@@ -1,5 +1,5 @@
-/* macOS: clang -std=gnu17 -I include libs/system/tests/test_dialog_callbacks.c
- * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks && /tmp/test_dialog_callbacks */
+/* clang -std=gnu17 -I include libs/system/tests/test_dialog_callbacks.c
+ * libs/system/cellSysutil.c -Wl,--gc-sections -pthread -o /tmp/test_dialog_callbacks && /tmp/test_dialog_callbacks */
 #include "../cellMsgDialog.c"
 #include <assert.h>
 #include <stdlib.h>

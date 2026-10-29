@@ -146,45 +146,12 @@ extern uint64_t ppu_timebase_now(void);
 #endif
 
 /* MSVC compatibility helpers */
-#ifdef _MSC_VER
-#include <intrin.h>
-/* clang-cl defines _MSC_VER but provides __builtin_clz/clzll natively, so
- * redefining them is a hard error there -- only polyfill for real MSVC. */
-#ifndef __clang__
-static inline int __builtin_clz(unsigned int x) {
-    /* BSR leaves the index undefined for x==0; PowerPC cntlzw(0) is DEFINED
-     * as 32. Without the guard this returned 31 minus an uninitialized
-     * index for zero inputs. */
-    unsigned long idx;
-    if (!x) return 32;
-    _BitScanReverse(&idx, x);
-    return 31 - (int)idx;
-}
-static inline int __builtin_clzll(unsigned long long x) {
-    unsigned long idx;
-    if (!x) return 64;
-    _BitScanReverse64(&idx, x);
-    return 63 - (int)idx;
-}
-#endif
-static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
-    int64_t hi;
-    _mul128(a, b, &hi);
-    return hi;
-}
-static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
-    uint64_t hi;
-    _umul128(a, b, &hi);
-    return hi;
-}
-#else
 static inline int64_t ppc_mulhd(int64_t a, int64_t b) {
     return (int64_t)((__int128)(int64_t)a * (__int128)(int64_t)b >> 64);
 }
 static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
     return (uint64_t)((unsigned __int128)a * (unsigned __int128)b >> 64);
 }
-#endif
 
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
@@ -351,11 +318,6 @@ extern "C" { uint8_t* vm_base = g_vm_stub; }
  * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and
  * siglongjmp back: without this the whole run dies on the first bad case and
  * the remaining 1300 checks never report. */
-#ifdef _MSC_VER
-#  define CONF_TRY     __try {
-#  define CONF_EXCEPT  } __except (1) {
-#  define CONF_ENDTRY  }
-#else
 #  include <setjmp.h>
 #  include <signal.h>
 static sigjmp_buf g_conf_jmp;
@@ -368,16 +330,10 @@ static void conf_trap_handler(int sig) {
 #  define CONF_TRY                                                               { struct sigaction _sa, _ofpe, _osegv, _oill;                                 _sa.sa_handler = conf_trap_handler;                                         sigemptyset(&_sa.sa_mask); _sa.sa_flags = 0;                                sigaction(SIGFPE,  &_sa, &_ofpe);                                           sigaction(SIGSEGV, &_sa, &_osegv);                                          sigaction(SIGILL,  &_sa, &_oill);                                           g_conf_armed = 1;                                                           if (sigsetjmp(g_conf_jmp, 1) == 0) {
 #  define CONF_EXCEPT  } else {
 #  define CONF_ENDTRY                                                              }                                                                           g_conf_armed = 0;                                                           sigaction(SIGFPE,  &_ofpe,  0);                                             sigaction(SIGSEGV, &_osegv, 0);                                             sigaction(SIGILL,  &_oill,  0); }
-#endif
 /* _byteswap_* are MSVC intrinsics; this driver is built with plain cl on
  * Windows and with clang/gcc everywhere else, so pick per compiler. */
-#ifdef _MSC_VER
-#  define CONF_BSWAP32 _byteswap_ulong
-#  define CONF_BSWAP64 _byteswap_uint64
-#else
 #  define CONF_BSWAP32 __builtin_bswap32
 #  define CONF_BSWAP64 __builtin_bswap64
-#endif
 extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + VMOFF(a), 4); return CONF_BSWAP32(v); }
 extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }

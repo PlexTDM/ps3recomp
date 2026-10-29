@@ -5,13 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <stdatomic.h>
 #include <time.h>
-#endif
 
 #define YZ_FRONTIER_CAPACITY 131072u
 #define YZ_FRONTIER_PATH_MAX 1024u
@@ -72,34 +67,6 @@ static int s_parity_only;
  * ~3300+). */
 static int s_arm_on_progress;
 
-#ifdef _WIN32
-static volatile LONG64 s_write_count;
-static volatile LONG s_enabled;
-static volatile LONG s_armed;
-static volatile LONG s_dumped;
-
-static uint64_t yz_frontier_now(void)
-{
-    LARGE_INTEGER value;
-    QueryPerformanceCounter(&value);
-    return (uint64_t)value.QuadPart;
-}
-
-static uint64_t yz_frontier_next(void)
-{
-    return (uint64_t)InterlockedIncrement64(&s_write_count) - 1u;
-}
-
-static uint64_t yz_frontier_count(void)
-{
-    return (uint64_t)InterlockedCompareExchange64(&s_write_count, 0, 0);
-}
-
-static void yz_frontier_publish(volatile uint64_t* sequence, uint64_t value)
-{
-    InterlockedExchange64((volatile LONG64*)sequence, (LONG64)value);
-}
-#else
 static _Atomic uint64_t s_write_count;
 static _Atomic int s_enabled;
 static _Atomic int s_armed;
@@ -127,7 +94,6 @@ static void yz_frontier_publish(volatile uint64_t* sequence, uint64_t value)
     atomic_store_explicit((_Atomic uint64_t*)sequence, value,
                           memory_order_release);
 }
-#endif
 
 static const char* yz_frontier_event_name(uint32_t type)
 {
@@ -199,17 +165,8 @@ int yz_frontier_trace_init(void)
     }
     s_compact = compact && *compact == '1';
     s_parity_only = parity && *parity == '1';
-#ifdef _WIN32
-    {
-        LARGE_INTEGER frequency;
-        QueryPerformanceFrequency(&frequency);
-        s_qpc_frequency = (uint64_t)frequency.QuadPart;
-        InterlockedExchange(&s_enabled, 1);
-    }
-#else
     s_qpc_frequency = 1000000000ull;
     atomic_store_explicit(&s_enabled, 1, memory_order_release);
-#endif
     fprintf(stderr,
             "[frontier-ring] configured dormant capacity=%u bytes=%zu compact=%d parity=%d\n",
             YZ_FRONTIER_CAPACITY, sizeof(s_records), s_compact,
@@ -257,20 +214,12 @@ void yz_frontier_trace_progress(uint32_t frame)
 
 int yz_frontier_trace_enabled(void)
 {
-#ifdef _WIN32
-    return InterlockedCompareExchange(&s_enabled, 0, 0) != 0;
-#else
     return atomic_load_explicit(&s_enabled, memory_order_acquire) != 0;
-#endif
 }
 
 int yz_frontier_trace_is_armed(void)
 {
-#ifdef _WIN32
-    return InterlockedCompareExchange(&s_armed, 0, 0) != 0;
-#else
     return atomic_load_explicit(&s_armed, memory_order_acquire) != 0;
-#endif
 }
 
 void yz_frontier_trace_emit(uint32_t type, uint32_t actor, uint32_t pc,
@@ -316,10 +265,6 @@ void yz_frontier_trace_arm(uint32_t actor, uint32_t pc,
 {
     if (!yz_frontier_trace_enabled())
         return;
-#ifdef _WIN32
-    if (InterlockedCompareExchange(&s_armed, 1, 0) != 0)
-        return;
-#else
     {
         int expected = 0;
         if (!atomic_compare_exchange_strong_explicit(
@@ -327,7 +272,6 @@ void yz_frontier_trace_arm(uint32_t actor, uint32_t pc,
                 memory_order_acq_rel, memory_order_acquire))
             return;
     }
-#endif
     yz_frontier_trace_emit(YZ_FT_ARM, actor, pc, source_ea, ls,
                            image, descriptor, 0, 0);
 }
@@ -350,18 +294,11 @@ int yz_frontier_trace_dump(uint32_t reason)
         s_progress < YZ_FRONTIER_PROGRESS_GATE)
         return 0;
 
-#ifdef _WIN32
-    dump_n = InterlockedIncrement(&s_dumped);
-    if (dump_n > (s_rearm_after_dump ? YZ_FRONTIER_MAX_DUMPS : 1))
-        return 0;
-    InterlockedExchange(&s_armed, 0);
-#else
     dump_n = (long)atomic_fetch_add_explicit(&s_dumped, 1,
                                              memory_order_acq_rel) + 1;
     if (dump_n > (s_rearm_after_dump ? YZ_FRONTIER_MAX_DUMPS : 1))
         return 0;
     atomic_store_explicit(&s_armed, 0, memory_order_release);
-#endif
 
     end = yz_frontier_count();
     begin = end > YZ_FRONTIER_CAPACITY ? end - YZ_FRONTIER_CAPACITY : 0u;
@@ -429,11 +366,7 @@ int yz_frontier_trace_dump(uint32_t reason)
     /* Mode '2': keep recording — the terminal stall must get its dump even
      * when an early-boot quiet phase spent this one. */
     if (s_rearm_after_dump && dump_n < YZ_FRONTIER_MAX_DUMPS) {
-#ifdef _WIN32
-        InterlockedExchange(&s_armed, 1);
-#else
         atomic_store_explicit(&s_armed, 1, memory_order_release);
-#endif
     }
     return 1;
 }

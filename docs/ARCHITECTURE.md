@@ -62,7 +62,7 @@ The pipeline transforms a PS3 ELF binary into native C/C++ source code that can 
 
 ### Stage 5: Compilation
 
-1. The generated C code is compiled by a standard host compiler (Clang/GCC/MSVC).
+1. The generated C code is compiled by a standard host compiler (GCC or Clang).
 2. Linked against the ps3recomp runtime library (memory manager, thread manager, HLE stubs).
 3. Produces a native executable.
 
@@ -76,7 +76,7 @@ PS3 uses 32-bit effective addresses (despite the 64-bit PPU, games use 32-bit mo
 host_ptr = vm::g_base + guest_addr
 ```
 
-`vm::g_base` is set at initialization to a large `mmap`/`VirtualAlloc` region.
+`vm::g_base` is set at initialization to a large `mmap` region.
 
 ### Endianness
 
@@ -148,7 +148,7 @@ The RSX GPU is handled by a three-layer translation architecture:
 ```
 cellGcmSys (HLE)  →  RSX Command Processor  →  Graphics Backend
                           │                         │
-                    NV47xx FIFO parsing      D3D12 / Vulkan / null
+                    NV47xx FIFO parsing      Vulkan / null
                     GPU state tracking        Real rendering
 ```
 
@@ -157,9 +157,8 @@ cellGcmSys (HLE)  →  RSX Command Processor  →  Graphics Backend
 2. **RSX Command Processor** (`rsx_commands.c`) parses the NV47xx FIFO command buffer and tracks GPU state: surfaces, viewport, blend, depth/stencil, textures (16 units), vertex attributes (16), shader programs, draw commands.
 
 3. **Graphics Backend** receives state changes and draw calls through the `rsx_backend` callback interface. Current backends:
-   - **Null**: Win32 window showing clear color (debugging)
-   - **D3D12**: Real GPU rendering — device, swap chain, clear, present (Phase 1)
-   - **Vulkan**: Planned
+   - **Null**: headless CPU rasteriser into host memory; the default and the CI path
+   - **Vulkan**: real GPU rendering, built with `-DPS3RECOMP_RSX_VULKAN=ON`; optionally presents through an SDL2 window
 
 See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the complete graphics architecture, shader translation strategy, and primitive type mapping.
 
@@ -170,10 +169,10 @@ See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the complete graphics architecture, s
 | **Approach** | Dynamic emulation (JIT) | Static recompilation (AOT) |
 | **PPU** | LLVM JIT or interpreter | C source generation, compiled natively |
 | **SPU** | LLVM JIT or ASMJIT | HLE / interpreter / static recomp |
-| **RSX** | Vulkan/OpenGL renderer | Vulkan/D3D12 renderer (shared concepts) |
+| **RSX** | Vulkan/OpenGL renderer | Vulkan renderer (shared concepts) |
 | **Compatibility** | Broad (~70% of library) | Per-game (each game is a project) |
 | **Performance** | Good, JIT overhead | Potentially better (fully optimized AOT) |
-| **Portability** | x86-64 primary, ARM64 WIP | Any platform with a C compiler |
+| **Portability** | x86-64 primary, ARM64 WIP | Linux x86-64 |
 | **Development** | One binary runs many games | Each game needs analysis and customization |
 | **Memory** | Dynamic guest memory | Statically mapped guest address space |
 | **HLE modules** | ~100 modules, varying completion | 95 complete modules, full runtime |
@@ -192,6 +191,6 @@ For deeper dives into specific subsystems, see:
 - **[NID_SYSTEM.md](NID_SYSTEM.md)** — How PS3 function linking works, NID computation, module registration
 - **[MODULES_REFERENCE.md](MODULES_REFERENCE.md)** — Detailed per-module documentation for all 93+ HLE modules
 - **[TOOLS.md](TOOLS.md)** — Recompiler pipeline tools reference
-- **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — How Win32/POSIX differences are handled
+- **[PLATFORM_ABSTRACTION.md](PLATFORM_ABSTRACTION.md)** — The Linux Win32 compatibility shim
 - **[BUILDING.md](BUILDING.md)** — Build system reference and troubleshooting
 - **[GAME_PORTING_GUIDE.md](GAME_PORTING_GUIDE.md)** — Step-by-step guide to porting a PS3 game

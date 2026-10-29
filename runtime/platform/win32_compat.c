@@ -28,7 +28,6 @@
  * documents the contract of each; this file is about how they are kept
  * correct, and the ordering rules they must not break.
  */
-#ifndef _WIN32
 
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE          /* pthread_setaffinity_np, CPU_SET, REG_RIP */
@@ -43,26 +42,13 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/stat.h>   /* GetFileAttributesA */
-#if defined(__APPLE__)
-/* <sys/ucontext.h>, not <ucontext.h>: the latter is the deprecated
- * makecontext/swapcontext family and refuses to compile without _XOPEN_SOURCE,
- * while all that is wanted here is the ucontext_t a signal handler is given. */
-#  include <sys/ucontext.h>
-#  include <mach/mach.h>
-#  include <mach/mach_vm.h>
-#  include <mach/thread_act.h>
-#  include <pthread/qos.h>
-#else
 #  include <semaphore.h>
 #  include <ucontext.h>
-#endif
 
 /* The signal that parks a thread for SuspendThread on Linux. SIGRTMIN and the
  * two above it belong to the C library's own threading, and SIGRTMIN is not a
  * compile-time constant there, so this is only ever evaluated at run time. */
-#if defined(__linux__)
 #  define PS3_SUSPEND_SIGNAL (SIGRTMIN + 4)
-#endif
 
 /* ---------------------------------------------------------------------------
  * Last error
@@ -102,14 +88,10 @@ typedef struct ps3_obj {
     LPVOID         arg;
     struct ps3_obj* thr_next;          /* the thread table, guarded by s_lock */
     unsigned long long created_ft, exited_ft;   /* FILETIME units */
-#if defined(__APPLE__)
-    mach_port_t    port;               /* the thread's Mach port, once it runs */
-#else
     sem_t          park_ack, park_go;  /* the suspend handshake, both ways */
     CONTEXT        park_ctx;           /* saved by the parking handler */
     int            park_ctx_dirty;     /* SetThreadContext wants it put back */
     int            park_ready;         /* the two semaphores exist */
-#endif
 
     /* waitable timer */
     unsigned long long due_ns;         /* CLOCK_MONOTONIC */
@@ -154,9 +136,7 @@ static void obj_release_locked(ps3_obj* o)
     if (o->kind == OBJ_THREAD) {
         for (ps3_obj** p = &s_threads; *p; p = &(*p)->thr_next)
             if (*p == o) { *p = o->thr_next; break; }
-#if !defined(__APPLE__)
         if (o->park_ready) { sem_destroy(&o->park_ack); sem_destroy(&o->park_go); }
-#endif
     }
     free(o->snap_tids);
     o->magic = 0;
@@ -404,33 +384,6 @@ BOOL CancelWaitableTimer(HANDLE h)
  * scheduler class. */
 static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
 {
-#if defined(__APPLE__)
-    struct sched_param sp; int policy = SCHED_OTHER;
-    if (pthread_getschedparam(pt, &policy, &sp) == 0) {
-        int lo = sched_get_priority_min(policy), hi = sched_get_priority_max(policy);
-        int def = (lo + hi) / 2;
-        int p;
-        if      (level >= THREAD_PRIORITY_TIME_CRITICAL) p = hi;
-        else if (level <= THREAD_PRIORITY_IDLE)          p = lo;
-        else                                             p = def + level * ((hi - def) / 4);
-        if (p < lo) p = lo;
-        if (p > hi) p = hi;
-        sp.sched_priority = p;
-        pthread_setschedparam(pt, policy, &sp);
-    }
-    /* QoS is what actually decides P-core vs E-core on Apple Silicon. Only the
-     * calling thread can set its own; a thread created suspended gets it from
-     * the trampoline, which runs on the new thread. */
-    if (is_self) {
-        qos_class_t q = QOS_CLASS_DEFAULT;
-        if      (level >= THREAD_PRIORITY_ABOVE_NORMAL) q = QOS_CLASS_USER_INTERACTIVE;
-        else if (level == THREAD_PRIORITY_NORMAL)       q = QOS_CLASS_USER_INITIATED;
-        else if (level >= THREAD_PRIORITY_LOWEST)       q = QOS_CLASS_UTILITY;
-        else                                            q = QOS_CLASS_BACKGROUND;
-        pthread_set_qos_class_self_np(q, 0);
-    }
-    (void)tid;
-#elif defined(__linux__)
     /* SCHED_OTHER has no per-thread priority, only nice, which Linux applies
      * per thread through setpriority(PRIO_PROCESS, tid). Lowering nice below
      * zero needs CAP_SYS_NICE or an RLIMIT_NICE grant; without it the call
@@ -446,22 +399,14 @@ static void apply_priority(pthread_t pt, DWORD tid, int level, int is_self)
     if (is_self) tid = (DWORD)syscall(SYS_gettid);
     if (tid) setpriority(PRIO_PROCESS, (id_t)tid, nice);
     (void)pt;
-#else
-    (void)pt; (void)tid; (void)level; (void)is_self;
-#endif
 }
 
 static void apply_affinity(pthread_t pt, DWORD_PTR mask)
 {
-#if defined(__linux__)
     cpu_set_t set; CPU_ZERO(&set);
     for (unsigned i = 0; i < 8 * sizeof mask && i < CPU_SETSIZE; i++)
         if (mask & ((DWORD_PTR)1 << i)) CPU_SET(i, &set);
     pthread_setaffinity_np(pt, sizeof set, &set);
-#else
-    /* Apple Silicon has no thread affinity; QoS (above) is the lever there. */
-    (void)pt; (void)mask;
-#endif
 }
 
 static void thread_finish(ps3_obj* t, DWORD code)
@@ -482,9 +427,6 @@ static void thread_finish(ps3_obj* t, DWORD code)
 static void thread_publish_self_locked(ps3_obj* t)
 {
     t->tid = GetCurrentThreadId();
-#if defined(__APPLE__)
-    t->port = pthread_mach_thread_np(pthread_self());
-#endif
 }
 
 static void* thread_trampoline(void* p)
@@ -514,11 +456,9 @@ static void* thread_trampoline(void* p)
  * without s_lock; it takes it. Returns 0 if the semaphores could not be made. */
 static int thread_arm(ps3_obj* t)
 {
-#if !defined(__APPLE__)
     if (sem_init(&t->park_ack, 0, 0) != 0) return 0;
     if (sem_init(&t->park_go, 0, 0) != 0) { sem_destroy(&t->park_ack); return 0; }
     t->park_ready = 1;
-#endif
     t->created_ft = now_ft();
     pthread_mutex_lock(&s_lock);
     t->thr_next = s_threads;
@@ -670,65 +610,12 @@ BOOL GetExitCodeThread(HANDLE h, DWORD* code)
  * Only what the header declares is carried. Whatever a caller asks for in
  * ContextFlags, one thread_get_state or one signal frame delivers all of it at
  * once, so everything is filled and ContextFlags reports that. */
-#if defined(__APPLE__) && defined(__aarch64__)
-typedef arm_thread_state64_t ps3_native_state;
-#define PS3_NATIVE_STATE_FLAVOR ARM_THREAD_STATE64
-#define PS3_NATIVE_STATE_COUNT  ARM_THREAD_STATE64_COUNT
-
-static void ctx_from_native(CONTEXT* c, const arm_thread_state64_t* s)
-{
-    for (int i = 0; i < 29; i++) c->X[i] = s->__x[i];
-    c->Pc   = (ULONGLONG)arm_thread_state64_get_pc(*s);
-    c->Sp   = (ULONGLONG)arm_thread_state64_get_sp(*s);
-    c->Fp   = (ULONGLONG)arm_thread_state64_get_fp(*s);
-    c->Lr   = (ULONGLONG)arm_thread_state64_get_lr(*s);
-    c->Cpsr = (DWORD)s->__cpsr;
-}
-static void ctx_to_native(arm_thread_state64_t* s, const CONTEXT* c, int all)
-{
-    arm_thread_state64_set_pc_fptr(*s, (void*)(uintptr_t)c->Pc);
-    arm_thread_state64_set_sp(*s, c->Sp);
-    if (!all) return;
-    for (int i = 0; i < 29; i++) s->__x[i] = c->X[i];
-    arm_thread_state64_set_fp(*s, c->Fp);
-    arm_thread_state64_set_lr_fptr(*s, (void*)(uintptr_t)c->Lr);
-    s->__cpsr = (__uint32_t)c->Cpsr;
-}
-#elif defined(__APPLE__) && defined(__x86_64__)
-typedef x86_thread_state64_t ps3_native_state;
-#define PS3_NATIVE_STATE_FLAVOR x86_THREAD_STATE64
-#define PS3_NATIVE_STATE_COUNT  x86_THREAD_STATE64_COUNT
-
-static void ctx_from_native(CONTEXT* c, const x86_thread_state64_t* s)
-{
-    c->Rax = s->__rax; c->Rbx = s->__rbx; c->Rcx = s->__rcx; c->Rdx = s->__rdx;
-    c->Rsi = s->__rsi; c->Rdi = s->__rdi;
-    c->R8  = s->__r8;  c->R9  = s->__r9;  c->R10 = s->__r10; c->R11 = s->__r11;
-    c->R12 = s->__r12; c->R13 = s->__r13; c->R14 = s->__r14; c->R15 = s->__r15;
-    c->Rip = s->__rip; c->Rsp = s->__rsp; c->Rbp = s->__rbp;
-    c->EFlags = (DWORD)s->__rflags;
-    c->Lr = 0;
-}
-static void ctx_to_native(x86_thread_state64_t* s, const CONTEXT* c, int all)
-{
-    s->__rip = c->Rip; s->__rsp = c->Rsp;
-    if (!all) return;
-    s->__rax = c->Rax; s->__rbx = c->Rbx; s->__rcx = c->Rcx; s->__rdx = c->Rdx;
-    s->__rsi = c->Rsi; s->__rdi = c->Rdi;
-    s->__r8  = c->R8;  s->__r9  = c->R9;  s->__r10 = c->R10; s->__r11 = c->R11;
-    s->__r12 = c->R12; s->__r13 = c->R13; s->__r14 = c->R14; s->__r15 = c->R15;
-    s->__rbp = c->Rbp;
-    s->__rflags = c->EFlags;
-}
-#endif
 
 static void ctx_from_uc(CONTEXT* c, const ucontext_t* uc)
 {
     memset(c, 0, sizeof *c);
     c->ContextFlags = CONTEXT_FULL;
-#if defined(__APPLE__)
-    ctx_from_native(c, &uc->uc_mcontext->__ss);
-#elif defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && defined(__x86_64__)
     const greg_t* g = uc->uc_mcontext.gregs;
     c->Rax = (ULONGLONG)g[REG_RAX]; c->Rbx = (ULONGLONG)g[REG_RBX];
     c->Rcx = (ULONGLONG)g[REG_RCX]; c->Rdx = (ULONGLONG)g[REG_RDX];
@@ -758,9 +645,7 @@ static void ctx_from_uc(CONTEXT* c, const ucontext_t* uc)
  * instruction, or the next one, on the same stack. */
 static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
 {
-#if defined(__APPLE__)
-    ctx_to_native(&uc->uc_mcontext->__ss, c, all);
-#elif defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && defined(__x86_64__)
     greg_t* g = uc->uc_mcontext.gregs;
     g[REG_RIP] = (greg_t)c->Rip; g[REG_RSP] = (greg_t)c->Rsp;
     if (!all) return;
@@ -804,7 +689,6 @@ static void ctx_to_uc(ucontext_t* uc, const CONTEXT* c, int all)
  * SuspendThread is holding s_lock for, and a thread whose routine has already
  * returned has cleared its own thread-local while still being alive enough to
  * take the signal. */
-#if !defined(__APPLE__)
 static ps3_obj* s_park_target;               /* set under s_lock */
 static int      s_park_installed;
 
@@ -856,7 +740,6 @@ static int park_thread_locked(ps3_obj* t)
 }
 
 static void unpark_thread_locked(ps3_obj* t) { sem_post(&t->park_go); }
-#endif /* !__APPLE__ */
 
 /* Can this record be stopped by the host right now? A thread that has not run
  * its trampoline yet is held on the CREATE_SUSPENDED gate instead, and a
@@ -883,11 +766,7 @@ DWORD ResumeThread(HANDLE h)
         if (!t->started) {
             pthread_cond_broadcast(&t->cv);       /* the CREATE_SUSPENDED gate */
         } else if (!t->done) {
-#if defined(__APPLE__)
-            thread_resume(t->port);
-#else
             unpark_thread_locked(t);
-#endif
         }
     }
     pthread_mutex_unlock(&s_lock);
@@ -914,11 +793,7 @@ DWORD SuspendThread(HANDLE h)
     } else if (thread_stoppable_locked(t)) {
         int ok = 1;
         if (t->suspend_count == 0) {
-#if defined(__APPLE__)
-            ok = (thread_suspend(t->port) == KERN_SUCCESS);
-#else
             ok = park_thread_locked(t);
-#endif
         }
         if (ok) { r = (DWORD)t->suspend_count; t->suspend_count++; }
     }
@@ -1002,17 +877,11 @@ LONG SetThreadDescription(HANDLE h, PCWSTR description)
         size_t n = wcstombs(name, description, sizeof name - 1);
         if (n == (size_t)-1) name[0] = '\0';
     }
-#if defined(__APPLE__)
-    if (self) pthread_setname_np(name);             /* Darwin names only the caller */
-#elif defined(__linux__)
     char short_name[16];                            /* the kernel's TASK_COMM_LEN */
     size_t n = strnlen(name, sizeof short_name - 1);
     memcpy(short_name, name, n);
     short_name[n] = '\0';
     pthread_setname_np(pt, short_name);
-#else
-    (void)pt;
-#endif
     return 0;   /* S_OK */
 }
 
@@ -1035,23 +904,6 @@ BOOL GetThreadContext(HANDLE h, CONTEXT* ctx)
 {
     ps3_obj* t = thread_of(h);
     if (!t || !ctx) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-#if defined(__APPLE__)
-    pthread_mutex_lock(&s_lock);
-    mach_port_t port = thread_stoppable_locked(t) ? t->port : MACH_PORT_NULL;
-    pthread_mutex_unlock(&s_lock);
-    if (port == MACH_PORT_NULL) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-
-    ps3_native_state st;
-    mach_msg_type_number_t n = PS3_NATIVE_STATE_COUNT;
-    if (thread_get_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, &n) != KERN_SUCCESS) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    memset(ctx, 0, sizeof *ctx);
-    ctx->ContextFlags = CONTEXT_FULL;
-    ctx_from_native(ctx, &st);
-    return TRUE;
-#else
     /* Only the parking handler has a frame to answer from. */
     pthread_mutex_lock(&s_lock);
     BOOL ok = FALSE;
@@ -1059,34 +911,12 @@ BOOL GetThreadContext(HANDLE h, CONTEXT* ctx)
     pthread_mutex_unlock(&s_lock);
     if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
     return ok;
-#endif
 }
 
 BOOL SetThreadContext(HANDLE h, const CONTEXT* ctx)
 {
     ps3_obj* t = thread_of(h);
     if (!t || !ctx) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-#if defined(__APPLE__)
-    pthread_mutex_lock(&s_lock);
-    mach_port_t port = (t->suspend_count > 0 && thread_stoppable_locked(t)) ? t->port : MACH_PORT_NULL;
-    pthread_mutex_unlock(&s_lock);
-    if (port == MACH_PORT_NULL) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-
-    /* Read, overwrite what a CONTEXT carries, write back: the flavour holds
-     * state this struct has no room for, and none of it should change. */
-    ps3_native_state st;
-    mach_msg_type_number_t n = PS3_NATIVE_STATE_COUNT;
-    if (thread_get_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, &n) != KERN_SUCCESS) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    ctx_to_native(&st, ctx, 1);
-    if (thread_set_state(port, PS3_NATIVE_STATE_FLAVOR, (thread_state_t)&st, n) != KERN_SUCCESS) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    return TRUE;
-#else
     /* Handed to the parking handler, which puts it back into the signal frame
      * as it returns. */
     pthread_mutex_lock(&s_lock);
@@ -1099,7 +929,6 @@ BOOL SetThreadContext(HANDLE h, const CONTEXT* ctx)
     pthread_mutex_unlock(&s_lock);
     if (!ok) SetLastError(ERROR_INVALID_PARAMETER);
     return ok;
-#endif
 }
 
 HANDLE OpenThread(DWORD access, BOOL inherit, DWORD tid)
@@ -1159,9 +988,6 @@ BOOL GetThreadTimes(HANDLE h, FILETIME* creation, FILETIME* exit,
      * second. The creation and exit stamps are the shim's own and always are. */
     int live = thread_stoppable_locked(t);
     pthread_t pt = t->pt;
-#if defined(__APPLE__)
-    mach_port_t port = t->port;
-#endif
     pthread_mutex_unlock(&s_lock);
 
     ft_store(creation, born);
@@ -1170,17 +996,6 @@ BOOL GetThreadTimes(HANDLE h, FILETIME* creation, FILETIME* exit,
     ft_store(user, 0);
     if (!live) return TRUE;
 
-#if defined(__APPLE__)
-    struct thread_basic_info info;
-    mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
-    if (port == MACH_PORT_NULL ||
-        thread_info(port, THREAD_BASIC_INFO, (thread_info_t)&info, &n) != KERN_SUCCESS)
-        return TRUE;                             /* the stamps are still good */
-    ft_store(kernel, (unsigned long long)info.system_time.seconds * 10000000ull
-                     + (unsigned long long)info.system_time.microseconds * 10ull);
-    ft_store(user,   (unsigned long long)info.user_time.seconds * 10000000ull
-                     + (unsigned long long)info.user_time.microseconds * 10ull);
-#else
     /* Per-thread user and system time apart needs /proc/self/task/<tid>/stat;
      * the CPU clock gives the sum, reported as user time. */
     clockid_t clk;
@@ -1188,7 +1003,6 @@ BOOL GetThreadTimes(HANDLE h, FILETIME* creation, FILETIME* exit,
     if (pthread_getcpuclockid(pt, &clk) == 0 && clock_gettime(clk, &ts) == 0)
         ft_store(user, (unsigned long long)ts.tv_sec * 10000000ull
                        + (unsigned long long)ts.tv_nsec / 100ull);
-#endif
     (void)pt;
     return TRUE;
 }
@@ -1543,27 +1357,6 @@ static int os_region(uintptr_t addr, uintptr_t* base, size_t* size, int* prot,
                      uintptr_t* next)
 {
     *base = 0; *size = 0; *prot = 0; *next = 0;
-#if defined(__APPLE__)
-    /* mach_vm_region searches UPWARDS from the address it is given and reports
-     * where it landed, so one call answers both questions: a base above the
-     * address means nothing is mapped at it, and that base is the gap's end. */
-    mach_vm_address_t a = (mach_vm_address_t)addr;
-    mach_vm_size_t    sz = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t name = MACH_PORT_NULL;
-    kern_return_t kr = mach_vm_region(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64,
-                                      (vm_region_info_t)&info, &cnt, &name);
-    if (name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), name);
-    if (kr != KERN_SUCCESS) return 0;             /* nothing at or above it */
-    if ((uintptr_t)a > addr) { *next = (uintptr_t)a; return 0; }
-    *base = (uintptr_t)a;
-    *size = (size_t)sz;
-    *prot = ((info.protection & VM_PROT_READ)    ? PROT_READ  : 0)
-          | ((info.protection & VM_PROT_WRITE)   ? PROT_WRITE : 0)
-          | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC  : 0);
-    return 1;
-#elif defined(__linux__)
     /* /proc/self/maps is sorted by address, so the first line that starts above
      * the address ends the gap it sits in. */
     FILE* f = fopen("/proc/self/maps", "r");
@@ -1587,10 +1380,6 @@ static int os_region(uintptr_t addr, uintptr_t* base, size_t* size, int* prot,
     }
     fclose(f);
     return found;
-#else
-    (void)addr;
-    return 0;
-#endif
 }
 
 static DWORD win_prot_of(int prot)
@@ -1735,9 +1524,6 @@ static const int s_veh_signals[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
 static unsigned long long fault_esr(const ucontext_t* uc)
 {
     if (!uc) return 0;
-#if defined(__APPLE__)
-    return (unsigned long long)uc->uc_mcontext->__es.__esr;
-#elif defined(__linux__)
     /* The ESR arrives as one record in the chain of extension blocks the
      * kernel appends to the signal frame, terminated by a zero magic. */
     struct ps3_a64_hdr { uint32_t magic; uint32_t size; };
@@ -1755,9 +1541,6 @@ static unsigned long long fault_esr(const ucontext_t* uc)
         p += h.size;
     }
     return 0;
-#else
-    return 0;
-#endif
 }
 /* Data abort from a lower or the same exception level: the two syndromes that
  * carry a faulting data address and a direction. */
@@ -1798,10 +1581,8 @@ static DWORD exception_code_of(int sig, const siginfo_t* si, const ucontext_t* u
         return EXCEPTION_ACCESS_VIOLATION;
     case SIGBUS:
         if (fault_is_alignment(uc)) return EXCEPTION_DATATYPE_MISALIGNMENT;
-#if !defined(__APPLE__)
         if (code == BUS_ADRALN) return EXCEPTION_DATATYPE_MISALIGNMENT;
         if (code == BUS_OBJERR) return EXCEPTION_IN_PAGE_ERROR;
-#endif
         return EXCEPTION_ACCESS_VIOLATION;
     case SIGILL:
         if (code == ILL_PRVOPC || code == ILL_PRVREG) return EXCEPTION_PRIV_INSTRUCTION;
@@ -1832,8 +1613,6 @@ static int fault_is_write(const ucontext_t* uc)
 #if defined(__aarch64__)
     unsigned long long esr = fault_esr(uc);
     return esr_is_data_abort(esr) && (esr & (1ull << 6)) != 0;   /* WnR */
-#elif defined(__APPLE__) && defined(__x86_64__)
-    return (uc->uc_mcontext->__es.__err & 2u) != 0;
 #elif defined(__linux__) && defined(__x86_64__)
     return ((unsigned long long)uc->uc_mcontext.gregs[REG_ERR] & 2ull) != 0;
 #else
@@ -2008,7 +1787,3 @@ LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_F
         __atomic_exchange_n(&s_top_filter, filter, __ATOMIC_ACQ_REL);
 }
 
-#else  /* _WIN32 */
-/* Nothing to build: the header is a passthrough to <windows.h> there. */
-typedef int ps3_win32_compat_not_needed_on_windows;
-#endif

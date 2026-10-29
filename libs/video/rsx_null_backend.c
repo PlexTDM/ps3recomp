@@ -1,8 +1,9 @@
 /*
- * ps3recomp - Null RSX Backend (Win32 window + color clear)
+ * ps3recomp - Null RSX Backend (headless software rasteriser)
  *
- * Implements rsx_backend callbacks using a simple Win32 GDI window.
- * No GPU rendering — just clears to the RSX clear color and presents.
+ * Implements the rsx_backend callbacks against a host-memory framebuffer.
+ * No GPU and no window: it clears to the RSX clear color, flat-shades
+ * triangles and presents the centre pixel for readback.
  * Used for debugging command buffer flow before a real backend exists.
  */
 
@@ -11,334 +12,6 @@
 #include <string.h>
 #include "../../runtime/ps3_log.h"
 
-#ifdef _WIN32
-
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-/* ---------------------------------------------------------------------------
- * Internal state
- * -----------------------------------------------------------------------*/
-
-typedef struct {
-    HWND     hwnd;
-    HDC      hdc;
-    u32      width;
-    u32      height;
-
-    /* Current clear color (ARGB -> COLORREF) */
-    COLORREF clear_color;
-
-    /* Frame counter */
-    u64      frame_count;
-    u64      last_fps_time;
-    u32      fps;
-
-    int      window_closed;
-
-    /* Title-bar stats: base caption, and frames/time at the last refresh. */
-    char     title[128];
-    u64      title_frames;
-    ULONGLONG title_time;
-} NullBackendState;
-
-static NullBackendState s_state;
-
-/* ---------------------------------------------------------------------------
- * Win32 window procedure
- * -----------------------------------------------------------------------*/
-
-static int s_present_suppressed = 0;
-
-static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
-{
-    switch (msg) {
-    case WM_CLOSE:
-        s_state.window_closed = 1;
-        DestroyWindow(hwnd);
-        return 0;
-
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-
-        /* Fill with current clear color */
-        HBRUSH brush = CreateSolidBrush(s_state.clear_color);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        FillRect(hdc, &rc, brush);
-        DeleteObject(brush);
-
-        /* Draw debug overlay text */
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        char buf[128];
-        snprintf(buf, sizeof(buf), "ps3recomp null backend | %u FPS | frame %llu",
-                 s_state.fps, (unsigned long long)s_state.frame_count);
-        TextOutA(hdc, 10, 10, buf, (int)strlen(buf));
-
-        char buf2[64];
-        snprintf(buf2, sizeof(buf2), "Clear: #%06X",
-                 (unsigned)(s_state.clear_color & 0xFFFFFF));
-        TextOutA(hdc, 10, 30, buf2, (int)strlen(buf2));
-
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) {
-            s_state.window_closed = 1;
-            DestroyWindow(hwnd);
-        }
-        return 0;
-    }
-
-    return DefWindowProcA(hwnd, msg, wp, lp);
-}
-
-/* ---------------------------------------------------------------------------
- * Backend callbacks
- * -----------------------------------------------------------------------*/
-
-static int null_init(void* ud, u32 width, u32 height)
-{
-    (void)ud;
-    printf("[RSX null] init(%ux%u)\n", width, height);
-    return 0;
-}
-
-static void null_shutdown(void* ud)
-{
-    (void)ud;
-    printf("[RSX null] shutdown\n");
-}
-
-static void null_begin_frame(void* ud)
-{
-    (void)ud;
-}
-
-static void null_end_frame(void* ud)
-{
-    (void)ud;
-    s_state.frame_count++;
-
-    /* Compute FPS every second */
-    ULONGLONG now = GetTickCount64();
-    if (now - s_state.last_fps_time >= 1000) {
-        /* Simple: just use frame_count delta. For first second, estimate. */
-        s_state.fps = (u32)(s_state.frame_count -
-                           (s_state.frame_count > 60 ? s_state.frame_count - 60 : 0));
-        s_state.last_fps_time = now;
-    }
-}
-
-static void null_present(void* ud, u32 buffer_id)
-{
-    /* The live draw engine presents through its own swap chain on this HWND;
-     * leaving the GDI blit running underneath would fight it for the window. */
-    if (s_present_suppressed) return;
-    (void)ud;
-    (void)buffer_id;
-
-    /* Trigger a repaint */
-    if (s_state.hwnd)
-        InvalidateRect(s_state.hwnd, NULL, FALSE);
-}
-
-static void null_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
-{
-    (void)ud;
-    (void)flags;
-    (void)depth;
-    (void)stencil;
-
-    /* Convert RSX ARGB to Win32 COLORREF (BGR) */
-    u8 r = (color >> 16) & 0xFF;
-    u8 g = (color >> 8) & 0xFF;
-    u8 b = color & 0xFF;
-    s_state.clear_color = RGB(r, g, b);
-}
-
-static void null_set_render_target(void* ud, const rsx_state* state)
-{
-    (void)ud;
-    if (ps3_log_verbose()) printf("[RSX null] set_render_target(format=0x%X, %ux%u)\n",
-           state->surface_format, state->surface_clip_w, state->surface_clip_h);
-}
-
-static void null_set_viewport(void* ud, const rsx_state* state)
-{
-    (void)ud;
-    if (ps3_log_verbose()) printf("[RSX null] set_viewport(%u,%u %ux%u)\n",
-           state->viewport_x, state->viewport_y,
-           state->viewport_w, state->viewport_h);
-}
-
-static void null_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
-{
-    (void)ud;
-    static int s_draw_log_count = 0;
-    if (s_draw_log_count < 20) {
-        printf("[RSX null] draw_arrays(prim=%u, first=%u, count=%u)\n",
-               primitive, first, count);
-        s_draw_log_count++;
-    }
-}
-
-static void null_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
-{
-    (void)ud;
-    static int s_draw_log_count = 0;
-    if (s_draw_log_count < 20) {
-        printf("[RSX null] draw_indexed(prim=%u, offset=%u, count=%u)\n",
-               primitive, offset, count);
-        s_draw_log_count++;
-    }
-}
-
-/* ---------------------------------------------------------------------------
- * Backend registration
- * -----------------------------------------------------------------------*/
-
-static rsx_backend s_null_backend = {
-    .userdata          = &s_state,
-    .init              = null_init,
-    .shutdown          = null_shutdown,
-    .begin_frame       = null_begin_frame,
-    .end_frame         = null_end_frame,
-    .present           = null_present,
-    .set_render_target = null_set_render_target,
-    .set_viewport      = null_set_viewport,
-    .set_blend         = NULL,
-    .set_depth_stencil = NULL,
-    .clear             = null_clear,
-    .draw_arrays       = null_draw_arrays,
-    .draw_indexed      = null_draw_indexed,
-    .bind_texture      = NULL,
-};
-
-/* ---------------------------------------------------------------------------
- * Public API
- * -----------------------------------------------------------------------*/
-
-int rsx_null_backend_init(u32 width, u32 height, const char* title)
-{
-    memset(&s_state, 0, sizeof(s_state));
-    s_state.width = width;
-    s_state.height = height;
-    s_state.clear_color = RGB(0, 0, 64); /* dark blue default */
-
-    /* Register window class */
-    WNDCLASSEXA wc = {0};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = null_wndproc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = "ps3recomp_null";
-    RegisterClassExA(&wc);
-
-    /* Compute window size from client area */
-    RECT wr = {0, 0, (LONG)width, (LONG)height};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
-
-    s_state.hwnd = CreateWindowExA(
-        0, "ps3recomp_null",
-        title ? title : "ps3recomp",
-        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        wr.right - wr.left, wr.bottom - wr.top,
-        NULL, NULL, GetModuleHandle(NULL), NULL);
-
-    if (!s_state.hwnd) {
-        printf("[RSX null] ERROR: CreateWindow failed (%lu)\n", GetLastError());
-        return -1;
-    }
-
-    s_state.hdc = GetDC(s_state.hwnd);
-    s_state.last_fps_time = GetTickCount64();
-    snprintf(s_state.title, sizeof(s_state.title), "%s", title ? title : "ps3recomp");
-    s_state.title_time = s_state.last_fps_time;
-
-    /* Keep the display awake, as any PC game does. With the monitor asleep a
-     * vsync'd Present crawls (~4 fps); guest frames stretch to 250 ms and GH3's
-     * Havok step takes huge timesteps, which is how an unattended run stalled
-     * in the intro movie while an attended one did not. */
-    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
-
-    /* Register as the active RSX backend */
-    rsx_set_backend(&s_null_backend);
-
-    printf("[RSX null] Window created: %ux%u\n", width, height);
-    return 0;
-}
-
-void rsx_null_backend_shutdown(void)
-{
-    if (s_state.hwnd) {
-        ReleaseDC(s_state.hwnd, s_state.hdc);
-        DestroyWindow(s_state.hwnd);
-        s_state.hwnd = NULL;
-    }
-    rsx_set_backend(NULL);
-    printf("[RSX null] Backend shut down after %llu frames\n",
-           (unsigned long long)s_state.frame_count);
-}
-
-int rsx_null_backend_pump_messages(void)
-{
-    MSG msg;
-    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT)
-            return -1;
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
-    }
-    /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
-     * live-draw frame, window size. Here on the window's own thread, so the
-     * WM_SETTEXT never blocks the renderer. */
-    ULONGLONG now = GetTickCount64();
-    if (s_state.hwnd && now - s_state.title_time >= 1000) {
-        extern u32 rsx_live_draw_get_last_draws(void);
-        extern double rsx_live_draw_get_present_fps(void);
-        /* Live draw owns presentation (and end_frame never runs) when enabled. */
-        double fps = rsx_live_draw_get_present_fps();
-        if (fps <= 0.0)
-            fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
-                  (double)(now - s_state.title_time);
-        char tb[256];
-        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
-                 rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
-        SetWindowTextA(s_state.hwnd, tb);
-        s_state.title_frames = s_state.frame_count;
-        s_state.title_time = now;
-    }
-    return s_state.window_closed ? -1 : 0;
-}
-
-/* Ported from caner (canersaka) Yakuza-Dead-Souls-EX: the live NV4097->D3D12
- * engine binds its swap chain to this window and then owns presentation, so it
- * needs the HWND and a way to silence the GDI present underneath it. */
-void* rsx_null_backend_get_hwnd(void)
-{
-    return (void*)s_state.hwnd;
-}
-
-void rsx_null_backend_suppress_present(int on)
-{
-    s_present_suppressed = on;
-}
-
-#else /* !_WIN32 */
 
 /* ---------------------------------------------------------------------------
  * Headless software backend
@@ -349,9 +22,9 @@ void rsx_null_backend_suppress_present(int on)
  * stream actually reach a backend and produce the pixels it asked for -- on
  * any platform, including a CI runner with no display and no GPU driver.
  *
- * Linux has no real backend yet (Metal is Apple-only, D3D12 Windows-only), so
- * without this ps3recomp_host cannot be built or run there at all and the
- * whole cellGcm -> RSX -> backend bridge goes unexercised on the platform.
+ * It is the fallback when the Vulkan backend is not built in, so
+ * ps3recomp_host can be built and run anywhere and the whole
+ * cellGcm -> RSX -> backend bridge stays exercised on the platform.
  *
  * ponytail: flat-shaded triangles from the first vertex's colour, no blending,
  * no stencil, no clipping beyond the framebuffer bounds, and the viewport is
@@ -413,8 +86,8 @@ static void nullsw_set_vertex_attribs(void* ud, const rsx_state* state)
 /* NDC -> framebuffer pixels, plus the window z the depth test compares. The
  * guest's clip-space position is divided by w (1.0 for the identity-transform
  * case) and mapped over the whole target; see the ponytail note above about
- * the viewport. z/w is already the [0,1] depth on this hardware, as it is in
- * D3D and Metal, so it needs no remapping. */
+ * the viewport. z/w is already the [0,1] depth this backend stores, so it
+ * needs no remapping. */
 static void ndc_to_px(const float p[4], float* sx, float* sy, float* sz)
 {
     float w = (p[3] != 0.0f) ? p[3] : 1.0f;
@@ -424,8 +97,8 @@ static void ndc_to_px(const float p[4], float* sx, float* sy, float* sz)
 }
 
 /* The NV4097 depth function is the GL enum, 0x200 NEVER .. 0x207 ALWAYS.
- * Anything unrecognised passes, as it does in the D3D12 backend's gcm_cmp --
- * including the 1 rsx_state_init seeds the register with. */
+ * Anything unrecognised passes -- including the 1 rsx_state_init seeds the
+ * register with. */
 static int depth_passes(u32 func, float src, float dst)
 {
     switch (func) {
@@ -718,8 +391,6 @@ void rsx_null_backend_shutdown(void)
 int rsx_null_backend_pump_messages(void) { return 0; }
 
 void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
-void* rsx_null_backend_get_hwnd(void) { return 0; }
-void  rsx_null_backend_suppress_present(int on) { (void)on; }
 
 u32 rsx_null_backend_debug_color(void) { return s_soft.clear_argb; }
 
@@ -732,4 +403,3 @@ u32 rsx_null_backend_readback_center(void)
 
 u32 rsx_null_backend_guest_draws(void) { return 0; }
 
-#endif /* _WIN32 */

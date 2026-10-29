@@ -8,7 +8,7 @@ A step-by-step guide to adding new High-Level Emulation modules to ps3recomp.
 
 Every PS3 game depends on system libraries (PRX modules) for graphics, audio, input, filesystem, networking, and more. Instead of running the original Sony code, ps3recomp replaces these libraries with **HLE (High-Level Emulation) modules** — native implementations that provide equivalent behavior using host OS services.
 
-When a game calls `cellAudioInit()`, our HLE module initializes WASAPI (Windows) or SDL2 (Linux) audio instead of the PS3's audio hardware. The game can't tell the difference.
+When a game calls `cellAudioInit()`, our HLE module initializes SDL2 audio instead of the PS3's audio hardware. The game can't tell the difference.
 
 ---
 
@@ -354,7 +354,7 @@ When implementing a function, search RPCS3 for the function name to see:
 |--------|-----------|-------------|------|
 | cellSysmodule | Simple | State tracking, module ID management | `libs/system/cellSysmodule.c` |
 | cellVideoOut | Medium | Struct output, resolution config | `libs/video/cellVideoOut.c` |
-| cellAudio | Complex | Background thread, WASAPI/SDL2 backend, port management | `libs/audio/cellAudio.c` |
+| cellAudio | Complex | Background thread, SDL2 backend, port management | `libs/audio/cellAudio.c` |
 | cellSync | Advanced | C11 atomics, spinlocks, barriers | `libs/sync/cellSync.c` |
 | cellFs | Medium | Host filesystem, path translation | `libs/filesystem/cellFs.c` |
-| cellPad | Medium | XInput/SDL2 backend, button mapping | `libs/input/cellPad.c` |
+| cellPad | Medium | SDL2 backend, button mapping | `libs/input/cellPad.c` |

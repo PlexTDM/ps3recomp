@@ -19,39 +19,22 @@
  * -----------------------------------------------------------------------*/
 sys_semaphore_info g_sys_semaphores[SYS_SEMAPHORE_MAX];
 
-#ifdef _WIN32
-static CRITICAL_SECTION s_sem_table_lock;
-static int              s_sem_table_lock_init = 0;
-#else
 static pthread_mutex_t  s_sem_table_lock = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 static void sem_table_lock(void)
 {
-#ifdef _WIN32
-    if (!s_sem_table_lock_init) {
-        InitializeCriticalSection(&s_sem_table_lock);
-        s_sem_table_lock_init = 1;
-    }
-    EnterCriticalSection(&s_sem_table_lock);
-#else
     pthread_mutex_lock(&s_sem_table_lock);
-#endif
 }
 
 static void sem_table_unlock(void)
 {
-#ifdef _WIN32
-    LeaveCriticalSection(&s_sem_table_lock);
-#else
     pthread_mutex_unlock(&s_sem_table_lock);
-#endif
 }
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
@@ -62,7 +45,7 @@ static uint32_t read_be32(uint32_t addr)
 {
     uint32_t v; uint32_t* p = (uint32_t*)vm_to_host(addr);
     v = *p;
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     v = ((v >> 24) & 0xFF) | ((v >> 8) & 0xFF00) |
         ((v <<  8) & 0xFF0000) | ((v << 24) & 0xFF000000u);
 #endif
@@ -106,41 +89,8 @@ void lbp_hang_census(void)
             sys_semaphore_info* qs = &g_sys_semaphores[sem - 1];
             fprintf(stderr, "[HANGCENSUS]   sem=%u runtime: active=%d value=%d max=%d\n",
                     sem, qs->active, qs->value, qs->max_value);
-#ifdef _WIN32
-            /* POKESEM experiment: if the guest queue holds more items than the
-             * semaphore has been posted for, the wakeup was lost -- post the
-             * deficit and see whether the consumer drains it and the load proceeds. */
-            if (poke && qs->active && (int)cnt > qs->value) {
-                int deficit = (int)cnt - qs->value;
-                EnterCriticalSection(&qs->value_lock);
-                qs->value += deficit;
-                LeaveCriticalSection(&qs->value_lock);
-                ReleaseSemaphore(qs->sem_handle, deficit, NULL);
-                fprintf(stderr, "[HANGCENSUS]   *** POKED sem=%u by %d (count=%u > value) ***\n",
-                        sem, deficit, cnt);
-            }
-#endif
         }
     }
-#ifdef _WIN32
-    /* POKE7=<id>: one-shot force-post of an arbitrary semaphore, to test whether a
-     * starved gate (e.g. the completion sem tid0 polls) is merely a lost wakeup --
-     * if the load then proceeds, the state was ready and only the signal was lost. */
-    { const char* pk = getenv("POKE7");
-      if (pk && *pk) {
-        static int done_pk = 0;
-        if (!done_pk) { done_pk = 1;
-          int id = atoi(pk);
-          if (id >= 1 && id <= SYS_SEMAPHORE_MAX && g_sys_semaphores[id-1].active) {
-            sys_semaphore_info* ps = &g_sys_semaphores[id-1];
-            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
-            ReleaseSemaphore(ps->sem_handle, 1, NULL);
-            fprintf(stderr, "[HANGCENSUS] *** FORCE-POSTED sem=%d by 1 (POKE7 test) ***\n", id);
-          }
-        }
-      }
-    }
-#endif
     fflush(stderr);
 }
 
@@ -159,32 +109,6 @@ void lbp_hang_census(void)
  * -----------------------------------------------------------------------*/
 void lbp_unstick_once(void)
 {
-#ifdef _WIN32
-    uint32_t mgr = read_be32(0x009357B8);
-    if (!mgr) return;
-    const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
-    for (int i = 0; i < 3; i++) {
-        uint32_t q   = read_be32(mgr + qoff[i]);
-        uint32_t cnt = read_be32(q + 0x04);
-        uint32_t sem = read_be32(q + 0x30);
-        if (sem >= 1 && sem <= SYS_SEMAPHORE_MAX && g_sys_semaphores[sem-1].active) {
-            sys_semaphore_info* ps = &g_sys_semaphores[sem-1];
-            if ((int)cnt > ps->value) {
-                int d = (int)cnt - ps->value;
-                EnterCriticalSection(&ps->value_lock); ps->value += d; LeaveCriticalSection(&ps->value_lock);
-                ReleaseSemaphore(ps->sem_handle, d, NULL);
-            }
-        }
-    }
-    /* nudge the completion sem (id 7) so tid0 re-evaluates the load predicate */
-    if (g_sys_semaphores[7-1].active) {
-        sys_semaphore_info* ps = &g_sys_semaphores[7-1];
-        if (ps->value < 2) {
-            EnterCriticalSection(&ps->value_lock); ps->value += 1; LeaveCriticalSection(&ps->value_lock);
-            ReleaseSemaphore(ps->sem_handle, 1, NULL);
-        }
-    }
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -249,7 +173,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
         uint32_t proto_be;
         memcpy(&proto_be, attr_raw, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
@@ -258,19 +182,8 @@ int64_t sys_semaphore_create(ppu_context* ctx)
         memcpy(s->name, attr_raw + 8, 8);
     }
 
-#ifdef _WIN32
-    /* The kernel semaphore is a wake channel, not a second count. */
-    s->sem_handle = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
-    InitializeCriticalSection(&s->value_lock);
-    if (s->sem_handle == NULL) {
-        s->active = 0;
-        sem_table_unlock();
-        return (int64_t)(int32_t)CELL_EAGAIN;
-    }
-#else
     pthread_mutex_init(&s->mtx, NULL);
     pthread_cond_init(&s->cv, NULL);
-#endif
 
     uint32_t sem_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -309,13 +222,8 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    CloseHandle(s->sem_handle);
-    DeleteCriticalSection(&s->value_lock);
-#else
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mtx);
-#endif
 
     s->active = 0;
     sem_table_unlock();
@@ -384,35 +292,6 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-#ifdef _WIN32
-    /* value is the only count. The kernel semaphore is only a wake channel;
-     * every wake re-checks value under the lock. */
-    int64_t deadline = (timeout_us > 0) ? lv2_usec_deadline(timeout_us) : 0;
-    for (;;) {
-        /* Take a token if available (the ONLY count, under the lock). */
-        EnterCriticalSection(&s->value_lock);
-        if (s->value > 0) {
-            s->value--;
-            LeaveCriticalSection(&s->value_lock);
-            return CELL_OK;
-        }
-        if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
-            LeaveCriticalSection(&s->value_lock);
-            return (int64_t)(int32_t)CELL_ETIMEDOUT;
-        }
-        s->waiters++;
-        LeaveCriticalSection(&s->value_lock);
-
-        /* Bounded slices keep timed waits on the QPC deadline. */
-        DWORD ms = (timeout_us == 0) ? INFINITE : 1;
-        WaitForSingleObject(s->sem_handle, ms);
-
-        EnterCriticalSection(&s->value_lock);
-        if (s->waiters > 0) s->waiters--;
-        LeaveCriticalSection(&s->value_lock);
-        /* loop: re-check value */
-    }
-#else
     pthread_mutex_lock(&s->mtx);
 
     if (timeout_us == 0) {
@@ -443,7 +322,6 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 
     s->value--;
     pthread_mutex_unlock(&s->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -476,15 +354,6 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    if (s->value <= 0) {
-        LeaveCriticalSection(&s->value_lock);
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-    s->value--;
-    LeaveCriticalSection(&s->value_lock);
-#else
     pthread_mutex_lock(&s->mtx);
     if (s->value <= 0) {
         pthread_mutex_unlock(&s->mtx);
@@ -492,7 +361,6 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
     }
     s->value--;
     pthread_mutex_unlock(&s->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -539,26 +407,6 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     if (!s->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    if (s->value + count > s->max_value) {
-        if (getenv("PS3_SEMTRACE")) { static int _n=0; if (_n < 6 && ++_n)
-            fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
-                    sem_id, s->value, count, s->max_value); }
-        LeaveCriticalSection(&s->value_lock);
-        return (int64_t)(int32_t)CELL_EBUSY;
-    }
-    s->value += count;
-    /* Wake channel: release exactly enough tokens to cover the parked waiters
-     * this post can satisfy (min(count, waiters)). Woken waiters re-check
-     * value under the lock; an orphaned token (waiter already left) is benign.
-     * This is the lost-wake fix — a post can NEVER skip the release now. */
-    int wake = (count < s->waiters) ? count : s->waiters;
-    LeaveCriticalSection(&s->value_lock);
-
-    if (wake > 0)
-        ReleaseSemaphore(s->sem_handle, wake, NULL);
-#else
     pthread_mutex_lock(&s->mtx);
     if (s->value + count > s->max_value) {
         pthread_mutex_unlock(&s->mtx);
@@ -570,7 +418,6 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     { int wake = (count < s->waiters) ? count : s->waiters;
       for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
-#endif
 
     return CELL_OK;
 }
@@ -594,15 +441,9 @@ int64_t sys_semaphore_get_value(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     int32_t val;
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    val = s->value;
-    LeaveCriticalSection(&s->value_lock);
-#else
     pthread_mutex_lock(&s->mtx);
     val = s->value;
     pthread_mutex_unlock(&s->mtx);
-#endif
 
     if (out_addr != 0) {
         write_be32(out_addr, (uint32_t)val);
@@ -618,12 +459,6 @@ void sys_semaphore_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_semaphores, 0, sizeof(g_sys_semaphores));
 
-#ifdef _WIN32
-    if (!s_sem_table_lock_init) {
-        InitializeCriticalSection(&s_sem_table_lock);
-        s_sem_table_lock_init = 1;
-    }
-#endif
 
     lv2_syscall_register(tbl, SYS_SEMAPHORE_CREATE,    sys_semaphore_create);
     lv2_syscall_register(tbl, SYS_SEMAPHORE_DESTROY,   sys_semaphore_destroy);

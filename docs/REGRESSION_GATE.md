@@ -74,7 +74,7 @@ Recording twice and keeping the intersection would have caught both.
 ## `--shots`: does it actually render?
 
 The default run is headless on the null backend — fast, GPU-free, identical on
-Linux and macOS. It therefore has no opinion on whether a title *renders*, only
+Linux. It therefore has no opinion on whether a title *renders*, only
 on whether it submits draw methods. For VF5 it does not even have that: its draws
 exist only on the live-draw path, which the headless run disables.
 

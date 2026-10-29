@@ -30,15 +30,6 @@
 #  undef st_ctime
 #endif
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <io.h>
-#  include <direct.h>
-#  define HOST_MKDIR(p)   _mkdir(p)
-#  define HOST_STAT       _stat64
-#  define HOST_STAT_T     struct __stat64
-#  define HOST_FSTAT      _fstat64
-#else
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/types.h>
@@ -46,7 +37,6 @@
 #  define HOST_STAT       stat
 #  define HOST_STAT_T     struct stat
 #  define HOST_FSTAT      fstat
-#endif
 
 /* ---------------------------------------------------------------------------
  * Path translation
@@ -185,8 +175,8 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
     }
 
     /* A mapped path with an empty remainder ends in a separator ("…/dev_hdd0/"),
-     * and stat() rejects that on Windows -- so the directory a game asks about
-     * reads as missing even when it is right there. Trim it. */
+     * and stat() rejects that on a non-directory -- so the directory a game
+     * asks about reads as missing even when it is right there. Trim it. */
     { size_t hl = strlen(translated);
       const size_t root_len = translated[1] == ':' && host_path_is_absolute(translated) ? 3 : 1;
       while (hl > root_len && (translated[hl-1] == '/' ||
@@ -196,11 +186,7 @@ static int translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
 
     /* Normalize slashes */
     for (char* p = translated; *p; p++) {
-#ifdef _WIN32
-        if (*p == '/') *p = '\\';
-#else
         if (*p == '\\') *p = '/';
-#endif
     }
 
     extern void ps3_vfs_ps3game_fallback(char* path, size_t cap);
@@ -270,19 +256,6 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
 {
     memset(sb, 0, sizeof(CellFsStat));
 
-#ifdef _WIN32
-    if (hst->st_mode & _S_IFDIR)
-        sb->st_mode = CELL_FS_S_IFDIR;
-    else
-        sb->st_mode = CELL_FS_S_IFREG;
-
-    if (hst->st_mode & _S_IREAD)
-        sb->st_mode |= CELL_FS_S_IRUSR | CELL_FS_S_IRGRP | CELL_FS_S_IROTH;
-    if (hst->st_mode & _S_IWRITE)
-        sb->st_mode |= CELL_FS_S_IWUSR | CELL_FS_S_IWGRP | CELL_FS_S_IWOTH;
-    if (hst->st_mode & _S_IEXEC)
-        sb->st_mode |= CELL_FS_S_IXUSR | CELL_FS_S_IXGRP | CELL_FS_S_IXOTH;
-#else
     if (S_ISDIR(hst->st_mode))
         sb->st_mode = CELL_FS_S_IFDIR;
     else if (S_ISLNK(hst->st_mode))
@@ -299,24 +272,12 @@ static void fill_cellfs_stat(CellFsStat* sb, const HOST_STAT_T* hst)
     if (hst->st_mode & S_IROTH) sb->st_mode |= CELL_FS_S_IROTH;
     if (hst->st_mode & S_IWOTH) sb->st_mode |= CELL_FS_S_IWOTH;
     if (hst->st_mode & S_IXOTH) sb->st_mode |= CELL_FS_S_IXOTH;
-#endif
 
     sb->st_uid   = 0;
     sb->st_gid   = 0;
-#ifdef _WIN32
-    sb->st_atime = (s64)hst->st_atime;
-    sb->st_mtime = (s64)hst->st_mtime;
-    sb->st_ctime = (s64)hst->st_ctime;
-#elif defined(__APPLE__)
-/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-    sb->st_atime = (s64)hst->st_atimespec.tv_sec;
-    sb->st_mtime = (s64)hst->st_mtimespec.tv_sec;
-    sb->st_ctime = (s64)hst->st_ctimespec.tv_sec;
-#else
     sb->st_atime = (s64)hst->st_atim.tv_sec;
     sb->st_mtime = (s64)hst->st_mtim.tv_sec;
     sb->st_ctime = (s64)hst->st_ctim.tv_sec;
-#endif
     sb->st_size  = (u64)hst->st_size;
     sb->st_blksize = 4096;
 
@@ -340,14 +301,7 @@ typedef struct {
 typedef struct {
     int  in_use;
     char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-#ifdef _WIN32
-    HANDLE           find_handle;
-    WIN32_FIND_DATAA find_data;
-    int              first_read;
-    int              done;
-#else
     DIR* host_dir;
-#endif
 } FsDirSlot;
 
 static FsFileSlot s_files[MAX_OPEN_FILES];
@@ -586,13 +540,8 @@ s32 cellFsLseek(CellFsFd fd, s64 offset, s32 whence, u64* pos)
         if (whence == CELL_FS_SEEK_CUR) host_whence = SEEK_CUR;
         if (whence == CELL_FS_SEEK_END) host_whence = SEEK_END;
 
-#ifdef _MSC_VER
-        _fseeki64(s_files[fd].host_fp, offset, host_whence);
-        s64 cur = _ftelli64(s_files[fd].host_fp);
-#else
         fseeko(s_files[fd].host_fp, (off_t)offset, host_whence);
         s64 cur = (s64)ftello(s_files[fd].host_fp);
-#endif
         if (pos)
             *(u64*)gptr(pos) = ps3_bswap64((u64)cur);
     } else {
@@ -618,21 +567,12 @@ s32 cellFsFstat(CellFsFd fd, CellFsStat* sb)
     if (!sbh) return CELL_EFAULT;
 
     if (s_files[fd].host_fp) {
-#ifdef _WIN32
-        int file_no = _fileno(s_files[fd].host_fp);
-        HOST_STAT_T hst;
-        if (HOST_FSTAT(file_no, &hst) == 0) {
-            fill_cellfs_stat(sbh, &hst);
-            return CELL_OK;
-        }
-#else
         int file_no = fileno(s_files[fd].host_fp);
         HOST_STAT_T hst;
         if (HOST_FSTAT(file_no, &hst) == 0) {
             fill_cellfs_stat(sbh, &hst);
             return CELL_OK;
         }
-#endif
     }
 
     /* Fallback */
@@ -687,21 +627,8 @@ s32 cellFsTruncate(const char* path, u64 size)
     if (translate_path(gpath(path), host_path, sizeof(host_path)) != 0)
         return (s32)CELL_ENOENT;
 
-#ifdef _WIN32
-    HANDLE hFile = CreateFileA(host_path, GENERIC_WRITE, 0, NULL,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE)
-        return (s32)CELL_ENOENT;
-
-    LARGE_INTEGER li;
-    li.QuadPart = (LONGLONG)size;
-    SetFilePointerEx(hFile, li, NULL, FILE_BEGIN);
-    SetEndOfFile(hFile);
-    CloseHandle(hFile);
-#else
     if (truncate(host_path, (off_t)size) != 0)
         return (s32)CELL_ENOENT;
-#endif
 
     return CELL_OK;
 }
@@ -716,13 +643,8 @@ s32 cellFsFtruncate(CellFsFd fd, u64 size)
 
     if (s_files[fd].host_fp) {
         fflush(s_files[fd].host_fp);
-#ifdef _WIN32
-        int file_no = _fileno(s_files[fd].host_fp);
-        _chsize_s(file_no, (long long)size);
-#else
         int file_no = fileno(s_files[fd].host_fp);
         ftruncate(file_no, (off_t)size);
-#endif
     }
 
     return CELL_OK;
@@ -755,17 +677,6 @@ s32 cellFsGetFreeSize(const char* path, u32* block_size, u64* free_block_count)
     /* Report ~1GB free by default */
     u64 free_blocks = (u64)(1024ULL * 1024 * 1024 / 4096);
 
-#ifdef _WIN32
-    {
-        char host_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        if (translate_path(gpath(path), host_path, sizeof(host_path)) == 0) {
-            ULARGE_INTEGER free_bytes;
-            if (GetDiskFreeSpaceExA(host_path, &free_bytes, NULL, NULL)) {
-                free_blocks = (u64)(free_bytes.QuadPart / 4096);
-            }
-        }
-    }
-#endif
 
     if (free_block_count) vm_write64((u32)(uintptr_t)free_block_count, free_blocks);
 
@@ -807,27 +718,12 @@ s32 cellFsOpendir(const char* path, CellFsDir* fd)
     strncpy(s_dirs[slot].host_path, host_path, CELL_FS_MAX_FS_PATH_LENGTH - 1);
     s_dirs[slot].host_path[CELL_FS_MAX_FS_PATH_LENGTH - 1] = '\0';
 
-#ifdef _WIN32
-    {
-        char search_path[CELL_FS_MAX_FS_PATH_LENGTH];
-        snprintf(search_path, sizeof(search_path), "%s\\*", host_path);
-        s_dirs[slot].find_handle = FindFirstFileA(search_path, &s_dirs[slot].find_data);
-        if (s_dirs[slot].find_handle == INVALID_HANDLE_VALUE) {
-            s_dirs[slot].in_use = 0;
-            printf("[cellFs] Opendir: FindFirstFile('%s') failed\n", search_path);
-            return (s32)CELL_ENOENT;
-        }
-        s_dirs[slot].first_read = 1;
-        s_dirs[slot].done = 0;
-    }
-#else
     s_dirs[slot].host_dir = opendir(host_path);
     if (!s_dirs[slot].host_dir) {
         s_dirs[slot].in_use = 0;
         printf("[cellFs] Opendir: opendir('%s') failed: %s\n", host_path, strerror(errno));
         return (s32)CELL_ENOENT;
     }
-#endif
 
     *(CellFsDir*)gptr(fd) = (CellFsDir)ps3_bswap32((u32)slot);   /* guest reads the dir fd big-endian */
     printf("[cellFs] Opendir: dir_fd=%d -> '%s'\n", slot, host_path);
@@ -847,31 +743,6 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
     CellFsDirent* ent = (CellFsDirent*)gptr(entry);
     if (!ent) return CELL_EFAULT;
 
-#ifdef _WIN32
-    if (s_dirs[fd].done) {
-        *(u64*)gptr(nread) = 0;
-        return CELL_OK;
-    }
-
-    if (!s_dirs[fd].first_read) {
-        if (!FindNextFileA(s_dirs[fd].find_handle, &s_dirs[fd].find_data)) {
-            s_dirs[fd].done = 1;
-            *(u64*)gptr(nread) = 0;
-            return CELL_OK;
-        }
-    }
-    s_dirs[fd].first_read = 0;
-
-    memset(ent, 0, sizeof(*ent));
-    ent->d_type = (s_dirs[fd].find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        ? CELL_FS_TYPE_DIRECTORY : CELL_FS_TYPE_REGULAR;
-    strncpy(ent->d_name, s_dirs[fd].find_data.cFileName,
-            CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1);
-    ent->d_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH - 1] = '\0';
-    ent->d_namlen = (u8)strlen(ent->d_name);
-
-    *(u64*)gptr(nread) = ps3_bswap64(sizeof(CellFsDirent));
-#else
     struct dirent* de = readdir(s_dirs[fd].host_dir);
     if (!de) {
         *(u64*)gptr(nread) = 0;
@@ -891,7 +762,6 @@ s32 cellFsReaddir(CellFsDir fd, CellFsDirent* entry, u64* nread)
     ent->d_namlen = (u8)strlen(ent->d_name);
 
     *(u64*)gptr(nread) = ps3_bswap64(sizeof(CellFsDirent));
-#endif
 
     return CELL_OK;
 }
@@ -904,17 +774,10 @@ s32 cellFsClosedir(CellFsDir fd)
     if (fd < 0 || fd >= MAX_OPEN_DIRS || !s_dirs[fd].in_use)
         return CELL_FS_ERROR_EBADF;
 
-#ifdef _WIN32
-    if (s_dirs[fd].find_handle != INVALID_HANDLE_VALUE) {
-        FindClose(s_dirs[fd].find_handle);
-        s_dirs[fd].find_handle = INVALID_HANDLE_VALUE;
-    }
-#else
     if (s_dirs[fd].host_dir) {
         closedir(s_dirs[fd].host_dir);
         s_dirs[fd].host_dir = NULL;
     }
-#endif
 
     s_dirs[fd].in_use = 0;
     return CELL_OK;

@@ -4,41 +4,24 @@
 
 #include "ffmpeg_runtime.h"
 
-#ifdef PS3RECOMP_FFMPEG_RUNTIME
+#if defined(PS3RECOMP_FFMPEG_RUNTIME)
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-typedef HMODULE ff_lib;
-static ff_lib ff_open(const char* p) { return LoadLibraryA(p); }
-static void*  ff_sym(ff_lib l, const char* n) { return (void*)(uintptr_t)GetProcAddress(l, n); }
-static void   ff_close(ff_lib l) { FreeLibrary(l); }
-#else
 #include <dlfcn.h>
 typedef void* ff_lib;
 static ff_lib ff_open(const char* p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
 static void*  ff_sym(ff_lib l, const char* n) { return dlsym(l, n); }
 static void   ff_close(ff_lib l) { dlclose(l); }
-#endif
 
 /* The major the headers describe, which is the only one whose structs we can
  * read: libavcodec.so.63 / avcodec-63.dll / libavcodec.63.dylib. */
 #define FF_MAJ_C AV_STRINGIFY(LIBAVCODEC_VERSION_MAJOR)
 #define FF_MAJ_U AV_STRINGIFY(LIBAVUTIL_VERSION_MAJOR)
-#if defined(_WIN32)
-#define FF_AVCODEC_NAME "avcodec-" FF_MAJ_C ".dll"
-#define FF_AVUTIL_NAME  "avutil-" FF_MAJ_U ".dll"
-#elif defined(__APPLE__)
-#define FF_AVCODEC_NAME "libavcodec." FF_MAJ_C ".dylib"
-#define FF_AVUTIL_NAME  "libavutil." FF_MAJ_U ".dylib"
-#else
 #define FF_AVCODEC_NAME "libavcodec.so." FF_MAJ_C
 #define FF_AVUTIL_NAME  "libavutil.so." FF_MAJ_U
-#endif
 
 static PS3FFmpeg s_ff;
 static int s_state;   /* 0 not tried, 1 loaded, -1 unavailable */
@@ -58,8 +41,8 @@ static int ff_load(void)
     }
     const char* util_path  = env_or("PS3RECOMP_FFMPEG_AVUTIL", FF_AVUTIL_NAME);
     const char* codec_path = env_or("PS3RECOMP_FFMPEG_AVCODEC", FF_AVCODEC_NAME);
-    /* avutil first: avcodec depends on it, and on Windows the loader finds an
-     * already-loaded avutil by name. */
+    /* avutil first: avcodec depends on it, and the loader resolves the
+     * already-loaded library by name. */
     ff_lib util = ff_open(util_path);
     ff_lib codec = util ? ff_open(codec_path) : NULL;
     if (!util || !codec) {
@@ -112,27 +95,13 @@ static int ff_load(void)
 }
 
 /* Load once, even when two codec modules open from different threads. */
-#ifdef _WIN32
-static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK ff_once(PINIT_ONCE o, PVOID p, PVOID* c)
-{
-    (void)o; (void)p; (void)c;
-    s_state = ff_load();
-    return TRUE;
-}
-#else
 #include <pthread.h>
 static pthread_once_t s_once = PTHREAD_ONCE_INIT;
 static void ff_once(void) { s_state = ff_load(); }
-#endif
 
 const PS3FFmpeg* ps3_ffmpeg_get(void)
 {
-#ifdef _WIN32
-    InitOnceExecuteOnce(&s_once, ff_once, NULL, NULL);
-#else
     pthread_once(&s_once, ff_once);
-#endif
     return s_state > 0 ? &s_ff : NULL;
 }
 
@@ -141,4 +110,4 @@ const PS3FFmpeg* ps3_ffmpeg_get(void)
 /* ISO C forbids an empty translation unit. */
 typedef int ps3_ffmpeg_runtime_disabled;
 
-#endif /* PS3RECOMP_FFMPEG_RUNTIME */
+#endif

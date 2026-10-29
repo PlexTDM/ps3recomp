@@ -10,7 +10,7 @@
  * updates because its content hash is only taken once, and a pipeline that is
  * recompiled every time a constant changes.
  *
- * Builds and runs on Linux as well as macOS; nothing in it is Apple-specific.
+ * Builds and runs on Linux.
  */
 #include "rsx_draw_engine.h"
 #include "rsx_capture.h"

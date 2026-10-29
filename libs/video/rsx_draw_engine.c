@@ -23,9 +23,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#ifndef _WIN32
 #include <unistd.h>
-#endif
 #include <string.h>
 
 /* Environment switches are read where they are used, some of them per call:
@@ -743,9 +741,14 @@ static void eng_zdepth_copy_size(const eng_zdepth* z, u32 tw, u32 th, u32* w, u3
 static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    if (!z->handle || (!z->had_write && !z->cleared)) return 0;
     u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
-    if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) return z->snapshot;
+    if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) {
+        if (slot == 2) { static int n = 0; if (n < 200 && ++n)
+            fprintf(stderr, "[shadow-snap] f%u slot2 CACHED had_write %u cleared %u -> %u\n",
+                    g.frames, z->had_write, z->cleared, z->snapshot); }
+        return z->snapshot;
+    }
     if (!g.be->depth_snapshot) return 0;
     /* The previous image of this zeta is stale (a clear invalidated it), so
      * hand it back before resolving a new one. It never was: every shadow-map
@@ -760,6 +763,9 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
     if (z->snapshot && g.be->texture_release) g.be->texture_release(g.be->user, z->snapshot);
     z->snapshot = 0;
     const u32 tex = g.be->depth_snapshot(g.be->user, z->handle, cw, ch);
+    { static int n = 0; if (n < 200 && ++n)
+        fprintf(stderr, "[rsx engine] depth zeta %u (handle %u %ux%u had_write %u cleared %u) %ux%u -> tex %u\n",
+                slot, z->handle, z->w, z->h, z->had_write, z->cleared, cw, ch, tex); }
     if (!tex) return 0;
     z->snapshot = tex;
     z->snapshot_valid = 1;
@@ -770,13 +776,16 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 static u32 eng_zdepth_packed(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    if (!z->handle || (!z->had_write && !z->cleared)) return 0;
     u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
     if (z->packed_valid && z->packed && z->packed_w == cw && z->packed_h == ch) return z->packed;
     if (!g.be->depth_snapshot_rgba8) return 0;
     if (z->packed && g.be->texture_release) g.be->texture_release(g.be->user, z->packed);
     z->packed = 0;
     const u32 tex = g.be->depth_snapshot_rgba8(g.be->user, z->handle, cw, ch);
+    { static int n = 0; if (n < 8 && ++n)
+        fprintf(stderr, "[rsx engine] packed zeta %u (handle %u %ux%u had_write %u cleared %u) -> tex %u\n",
+                slot, z->handle, cw, ch, z->had_write, z->cleared, tex); }
     if (!tex) return 0;
     z->packed = tex;
     z->packed_valid = 1;
@@ -1729,34 +1738,9 @@ static const char* const kEngFixedPS =
  * cached shader is ready well inside that, so nothing changes for it -- and
  * a slow one is skipped until it is ready: the effect appears a few frames
  * late, the first time, instead of the game stopping. RSX_ASYNC_SHADERS=0 builds on the walker as
- * before. Metal and D3D12: both backends' pipeline_create are thread-safe. */
-#if defined(__APPLE__) || defined(_WIN32)
-#if defined(_WIN32)
-/* The pthread names the worker was written with, over Win32: an SRW lock,
- * condition variables and CreateThread. The timed wait takes a deadline the
- * caller computed with timespec_get, so it is converted to a span here. */
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-typedef SRWLOCK pj_mutex_t;
-typedef CONDITION_VARIABLE pj_cond_t;
-typedef HANDLE pj_thread_t;
-#define PJ_MUTEX_INIT SRWLOCK_INIT
-#define PJ_COND_INIT  CONDITION_VARIABLE_INIT
-static void pj_lock(pj_mutex_t* m)   { AcquireSRWLockExclusive(m); }
-static void pj_unlock(pj_mutex_t* m) { ReleaseSRWLockExclusive(m); }
-static void pj_wait(pj_cond_t* c, pj_mutex_t* m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
-static int  pj_timedwait(pj_cond_t* c, pj_mutex_t* m, const struct timespec* dl)
-{
-    struct timespec now; timespec_get(&now, TIME_UTC);
-    long long ms = (long long)(dl->tv_sec - now.tv_sec) * 1000LL + (dl->tv_nsec - now.tv_nsec) / 1000000LL;
-    if (ms <= 0) return 1;
-    return SleepConditionVariableSRW(c, m, (DWORD)ms, 0) ? 0 : 1;
-}
-static void pj_signal(pj_cond_t* c)    { WakeConditionVariable(c); }
-static void pj_broadcast(pj_cond_t* c) { WakeAllConditionVariable(c); }
-#else
+ * before. Metal, D3D12 and the Linux Vulkan backend: every pipeline_create
+ * that may run on these threads keeps its own lock (rsx_vulkan_backend.c
+ * serialises the Vulkan calls it makes). */
 #include <pthread.h>
 typedef pthread_mutex_t pj_mutex_t;
 typedef pthread_cond_t  pj_cond_t;
@@ -1769,7 +1753,6 @@ static void pj_wait(pj_cond_t* c, pj_mutex_t* m) { pthread_cond_wait(c, m); }
 static int  pj_timedwait(pj_cond_t* c, pj_mutex_t* m, const struct timespec* dl) { return pthread_cond_timedwait(c, m, dl); }
 static void pj_signal(pj_cond_t* c)    { pthread_cond_signal(c); }
 static void pj_broadcast(pj_cond_t* c) { pthread_cond_broadcast(c); }
-#endif
 typedef struct eng_pipe_job {
     char* vs; char* ps;
     rsx_be_render_state rs;
@@ -1793,11 +1776,7 @@ static int eng_pipe_nthreads(void)
     const char* e = getenv("RSX_ASYNC_THREADS");
     int n = e ? atoi(e) : 0;
     if (n <= 0) {
-#if defined(_WIN32)
-        SYSTEM_INFO si; GetSystemInfo(&si); n = (int)si.dwNumberOfProcessors - 2;
-#else
         n = (int)sysconf(_SC_NPROCESSORS_ONLN) - 2;
-#endif
     }
     if (n < 2) n = 2;
     if (n > PJ_MAX_THREADS) n = PJ_MAX_THREADS;
@@ -1810,16 +1789,9 @@ static int eng_async_on(void)
     if (on < 0) { const char* e = getenv("RSX_ASYNC_SHADERS"); on = !(e && e[0] == '0'); }
     return on;
 }
-#if defined(_WIN32)
-static DWORD WINAPI eng_pipe_worker(LPVOID arg)
-#else
 static void* eng_pipe_worker(void* arg)
-#endif
 {
     (void)arg;
-#if defined(__APPLE__)
-    pthread_setname_np("rsx pipeline build");
-#endif
     for (;;) {
         pj_lock(&s_pj_mu);
         while (!s_pj_head && !s_pj_quit) pj_wait(&s_pj_work, &s_pj_mu);
@@ -1862,16 +1834,11 @@ static eng_pipe_job* eng_pipe_submit(const char* vs, const char* ps, const rsx_b
         const int want = eng_pipe_nthreads();
         s_pj_nthreads = 0;
         for (int t = 0; t < want; t++) {
-#if defined(_WIN32)
-            s_pj_threads[t] = CreateThread(NULL, 64u << 20, eng_pipe_worker, NULL, 0, NULL);
-            if (!s_pj_threads[t]) break;
-#else
             pthread_attr_t at; pthread_attr_init(&at);
             pthread_attr_setstacksize(&at, 64u << 20);   /* glslang and spirv-opt recurse deeply */
             const int rc = pthread_create(&s_pj_threads[t], &at, eng_pipe_worker, NULL);
             pthread_attr_destroy(&at);
             if (rc != 0) break;
-#endif
             s_pj_nthreads++;
         }
         if (!s_pj_nthreads) s_pj_started = -1;
@@ -1907,11 +1874,7 @@ static void eng_pipe_stop(void)
     pj_broadcast(&s_pj_work);
     pj_unlock(&s_pj_mu);
     for (int t = 0; started && t < s_pj_nthreads; t++) {
-#if defined(_WIN32)
-        WaitForSingleObject(s_pj_threads[t], INFINITE); CloseHandle(s_pj_threads[t]); s_pj_threads[t] = NULL;
-#else
         pthread_join(s_pj_threads[t], NULL);
-#endif
     }
     s_pj_nthreads = 0;
     s_pj_started = 0;
@@ -1927,11 +1890,6 @@ static u32 eng_pipe_poll(eng_pipeline* p)
     free(p->job); p->job = NULL;
     return p->handle;
 }
-#else
-static int eng_async_on(void) { return 0; }
-static void eng_pipe_stop(void) {}
-static u32 eng_pipe_poll(eng_pipeline* p) { return p->handle; }
-#endif
 
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
@@ -2124,7 +2082,6 @@ key_done:;
             fi = -1;
     }
     struct eng_pipe_job* job = NULL;
-#if defined(__APPLE__) || defined(_WIN32)
     if (vi > 0 && fi > 0 && !fixed && eng_async_on()) {
         job = eng_pipe_submit(s_vs_hlsl, s_ps_hlsl, rs, layout, layout->stride, rt_fmt, rt_count);
         if (job && __atomic_load_n(&job->done, __ATOMIC_ACQUIRE)) {
@@ -2134,7 +2091,6 @@ key_done:;
         }
     }
     if (!job && handle == 0)
-#endif
     if (vi > 0 && fi > 0)
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
@@ -2592,32 +2548,19 @@ static void eng_vc_promote(EngVCEntry* e)
     if (!g.be->buffer_wrap || !g.be->draw_buffer || !g.be->buffer_release) return;
     const size_t vb = (size_t)e->n_verts * e->stride;
     const size_t ib = e->indexed ? (size_t)e->n_draw * sizeof(u32) : 0;
-#ifdef _WIN32
-    const size_t page = 4096u;
-#else
     const size_t page = (size_t)getpagesize();
-#endif
     const u32 ib_off = (u32)((vb + 255u) & ~(size_t)255u);
     const size_t total = ((size_t)ib_off + ib + page - 1u) & ~(page - 1u);
     if (total > 0xFFFFFFFFu) return;
     void* mem = NULL;
-#ifdef _WIN32
-    mem = _aligned_malloc(total, page);
-    if (!mem) return;
-#else
     if (posix_memalign(&mem, page, total) != 0) return;
-#endif
     memcpy(mem, e->verts, vb);
     if (ib) memcpy((u8*)mem + ib_off, e->indices, ib);
     const double t_wrap = eng_now_ms();
     const u32 buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
     s_fstat.vc_wrap_ms += eng_now_ms() - t_wrap;
     if (!buf) {
-#ifdef _WIN32
-        _aligned_free(mem);
-#else
         free(mem);
-#endif
         return;
     }
     /* As eng_vc_store keeps them: the buffer's memory, which a backend that
@@ -2692,31 +2635,18 @@ static void eng_vc_store(u64 key, const EngVCFill* f, const u8* verts,
         /* Page-aligned, a whole number of pages: what buffer_wrap takes. On
          * Windows the memory comes from _aligned_malloc and the backend frees
          * it with _aligned_free; elsewhere posix_memalign and free. */
-#ifdef _WIN32
-        const size_t page = 4096u;
-#else
         const size_t page = (size_t)getpagesize();
-#endif
         ib_off = (u32)((vb + 255u) & ~(size_t)255u);
         const size_t total = ((size_t)ib_off + ib + page - 1u) & ~(page - 1u);
         void* mem = NULL;
-#ifdef _WIN32
-        if (total <= 0xFFFFFFFFu) mem = _aligned_malloc(total, page);
-        if (mem) {
-#else
         if (total <= 0xFFFFFFFFu && posix_memalign(&mem, page, total) == 0) {
-#endif
             memcpy(mem, verts, vb);
             if (ib) memcpy((u8*)mem + ib_off, indices, ib);
             { const double t_wrap = eng_now_ms();
               buf = g.be->buffer_wrap(g.be->user, mem, (u32)total);
               s_fstat.vc_wrap_ms += eng_now_ms() - t_wrap; }
             if (buf) { v = (u8*)mem; x = ib ? (u32*)((u8*)mem + ib_off) : NULL; }
-#ifdef _WIN32
-            else _aligned_free(mem);
-#else
             else free(mem);
-#endif
         }
     }
     if (!buf) {
@@ -3978,7 +3908,7 @@ static void eng_present(u32 buffer_id)
     if (!g.ready) return;
     const u32 target = eng_present_surface(buffer_id);
     if (target == ENG_INVALID) return;
-    if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
+    if (getenv("PS3RECOMP_RSX_FRAME_DUMP") && g.frames % 120 == 0) {
         u32 current = eng_current_surface();
         fprintf(stderr, "[rsx capture] frame=%u buffer=%u selected=%u current=%u draws=%u surfaces=%u\n",
                 g.frames, buffer_id, target, current, g.guest_draws, g.n_surfaces);

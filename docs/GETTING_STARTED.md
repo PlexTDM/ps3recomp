@@ -7,12 +7,11 @@ Step-by-step guide to recompiling your first PS3 game.
 ### Required Software
 
 - **CMake** 3.20 or later: [cmake.org](https://cmake.org/download/)
-- **C/C++ compiler** with C17 and C++20 support:
-  - Windows: Visual Studio 2022 (MSVC 17+) or Clang 14+
-  - Linux: GCC 12+ or Clang 14+
-  - macOS: Xcode 14+ (Apple Clang)
+- **C/C++ compiler** with C17 and C++20 support: GCC 12+ or Clang 15+
 - **Python** 3.9+: Required for the recompiler tools
-- **Ninja** (recommended): Faster than Make/MSBuild -- `pip install ninja`
+- **Ninja** (recommended): Faster than Make -- `pip install ninja`
+- **SDL2** development headers for input, audio and the Vulkan window
+- Optional: Vulkan headers and glslang for the Vulkan backend
 
 ### Required Game Files
 
@@ -45,14 +44,13 @@ cmake .. -G Ninja
 ninja
 ```
 
-This builds `libps3recomp_runtime.a` (or `ps3recomp_runtime.lib` on Windows), which contains the memory manager, thread manager, and all HLE library stubs.
+This builds `libps3recomp_runtime.a`, which contains the memory manager, thread manager, and all HLE library stubs.
 
 ### 3. Verify the Build
 
 ```bash
 # The runtime library should exist:
-ls build/libps3recomp_runtime.a    # Linux/macOS
-dir build\ps3recomp_runtime.lib    # Windows
+ls build/libps3recomp_runtime.a
 ```
 
 ## First Recompilation Walkthrough
@@ -200,26 +198,12 @@ cmake -B build -G Ninja -DPS3RECOMP_DIR=/path/to/ps3recomp -DRECOMP_DIR=$PWD/rec
 cmake --build build
 ```
 
-Use **clang-cl** on Windows, not `cl`. The runtime uses `__atomic_*` builtins,
-`__int128` and `__builtin_bswap*`, and the lifted output uses `__int128` for the
-PPC 64x64 multiplies; `cl` has none of them. clang-cl consumes the same MSVC
-headers and libraries, so nothing else about the build changes:
+Lifted output produces very large translation units. GCC and Clang handle
+them; give the compiler enough memory and build with a modest `-j` if the
+machine runs out (each `cc1plus` on a big lifted file can take a gigabyte or
+more).
 
-```bash
-cmake -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
-```
-
-Lifted output also produces very large translation units, so add `/bigobj` to the
-target that compiles them or the object files overflow their section limit:
-
-```cmake
-if(MSVC)
-    target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
-endif()
-```
-
-`templates/project/CMakeLists.txt` in this repository does exactly that and is the working
-reference; the starter template does not set it for you.
+`templates/project/CMakeLists.txt` in this repository is the working reference.
 
 ### Step 7: Run
 
@@ -243,8 +227,9 @@ You'll see:
 - `[init]` messages as the runtime initializes (VM, syscalls, HLE modules)
 - `[HLE]` messages as PS3 API functions are called
 - `[LV2]` messages for unimplemented system calls
-- A window opens for RSX output -- Direct3D 12 on Windows, Metal on macOS. See
-  [Graphics backends](BUILDING.md#graphics-backends) for what each platform gets.
+- A window opens for RSX output when the Vulkan backend is enabled and
+  `PS3RECOMP_VK_WINDOW=1` is set; otherwise frames stay offscreen. See
+  [Graphics backends](BUILDING.md#graphics-backends).
 
 **Expected first-run behavior:** CRT startup executes, the game calls `cellSysmoduleLoadModule` to load libraries, then begins initialization. Missing HLE functions show as `[HLE] UNIMPLEMENTED` — add bridges in your game's `hle_modules.cpp`.
 
@@ -324,13 +309,15 @@ the loop waits on is never written (see `[HOTREAD]` above).
 
 - The RSX command processor tracks GPU state but needs a rendering backend.
 - Start with the **null backend** (`rsx_null_backend_init()`) to verify command flow.
-- Switch to the **D3D12 backend** (`rsx_d3d12_backend_init()`) for real GPU rendering.
+- Switch to the **Vulkan backend** (`-DPS3RECOMP_RSX_VULKAN=ON`, then
+  `rsx_vulkan_backend_init()`) for real GPU rendering.
 - See [RSX_GRAPHICS.md](RSX_GRAPHICS.md) for the full graphics architecture.
 
 ### Audio crackling or silence
 
 - Check that `cellAudio` is set to `"hle"` in modules config.
-- Verify the audio backend matches your OS (`wasapi` for Windows, `pulseaudio` for Linux).
+- Check that the SDL2 audio device opened; `PS3RECOMP_AUDIO=0` disables output
+  for debugging.
 - Increase `buffer_size` to reduce crackling (at the cost of latency).
 
 ### Recompiler fails on indirect branches
@@ -342,10 +329,10 @@ the loop waits on is never written (see `[HOTREAD]` above).
 ### Build errors in generated code
 
 - Ensure your compiler supports C17 and C++20.
-- On Windows use **clang-cl**, not `cl`: the runtime and the lifted output use
-  `__atomic_*`, `__int128` and `__builtin_bswap*`, none of which MSVC has. See
-  Step 6.
-- Lifted translation units are large enough to need `/bigobj`.
+- Use GCC or Clang: the runtime and the lifted output use `__atomic_*`,
+  `__int128` and `__builtin_bswap*`.
+- Lifted translation units are large; build with a lower `-j` if the compiler
+  runs out of memory.
 
 ---
 
@@ -355,7 +342,7 @@ Once you have a basic build working:
 
 - **[Game Porting Guide](GAME_PORTING_GUIDE.md)** — Full 12-phase walkthrough with [flOw case study](GAME_PORTING_GUIDE.md#case-study-flow)
 - **[Custom Modules](CUSTOM_MODULES.md)** — How to write new HLE modules
-- **[RSX Graphics](RSX_GRAPHICS.md)** — RSX command processor, D3D12/Vulkan backends, shader translation
+- **[RSX Graphics](RSX_GRAPHICS.md)** — RSX command processor, Vulkan backend, shader translation
 - **[FAQ & Troubleshooting](FAQ.md)** — Common issues and solutions
 - **[Contributing](../CONTRIBUTING.md)** — How to contribute code and docs
 
@@ -368,4 +355,4 @@ Reference docs:
 - **[Tools](TOOLS.md)** — Recompiler pipeline tools reference
 - **[Building](BUILDING.md)** — Build system and compiler notes
 - **[Architecture](ARCHITECTURE.md)** — Cell processor and pipeline overview
-- **[Platform Abstraction](PLATFORM_ABSTRACTION.md)** — Win32/POSIX cross-platform details
+- **[Platform Abstraction](PLATFORM_ABSTRACTION.md)** — the Linux Win32 compatibility shim

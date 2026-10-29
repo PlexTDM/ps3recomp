@@ -6,10 +6,10 @@
  * cellGcm -> RSX bridge (cellGcmSys's gcm_consume_fifo() just hands a
  * [get,put) slice of guest memory to this function).
  *
- * No D3D12: a tiny recording backend captures the dispatched calls.
+ * No host GPU: a tiny recording backend captures the dispatched calls.
  *
  * Build:
- *   gcc -std=c11 -O2 -I../../../include ../rsx_commands.c test_rsx_fifo.c -o t.exe
+ *   gcc -std=c11 -O2 -I../../../include ../rsx_commands.c test_rsx_fifo.c -o t
  */
 
 #include "rsx_commands.h"

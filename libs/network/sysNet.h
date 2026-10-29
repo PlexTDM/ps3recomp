@@ -1,8 +1,7 @@
 /*
  * ps3recomp - sys_net module
  *
- * BSD socket API for PS3 games. Wraps the host OS socket layer
- * (Winsock on Windows, POSIX sockets on Linux/macOS) to provide
+ * BSD socket API for PS3 games. Wraps the host POSIX socket layer to provide
  * the PS3 sys_net interface.
  *
  * PS3 uses its own socket descriptor space and error codes.

@@ -22,8 +22,8 @@ extern "C" int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: still 
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-/* win32_compat.h is <windows.h> on Windows (CRITICAL_SECTION for the real
- * lwmutex exclusion) and the POSIX shims elsewhere -- Sleep, DWORD, QPC. */
+/* win32_compat.h supplies the Win32-shaped calls (CRITICAL_SECTION, Sleep,
+ * DWORD, QPC) over POSIX. */
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 
@@ -69,16 +69,8 @@ static void sys_initialize_tls(ppu_context* ctx)
  * and every frontend animation timed off it crawled. */
 static void sys_time_get_system_time(ppu_context* ctx)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const int64_t g = ps3_guest_ticks(now.QuadPart);
-    ctx->gpr[3] = g > s_base.QuadPart ? (uint64_t)((g - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart) : 0;
-#else
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     ctx->gpr[3] = (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec) / 1000ull;
-#endif
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model
@@ -145,10 +137,9 @@ static void sys_lwmutex_create(ppu_context* ctx)
  * notably the dlmalloc mspace behind the game's big-allocator, whose tree then
  * fell apart and reported OOM on a tiny request with 100+ MB free.
  *
- * The same on every host: on POSIX the semaphore is win32_compat's. This was
- * Windows-only for a while, which left every lwmutex on Linux a bare owner
- * stamp -- Twisted Metal's FIOS layer then freed one block from two threads
- * and its dlmalloc free() aborted on a chunk already merged into top.
+ * The semaphore comes from win32_compat over POSIX. A bare owner stamp is not
+ * enough: Twisted Metal's FIOS layer then freed one block from two threads and
+ * its dlmalloc free() aborted on a chunk already merged into top.
  *
  * Backed by a binary SEMAPHORE, not a CRITICAL_SECTION: a CS may only be
  * released by its owning thread, but guest code passes lwmutex ownership
@@ -162,7 +153,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
 static struct LwmSlot { volatile long addr; HANDLE sem;
     volatile long holder; volatile long long acq_us; volatile long long acq_fences;
     volatile unsigned long long acq_cpu_us;
-    volatile long state;   /* Windows fast path: 0 free, 1 held, 2 held with waiters */
+    volatile long state;   /* reserved; the semaphore carries the lock state */
     } g_lwm[LWM_HASH];
 extern "C" { extern volatile long long g_gcm_ref_pub_count;    /* cellGcmSys.c */
              unsigned long long ppu_thread_cpu_us(unsigned tid);   /* sys_ppu_thread.c */
@@ -218,68 +209,23 @@ static HANDLE lwm_sem(uint32_t addr)
     }
     return nullptr;   /* table full (raise LWM_HASH) */
 }
-/* The lock behind an lwmutex.
- *
- * On Windows it is a user-mode lock word in the slot with WaitOnAddress for
- * the contended case -- what the PS3's own lwmutex is (the "lightweight" is
- * that an uncontended lock never enters the kernel). It used to be the
- * binary semaphore on every path: a WaitForSingleObject per lock and a
- * ReleaseSemaphore per unlock, two system calls around every guest malloc
- * and free, and a contended hand-off through the kernel dispatcher.
- * Drakengard 3's main and render threads both listed sys_lwmutex_lock among
- * their top waits and NtReleaseSemaphore at 4-5% of their CPU. The word is
- * 0 free, 1 held, 2 held with waiters; a short spin covers the common
- * malloc-sized critical section. Release works from any thread and an
- * over-release is harmless, as with the semaphore. LWM_KERNEL=1 restores
- * the semaphore; off Windows the shim's semaphore is already user-mode. */
-#ifdef _WIN32
-#pragma comment(lib, "synchronization.lib")
-static int lwm_kernel(void)
-{ static int k = -1; if (k < 0) k = getenv("LWM_KERNEL") ? 1 : 0; return k; }
-#endif
+/* The lock behind an lwmutex is a binary semaphore from win32_compat. A CS
+ * may only be released by its owning thread, but guest code passes lwmutex
+ * ownership between threads and threads exit while holding one, so the
+ * release has to work from any thread. Recursion is tracked through the guest
+ * owner/recur fields, which only the holder writes. */
 static int lwm_lock_try(uint32_t lwm, HANDLE s)
 {
-#ifdef _WIN32
-    if (!lwm_kernel()) { struct LwmSlot* sl = lwm_find(lwm);
-        if (sl) return _InterlockedCompareExchange(&sl->state, 1, 0) == 0; }
-#endif
     (void)lwm;
     return WaitForSingleObject(s, 0) == WAIT_OBJECT_0;
 }
 static DWORD lwm_lock_wait(uint32_t lwm, HANDLE s, DWORD ms)
 {
-#ifdef _WIN32
-    if (!lwm_kernel()) { struct LwmSlot* sl = lwm_find(lwm);
-        if (sl) {
-            for (int i = 0; i < 200; i++) {
-                if (sl->state == 0 && _InterlockedCompareExchange(&sl->state, 1, 0) == 0) return WAIT_OBJECT_0;
-                YieldProcessor();
-            }
-            const ULONGLONG deadline = ms == INFINITE ? 0 : GetTickCount64() + ms;
-            for (;;) {
-                /* Taking it as 2 is conservative: the unlock then wakes one
-                 * waiter that may not exist, which costs a syscall, not a hang. */
-                if (_InterlockedExchange(&sl->state, 2) == 0) return WAIT_OBJECT_0;
-                long two = 2;
-                DWORD w = INFINITE;
-                if (ms != INFINITE) {
-                    const ULONGLONG now = GetTickCount64();
-                    if (now >= deadline) return WAIT_TIMEOUT;
-                    w = (DWORD)(deadline - now);
-                }
-                WaitOnAddress((volatile VOID*)&sl->state, &two, sizeof(long), w);
-            }
-        } }
-#endif
     (void)lwm;
     return WaitForSingleObject(s, ms);
 }
 static void lwm_unlock_any(uint32_t lwm, HANDLE s)
 {
-#ifdef _WIN32
-    if (!lwm_kernel()) { struct LwmSlot* sl = lwm_find(lwm);
-        if (sl) { if (_InterlockedExchange(&sl->state, 0) == 2) WakeByAddressSingle((PVOID)&sl->state); return; } }
-#endif
     (void)lwm;
     ReleaseSemaphore(s, 1, NULL);
 }
@@ -446,22 +392,16 @@ static std::atomic<uint32_t>* lwc_gen(uint32_t lwcond)
     const uint32_t id = vm_read32(lwcond + 0x04);
     return (id & 0xFF000000u) == 0x4C000000u ? &s_lwc_gen[id & (LWC_TAB - 1)] : nullptr;
 }
-#ifndef _WIN32
 static std::mutex              s_lwc_mu[64];
 static std::condition_variable s_lwc_cv[64];
-#endif
 static void lwc_wake(uint32_t lwcond)
 {
     std::atomic<uint32_t>* g = lwc_gen(lwcond);
     if (!g) return;
     g->fetch_add(1, std::memory_order_release);
-#ifdef _WIN32
-    WakeByAddressAll((PVOID)g);
-#else
     const size_t k = (size_t)(g - s_lwc_gen) & 63;
     { std::lock_guard<std::mutex> lk(s_lwc_mu[k]); }
     s_lwc_cv[k].notify_all();
-#endif
 }
 static int lwc_sleep_mode(void)
 { static int v = -1; if (v < 0) v = getenv("PS3_LWCOND_SLEEP") ? 1 : 0; return v; }
@@ -473,14 +413,10 @@ static uint32_t lwc_poll_us(void)
 }
 static void lwc_wait(std::atomic<uint32_t>* g, uint32_t seen, uint32_t max_us)
 {
-#ifdef _WIN32
-    WaitOnAddress((volatile VOID*)g, &seen, sizeof seen, (max_us + 999) / 1000);
-#else
     const size_t k = (size_t)(g - s_lwc_gen) & 63;
     std::unique_lock<std::mutex> lk(s_lwc_mu[k]);
     s_lwc_cv[k].wait_for(lk, std::chrono::microseconds(max_us),
                          [&] { return g->load(std::memory_order_acquire) != seen; });
-#endif
 }
 
 static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake((uint32_t)ctx->gpr[3]); ctx->gpr[3] = 0; }

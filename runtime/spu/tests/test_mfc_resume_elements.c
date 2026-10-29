@@ -1,9 +1,7 @@
 /* Exercise the production parked-list acknowledgement path. Only external
  * observation/coherence dependencies are inert; DMA list parsing and copies
  * come directly from spu_dma.h. Each process starts a fresh diagnostic cap. */
-#ifndef _WIN32
 #include <pthread.h>
-#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -81,37 +79,21 @@ static int exercise(unsigned worker,unsigned iteration,int mode)
     free(ctx);return 0;
 }
 static volatile LONG arrived,go;
-#ifdef _WIN32
-static DWORD WINAPI worker(LPVOID arg)
-#else
 static void* worker(void* arg)
-#endif
 {
     unsigned n=(unsigned)(uintptr_t)arg;InterlockedIncrement(&arrived);
     while(!InterlockedCompareExchange(&go,0,0))YieldProcessor();
     for(unsigned i=0;i<64;i++)exercise(n,i,0);
-#ifdef _WIN32
-    return 0;
-#else
     return NULL;
-#endif
 }
 int main(int argc,char** argv)
 {
     check(argc==2,"mode argument");memset(g_vm_page_bitmap,0xFF,sizeof g_vm_page_bitmap);
     if(strcmp(argv[1],"concurrent")==0){
-#ifdef _WIN32
-        HANDLE th[8];for(unsigned i=0;i<8;i++){th[i]=CreateThread(NULL,0,worker,(LPVOID)(uintptr_t)i,0,NULL);check(th[i]!=NULL,"start worker");}
-#else
         pthread_t th[8];for(unsigned i=0;i<8;i++)check(pthread_create(&th[i],NULL,worker,(void*)(uintptr_t)i)==0,"start worker");
-#endif
         while(InterlockedCompareExchange(&arrived,0,0)!=8)YieldProcessor();InterlockedExchange(&go,1);
         for(unsigned i=0;i<8;i++){
-#ifdef _WIN32
-            check(WaitForSingleObject(th[i],30000)==WAIT_OBJECT_0,"join worker");CloseHandle(th[i]);
-#else
             check(pthread_join(th[i],NULL)==0,"join worker");
-#endif
         }
     }else{
         int mode=strcmp(argv[1],"transfer")==0?1:strcmp(argv[1],"repark")==0?2:0;

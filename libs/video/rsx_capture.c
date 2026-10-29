@@ -41,16 +41,7 @@ void rsx_capture_present(u32 frame, double mean, const u32* regs, u32 nregs, con
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
-#ifdef _WIN32
-#include <io.h>          /* _access, _unlink */
-#ifndef F_OK
-#define F_OK 0
-#endif
-#define access _access
-#define unlink _unlink
-#else
 #include <unistd.h>
-#endif
 
 extern u8* vm_base;
 extern u32 ppu_vm_size;
@@ -219,4 +210,4 @@ void rsx_capture_present(u32 frame, double mean,
     (void)s_stop_pending;
 }
 
-#endif /* PS3RECOMP_HAVE_ZLIB */
+#endif

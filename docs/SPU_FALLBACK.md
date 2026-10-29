@@ -96,8 +96,8 @@ Find the entry point via the `[SPU] image_open` log:
 - Synchronous registration; not thread-safe. Call all
   `spu_register_ppu_fallback()` once at startup.
 - Asynchronous execution. `sys_spu_thread_group_start` spawns one host
-  thread per registered fallback (Win32 `CreateThread`, POSIX
-  `pthread_create`). Threads without a fallback complete instantly with
+  thread per registered fallback (`pthread_create`). Threads without a fallback
+  complete instantly with
   status 0.
 - `sys_spu_thread_group_join` blocks on each running thread's completion
   event, then collects the worst exit status into the group state.

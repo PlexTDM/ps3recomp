@@ -85,7 +85,7 @@ DECLARE_PS3_MODULE(cellFoo, "cellFoo")
 ### Design Principles
 
 1. **Static allocation** — all internal tables have fixed sizes; no runtime malloc
-2. **Platform abstraction** — `#ifdef _WIN32` blocks isolate Win32/POSIX differences
+2. **Platform abstraction** — Win32-shaped calls sit on the POSIX shim in `runtime/platform/win32_compat.h`; new code calls POSIX directly
 3. **Real backends preferred** — use actual OS services (threads, sockets, timers) rather than stubs where possible
 4. **Error codes match PS3** — every function returns the same error codes the real PS3 would
 5. **Init/End pattern** — most modules follow `Init()` / `End()` lifecycle with guard checks
@@ -102,12 +102,12 @@ DECLARE_PS3_MODULE(cellFoo, "cellFoo")
 This is the most critical module. It provides:
 
 **Lightweight Mutexes (lwmutex):**
-- Backed by `CRITICAL_SECTION` (Windows) / `pthread_mutex_t` (POSIX)
+- Backed by `pthread_mutex_t` through the `CRITICAL_SECTION` shim
 - Up to 256 concurrent lwmutex instances in a static pool
 - Supports recursive and non-recursive modes
 
 **Lightweight Condition Variables (lwcond):**
-- Backed by `CONDITION_VARIABLE` (Windows) / `pthread_cond_t` (POSIX)
+- Backed by `pthread_cond_t` through the `CONDITION_VARIABLE` shim
 - Associated with a specific lwmutex
 - Signal, broadcast, and timed wait
 
@@ -217,9 +217,7 @@ All filesystem operations translate PS3 paths (e.g., `/dev_hdd0/game/NPUA80001/`
 **File:** `libs/input/cellPad.c`
 **Purpose:** PlayStation 3 gamepad (DualShock 3 / Sixaxis) input
 
-**Backends:**
-- **Windows**: XInput (Xbox controller API — maps naturally to DS3)
-- **Cross-platform**: SDL2 GameController API
+**Backend:** SDL2 GameController API
 
 **Features:**
 - Up to 7 controller ports (PS3 maximum)
@@ -299,9 +297,7 @@ struct CellPadData {
 **File:** `libs/audio/cellAudio.c`
 **Purpose:** PS3 audio output with real mixing
 
-**Backends:**
-- **Windows**: WASAPI (Windows Audio Session API) — low-latency exclusive mode
-- **Cross-platform**: SDL2 Audio
+**Backend:** SDL2 Audio
 
 **Implementation:**
 - Background mixing thread runs at **5.33 ms intervals** (256 samples at 48 kHz)
@@ -598,26 +594,26 @@ Each conversion function follows the pattern `L10nResult SJIStoUTF8(...)` with p
 
 Wraps the host OS socket API with PS3 error code translation:
 
-| PS3 Function | Windows | POSIX |
-|---|---|---|
-| `sys_net_bnet_socket` | `socket()` | `socket()` |
-| `sys_net_bnet_bind` | `bind()` | `bind()` |
-| `sys_net_bnet_listen` | `listen()` | `listen()` |
-| `sys_net_bnet_accept` | `accept()` | `accept()` |
-| `sys_net_bnet_connect` | `connect()` | `connect()` |
-| `sys_net_bnet_send` | `send()` | `send()` |
-| `sys_net_bnet_recv` | `recv()` | `recv()` |
-| `sys_net_bnet_sendto` | `sendto()` | `sendto()` |
-| `sys_net_bnet_recvfrom` | `recvfrom()` | `recvfrom()` |
-| `sys_net_bnet_poll` | `WSAPoll()` | `poll()` |
-| `sys_net_bnet_select` | `select()` | `select()` |
-| `sys_net_bnet_setsockopt` | `setsockopt()` | `setsockopt()` |
-| `sys_net_bnet_gethostbyname` | `gethostbyname()` | `gethostbyname()` |
+| PS3 Function | Host call |
+|---|---|
+| `sys_net_bnet_socket` | `socket()` |
+| `sys_net_bnet_bind` | `bind()` |
+| `sys_net_bnet_listen` | `listen()` |
+| `sys_net_bnet_accept` | `accept()` |
+| `sys_net_bnet_connect` | `connect()` |
+| `sys_net_bnet_send` | `send()` |
+| `sys_net_bnet_recv` | `recv()` |
+| `sys_net_bnet_sendto` | `sendto()` |
+| `sys_net_bnet_recvfrom` | `recvfrom()` |
+| `sys_net_bnet_poll` | `poll()` |
+| `sys_net_bnet_select` | `select()` |
+| `sys_net_bnet_setsockopt` | `setsockopt()` |
+| `sys_net_bnet_gethostbyname` | `gethostbyname()` |
 
 **Features:**
 - 128-socket descriptor table mapping PS3 FDs to host FDs
 - PS3-specific `SO_NBIO` non-blocking mode support
-- Winsock error code → PS3 errno translation
+- Host socket error → PS3 errno translation
 - Big-endian sockaddr conversion
 
 ### cellHttp
@@ -684,7 +680,7 @@ Extends cellHttp with SSL/TLS support. No actual TLS handshake or encryption —
 
 - Init/end lifecycle
 - Certificate management stubs
-- Cryptographic RNG: `BCryptGenRandom` (Windows) / `/dev/urandom` (POSIX)
+- Cryptographic RNG: `/dev/urandom`
 - No actual TLS handshake (games needing HTTPS would need a real TLS library)
 
 ---
@@ -746,8 +742,7 @@ SPURS (SPU Runtime System) is Sony's framework for distributing work across SPUs
 - Task management (create/start/wait tasks)
 - Taskset management (create/destroy tasksets)
 - Event flags with **real OS blocking**:
-  - Windows: `CRITICAL_SECTION` + `CONDITION_VARIABLE`
-  - POSIX: `pthread_mutex` + `pthread_cond`
+  - `pthread_mutex` + `pthread_cond` (through the `win32_compat` names)
   - Side table maps event flag IDs to blocking state
   - `cellSpursEventFlagWait()` truly blocks until condition met
   - `cellSpursEventFlagSet()` broadcasts to wake waiters
@@ -817,9 +812,7 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
 **File:** `libs/spurs/cellFiber.c`
 **Purpose:** Cooperative multitasking (PPU fibers)
 
-**Backend:**
-- Windows: `CreateFiber()` / `SwitchToFiber()` / `ConvertThreadToFiber()`
-- POSIX: `makecontext()` / `swapcontext()` (`ucontext_t`)
+**Backend:** `makecontext()` / `swapcontext()` (`ucontext_t`)
 
 **Features:**
 - Up to 64 concurrent fibers
@@ -853,9 +846,9 @@ All cellSync primitives use **busy-waiting (spinlocks)** — they spin in a tigh
 
 Unlike cellSync (spinlocks), cellSync2 uses **real OS blocking**:
 
-- **Mutex**: CRITICAL_SECTION/pthread_mutex with timeout support
-- **Condition Variable**: CONDITION_VARIABLE/pthread_cond with timeout
-- **Semaphore**: Win32 Semaphore/sem_t with timeout
+- **Mutex**: `pthread_mutex` with timeout support
+- **Condition Variable**: `pthread_cond` with timeout
+- **Semaphore**: POSIX `sem_t` with timeout
 - **Queue**: Bounded blocking queue (producers block when full, consumers block when empty)
 
 ---

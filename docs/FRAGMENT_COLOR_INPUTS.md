@@ -10,8 +10,8 @@ The production change is limited to the two COL0/COL1 input expressions.
 No render-target, cache, vertex-program, tone mapping, texture or shader-control
 behavior changes.
 
-`test_color_input_metal.m` uses actual translated shaders and an RGBA32Float
-target, which preserves values below0 and above1. MOV, MUL and MAD test both
+`libs/video/tests/test_rsx_draw_engine.c` drives the same expressions through
+translated shaders; an RGBA32Float target preserves values below 0 and above 1. MOV, MUL and MAD test both
 color inputs, all source positions, identity/reversed swizzles, abs/negate
 ordering, half/full export selection, and unrestricted FOG/TC0 controls. The
 optional RSX_COLOR_TEST_TEX9 define checks TC9 on baselines that already support

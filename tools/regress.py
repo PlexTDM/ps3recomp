@@ -42,8 +42,6 @@ import subprocess
 import sys
 import tempfile
 
-from msvc_env import environ as toolchain_environ
-
 try:
     import tomllib
 except ModuleNotFoundError:                      # Python < 3.11
@@ -90,14 +88,9 @@ def build_toolkit(spec):
 def build_vars():
     """Toolchain placeholders for the registry's build commands.
 
-    Windows needs clang-cl specifically: the runtime uses __atomic_* builtins,
-    __int128 and __builtin_bswap*, none of which cl has. Everywhere else the
-    system compiler is fine, and Ninja is preferred but not assumed -- a stock
+    The system compiler is fine; Ninja is preferred but not assumed -- a stock
     Debian has cmake without it.
     """
-    if os.name == "nt":
-        return {"cc": "clang-cl", "cxx": "clang-cl", "generator": "Ninja",
-                "runtime_lib": "ps3recomp_runtime.lib"}
     cc = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc") or "cc"
     cxx = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++") or "c++"
     return {"cc": cc, "cxx": cxx,
@@ -108,9 +101,8 @@ def build_vars():
 def expand(cmd):
     """Fill the registry's placeholders.
 
-    Registry commands run through the platform shell, and $VAR / %VAR% are
-    spelled differently in sh and cmd, so neither works on both. Explicit
-    placeholders do.
+    Registry commands run through the shell, and explicit placeholders keep
+    $VAR out of the commands.
     """
     out = cmd.replace("{toolkit}", ROOT.replace("\\", "/"))
     for k, v in build_vars().items():
@@ -121,14 +113,11 @@ def expand(cmd):
 def gate_env():
     """Environment for build and run steps.
 
-    On Windows this is where the MSVC toolchain comes from: clang-cl needs the
-    headers and import libraries vcvars sets up, and nothing outside CI does
-    that for us. PS3RECOMP_DIR tells a port which toolkit it is being built
-    against -- without it a port rebuilds against whatever sibling checkout it
-    normally points at, and the gate tests a different tree than the one being
-    changed.
+    PS3RECOMP_DIR tells a port which toolkit it is being built against --
+    without it a port rebuilds against whatever sibling checkout it normally
+    points at, and the gate tests a different tree than the one being changed.
     """
-    env = toolchain_environ()
+    env = dict(os.environ)
     env["PS3RECOMP_DIR"] = ROOT
     return env
 
@@ -203,8 +192,7 @@ def report_shots(name, shots_dir, gold=None):
     of this code. A uniform frame has 1 unique colour; a rendered scene has
     thousands. So rank frames by unique colours and keep the richest.
 
-    PPM (live NV4097 engine) and BMP (plain D3D12 backend) both turn up; which
-    one depends on the port, so take whatever is there.
+    The shared engine writes PPM frames, so take whatever is in the directory.
     """
     frames = sorted(f for f in os.listdir(shots_dir)
                     if f.lower().endswith((".ppm", ".bmp")))
@@ -297,15 +285,12 @@ def run_port(port, build=True, shots=False):
     cmd = list(port["cmd"])
     # Resolve the executable against the PORT directory, not ours. Python looks a
     # relative argv[0] up against the parent process cwd even when cwd= is set,
-    # so a bare "build-gate/vf5.exe" is simply not found.
+    # so a bare "build-gate/vf5" is simply not found.
     exe = os.path.join(pdir, cmd[0])
-    for cand in (exe, exe + ".exe"):
-        if os.path.exists(cand):
-            cmd[0] = os.path.abspath(cand)
-            break
-    else:
-        if not shutil.which(cmd[0]):
-            return "skip", None, "no executable at %s (build it first)" % cmd[0]
+    if os.path.exists(exe):
+        cmd[0] = os.path.abspath(exe)
+    elif not shutil.which(cmd[0]):
+        return "skip", None, "no executable at %s (build it first)" % cmd[0]
 
     log = os.path.join(tempfile.gettempdir(), "ps3recomp_regress_%s.txt" % name)
     if os.path.exists(log):
@@ -316,12 +301,11 @@ def run_port(port, build=True, shots=False):
 
     # --shots: run the port the way its README documents instead of headless,
     # and keep the frames. The default gate run is deliberately headless on the
-    # null backend -- fast, GPU-free, identical on Linux and macOS -- but that
-    # means it has no opinion at all on whether a title still RENDERS. VF5 draws
-    # only through the live engine, so headless it looks like it draws nothing.
-    # Two dump paths exist and which fires depends on the port, so set both: the
-    # live NV4097 engine writes .ppm (and reports nonblack= itself), the plain
-    # D3D12 backend writes .bmp.
+    # null backend -- fast and GPU-free -- but that means it has no opinion at
+    # all on whether a title still RENDERS. VF5 draws only through the live
+    # engine, so headless it looks like it draws nothing. The shared engine
+    # writes .ppm (and reports nonblack= itself), so set the port's render
+    # knobs and keep those frames.
     shots_dir = None
     if shots:
         env.update({str(k): str(v) for k, v in port.get("render_env", {}).items()})
@@ -501,9 +485,8 @@ def cmd_check(ports, args):
     worst = 0
     shots = getattr(args, "shots", False)
     if shots:
-        # A --shots run is a DIFFERENT configuration -- RSX_LIVE_DRAW and the
-        # port's own render knobs -- so its milestone stream is legitimately not
-        # the headless one. Diffing it against the headless golden reports
+        # A --shots run is a DIFFERENT configuration -- the port's own render
+        # knobs -- so its milestone stream is legitimately not the headless one. Diffing it against the headless golden reports
         # dozens of "regressions" that are only the profile change; ydkj showed
         # 37 of them. Report what it drew and leave the golden alone.
         print("--shots: render profile, not the headless gate -- "

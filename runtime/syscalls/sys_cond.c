@@ -24,16 +24,6 @@ struct sys_cond_waiter {
 sys_cond_info g_sys_conds[SYS_COND_MAX];
 uint32_t g_cond_id_addr[SYS_COND_MAX + 1];
 
-#ifdef _WIN32
-static SRWLOCK s_table_lock = SRWLOCK_INIT;
-static void table_lock(void) { AcquireSRWLockExclusive(&s_table_lock); }
-static void table_unlock(void) { ReleaseSRWLockExclusive(&s_table_lock); }
-static void cond_lock(sys_cond_info* c) { EnterCriticalSection(&c->signal_lock); }
-static void cond_unlock(sys_cond_info* c) { LeaveCriticalSection(&c->signal_lock); }
-static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
-static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
-static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
-#else
 static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
 static void table_unlock(void) { pthread_mutex_unlock(&s_table_lock); }
@@ -42,7 +32,6 @@ static void cond_unlock(sys_cond_info* c) { pthread_mutex_unlock(&c->signal_lock
 static void cond_wake(sys_cond_info* c) { pthread_cond_broadcast(&c->cv); }
 static void guest_lock(sys_mutex_info* m) { pthread_mutex_lock(&m->mtx); }
 static void guest_unlock(sys_mutex_info* m) { pthread_mutex_unlock(&m->mtx); }
-#endif
 
 /* Lock ordering is table -> condition. No caller holds the condition lock
  * while acquiring a guest mutex. Native locks survive slot recycling. */
@@ -69,10 +58,6 @@ int64_t sys_cond_create(ppu_context* ctx)
         sys_cond_info* c = &g_sys_conds[i];
         if (c->active) continue;
         if (!c->initialized) {
-#ifdef _WIN32
-            InitializeCriticalSection(&c->signal_lock);
-            InitializeConditionVariable(&c->cv);
-#else
             int rc = pthread_mutex_init(&c->signal_lock, NULL);
             if (rc) { table_unlock(); return (int32_t)CELL_EAGAIN; }
             rc = pthread_cond_init(&c->cv, NULL);
@@ -80,7 +65,6 @@ int64_t sys_cond_create(ppu_context* ctx)
                 pthread_mutex_destroy(&c->signal_lock);
                 table_unlock(); return (int32_t)CELL_EAGAIN;
             }
-#endif
             c->initialized = 1;
         }
         c->mutex_id = mid;
@@ -138,11 +122,6 @@ int64_t sys_cond_wait(ppu_context* ctx)
                     ea, value, value, LV2_ARG_U32(ctx, 0));
         }
     }
-#ifdef _WIN32
-    const char* spurious = getenv("PS3_COND_SPURIOUS_MS");
-    long probe_ms = spurious ? atol(spurious) : 0;
-    if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
-#endif
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
     if (!c) return (int32_t)CELL_ESRCH;
@@ -161,23 +140,6 @@ int64_t sys_cond_wait(ppu_context* ctx)
     for (int i = 0; i < depth; ++i) guest_unlock(m);
 
     int32_t result = CELL_OK;
-#ifdef _WIN32
-    ULONGLONG start = GetTickCount64();
-    uint64_t duration = (timeout + 999) / 1000;
-    while (!waiter.signalled) {
-        DWORD ms = INFINITE;
-        if (timeout) {
-            uint64_t elapsed = GetTickCount64() - start;
-            if (elapsed >= duration) { result = (int32_t)CELL_ETIMEDOUT; break; }
-            uint64_t remaining = duration - elapsed;
-            ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
-        }
-        BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
-        if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
-            result = (int32_t)CELL_EFAULT; break;
-        }
-    }
-#else
     struct timespec deadline;
     if (timeout) {
         clock_gettime(CLOCK_REALTIME, &deadline);
@@ -195,7 +157,6 @@ int64_t sys_cond_wait(ppu_context* ctx)
             break;
         }
     }
-#endif
     struct sys_cond_waiter** link = &c->waiters;
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;

@@ -7,7 +7,7 @@
  *   - Channel state (MFC command queue, mailboxes, signal notification)
  */
 
-#ifndef SPU_CONTEXT_H
+#if !defined(SPU_CONTEXT_H)
 #define SPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
@@ -36,11 +36,7 @@ static inline int spu_cri_image(void)
 }
 
 /* Portable 16-byte alignment (MSVC __declspec vs GCC/clang __attribute__). */
-#if defined(_MSC_VER)
-#  define SPU_ALIGN16 __declspec(align(16))
-#else
 #  define SPU_ALIGN16 __attribute__((aligned(16)))
-#endif
 
 /* Local store size: 256 KB */
 #define SPU_LS_SIZE         (256 * 1024)
@@ -496,11 +492,7 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * runs through here). On x86 the whole BE<->LE quadword swizzle is one
  * SSSE3 byte-shuffle instead of 16 scalar byte ops -- measured against the
  * scalar path with the same per-lane _u32 semantics. */
-#if defined(_MSC_VER)
-#include <stdlib.h>
-#define SPU_BSWAP32(x) _byteswap_ulong(x)
-#define SPU_LS_FAST 1
-#elif defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
 #define SPU_BSWAP32(x) __builtin_bswap32(x)
 #define SPU_LS_FAST 1
 #endif
@@ -513,11 +505,7 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
  * in spu_channels.c, as one merged definition per program (selectany / weak),
  * so every target that includes this header links whether or not it builds
  * spu_channels.c -- the SPU unit tests and sync_stress do not. */
-#if defined(_MSC_VER)
-#  define SPU_GATE __declspec(selectany)
-#else
 #  define SPU_GATE __attribute__((weak))
-#endif
 SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
 SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
 SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
@@ -721,14 +709,8 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
  * on 0 with a word still queued, and the PPU waited forever for a reply to a
  * command the SPU never saw. The reader could also see the new count before
  * the new value. Plain reads of `count` elsewhere stay lock-free. */
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
-#define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
-#else
 #define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
 #define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
-#endif
 
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
@@ -783,11 +765,7 @@ static inline int spu_channel_has_data(const spu_channel* ch)
  * SPU_RET. Hooks below are STUBS for now (spu_drain.c) -- lockstep/fltrec land
  * in later milestones.
  * -----------------------------------------------------------------------*/
-#if defined(_MSC_VER)
-#  define SPU_THREAD_LOCAL __declspec(thread)
-#else
 #  define SPU_THREAD_LOCAL __thread
-#endif
 
 /* Indirect-branch dispatcher (spu_channels.c): resolves ctx->pc to a lifted
  * function in the active image and runs it. Referenced by SPU_RET/SPU_DRAIN. */
@@ -967,4 +945,4 @@ static inline void spu_hop(spu_context* ctx, void (*tf)(spu_context*))
 } /* extern "C" */
 #endif
 
-#endif /* SPU_CONTEXT_H */
+#endif

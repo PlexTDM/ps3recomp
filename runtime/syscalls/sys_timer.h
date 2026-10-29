@@ -2,7 +2,7 @@
  * ps3recomp - Timer and time syscalls
  */
 
-#ifndef SYS_TIMER_H
+#if !defined(SYS_TIMER_H)
 #define SYS_TIMER_H
 
 #include "lv2_syscall_table.h"
@@ -12,14 +12,9 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
   #include <time.h>
   #include <unistd.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,21 +34,11 @@ uint64_t ppu_timebase_now(void);
  * ps3_guest_ticks(), which leaves out the time spent paused and holds while
  * paused: as in RPCS3, whose guest time leaves out the time the emulator was
  * paused, so nothing in the title sees the pause as a hitch. Ticks are the
- * host counter's: QueryPerformanceCounter on Windows, CLOCK_MONOTONIC
- * nanoseconds elsewhere. ps3_guest_clock_pause() is called from one thread. */
+ * host counter's CLOCK_MONOTONIC nanoseconds. ps3_guest_clock_pause() is called
+ * from one thread. */
 int64_t ps3_guest_ticks(int64_t host_ticks);
 void    ps3_guest_clock_pause(int paused);
 
-#ifdef _WIN32
-/* Sub-millisecond timed-wait support for the lv2 sync primitives.
- * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,
- * and the OS then rounds that up to the timer tick -- a 30 us guest timeout
- * inflates ~50x even with timeBeginPeriod(1). Waits under 1 ms must instead
- * poll their wake predicate and yield to a QueryPerformanceCounter deadline
- * (same approach sys_timer_usleep already uses). */
-int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
-int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
-#endif
 
 #define SYS_TIMER_MAX  64
 
@@ -65,16 +50,10 @@ typedef struct sys_timer_info {
     uint64_t source;           /* event source value */
     uint64_t data1;            /* event data1 */
 
-#ifdef _WIN32
-    HANDLE   timer_handle;
-    HANDLE   stop_event;
-    HANDLE   thread_handle;
-#else
     pthread_t       thread;
     pthread_mutex_t mtx;
     pthread_cond_t  cv;
     int             stop_flag;
-#endif
 
 } sys_timer_info;
 
@@ -100,4 +79,4 @@ void sys_timer_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_TIMER_H */
+#endif

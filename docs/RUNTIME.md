@@ -56,7 +56,7 @@ The PS3 uses 32-bit effective addresses despite having a 64-bit PPU. Games never
 host_ptr = vm_base + guest_addr
 ```
 
-On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without consuming physical memory. On POSIX, `mmap` with `MAP_NORESERVE | MAP_ANONYMOUS` does the same. Pages are committed on demand as regions are needed.
+`mmap` with `MAP_NORESERVE | MAP_ANONYMOUS` reserves the 4 GB range without consuming physical memory. Pages are committed on demand as regions are needed.
 
 ### Memory Map
 
@@ -89,9 +89,7 @@ On Windows, `VirtualAlloc` with `MEM_RESERVE` reserves the 4 GB range without co
 
 Reserves the 4 GB address space and commits the main memory (256 MB) and stack (256 MB) regions. Zeros main memory. Returns `CELL_OK` on success, `CELL_ENOMEM` on failure.
 
-**Platform behavior:**
-- **Windows**: `VirtualAlloc(NULL, 4GB, MEM_RESERVE, PAGE_NOACCESS)` then `VirtualAlloc(region, size, MEM_COMMIT, PAGE_READWRITE)` for each active region
-- **POSIX**: `mmap(NULL, 4GB, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)` then `mprotect(region, size, PROT_READ|PROT_WRITE)`
+**How it maps the range:** `mmap(NULL, 4GB, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)`, then `mprotect(region, size, PROT_READ|PROT_WRITE)` for each active region.
 
 #### `vm_shutdown()`
 
@@ -490,11 +488,9 @@ p += 1;                      // Advances by sizeof(u32) = 4 bytes in guest space
 
 The byte-swap primitives use compiler builtins for maximum performance:
 
-| Platform | 16-bit | 32-bit | 64-bit |
-|----------|--------|--------|--------|
-| **MSVC** | `_byteswap_ushort` | `_byteswap_ulong` | `_byteswap_uint64` |
-| **GCC/Clang** | `__builtin_bswap16` | `__builtin_bswap32` | `__builtin_bswap64` |
-| **Portable** | Shift/mask fallback | Shift/mask fallback | Shift/mask fallback |
+| 16-bit | 32-bit | 64-bit |
+|--------|--------|--------|
+| `__builtin_bswap16` | `__builtin_bswap32` | `__builtin_bswap64` |
 
 These compile to single instructions on x86 (`bswap`), ARM (`rev`), etc.
 

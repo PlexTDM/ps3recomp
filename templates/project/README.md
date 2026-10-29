@@ -38,7 +38,7 @@ the new files are picked up.
 |------|---------|
 | `main.cpp` | Boots the runtime and runs the ELF entry point. |
 | `stubs.cpp` | Where you add HLE bridges for functions the runtime does not implement yet. |
-| `CMakeLists.txt` | Links `ps3recomp_runtime`, compiles the per-game PPU scaffold from `runtime/ppu/`, and sets `/bigobj` for the large generated translation units. |
+| `CMakeLists.txt` | Links `ps3recomp_runtime`, compiles the per-game PPU scaffold from `runtime/ppu/`, and builds the large generated translation units. |
 | `config.toml` | Lifter/porting settings for the title. |
 
 ## Running
@@ -50,8 +50,9 @@ directory the guest filesystem should resolve against:
 ./build/MyGameRecomp path/to/EBOOT.elf [vfs-root]
 ```
 
-Graphics come up on Direct3D 12 on Windows and Metal on macOS with no extra
-configuration; see [docs/BUILDING.md](../../docs/BUILDING.md#graphics-backends).
+Graphics come up through the null backend's headless software path with no
+extra configuration; point the port at the Vulkan backend when you want a real
+one.
 
 ## Automatically discover and register SPU ELF programs
 

@@ -5,11 +5,7 @@
  * from each active port's buffer in guest memory, mixes them, and outputs
  * to the host audio device.
  *
- * Backend selection:
- *   - Windows default: WASAPI (via mmdeviceapi)
- *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
- *
- * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
+ * Host output goes through SDL2.
  */
 
 #include "../../runtime/memory/vm.h"   /* vm_commit */
@@ -34,75 +30,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
  * Backend selection
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
-#elif defined(_WIN32)
-  #define AUDIO_BACKEND_SDL2    0
-  #define AUDIO_BACKEND_WASAPI  1
-#else
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
-#endif
-
-#if AUDIO_BACKEND_WASAPI
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <windows.h>
-  #include <mmdeviceapi.h>
-  #include <audioclient.h>
-#include <avrt.h>
-#pragma comment(lib, "avrt.lib")
-#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
-#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM      0x80000000
-#endif
-#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
-#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
-#endif
-  #include <process.h>
-
-  /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
-  #ifdef __cplusplus
-    #define GUID_SECT
-  #else
-    #define GUID_SECT
-  #endif
-  #ifndef DEFINE_AUDIO_GUID
-    #ifdef INITGUID
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #else
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #endif
-  #endif
-  DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
-  DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
-  DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
-  DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
-
-  /* Map to the names used in the code */
-  #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
-  #define CLSID_MMDeviceEnumerator ps3r_CLSID_MMDeviceEnumerator
-  #define IID_IAudioClient         ps3r_IID_IAudioClient
-  #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
-#endif
-
-#if AUDIO_BACKEND_SDL2
-  #include <SDL2/SDL.h>
-#endif
+#include <SDL2/SDL.h>
 
 /* Portable threading */
-#ifdef _WIN32
-  #include <windows.h>
-  typedef HANDLE thread_t;
-  typedef CRITICAL_SECTION mutex_t;
-  #define mutex_init(m)    InitializeCriticalSection(m)
-  #define mutex_destroy(m) DeleteCriticalSection(m)
-  #define mutex_lock(m)    EnterCriticalSection(m)
-  #define mutex_unlock(m)  LeaveCriticalSection(m)
-#else
   #include <pthread.h>
   #include <unistd.h>
   #include <time.h>
@@ -112,7 +42,6 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #define mutex_destroy(m) pthread_mutex_destroy(m)
   #define mutex_lock(m)    pthread_mutex_lock(m)
   #define mutex_unlock(m)  pthread_mutex_unlock(m)
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -153,12 +82,9 @@ static u64            s_audio_start_us = 0;
 static unsigned long long g_audio_dropped;   /* frames the device had no room for */
 static volatile int  s_mix_thread_running = 0;
 static thread_t      s_mix_thread;
-#ifndef _WIN32
-/* Is s_mix_thread a thread that exists and has not been joined? The Win32
- * branch asks that of the HANDLE itself, which it nulls after closing;
- * pthread_t has no such value, so carry the flag. */
+/* Is s_mix_thread a thread that exists and has not been joined? pthread_t has
+ * no such value, so carry the flag. */
 static int           s_mix_thread_live = 0;
-#endif
 static mutex_t       s_audio_mutex;
 
 /* Output mix buffer (stereo, one block worth) */
@@ -174,8 +100,6 @@ volatile int g_audio_hold = 0;
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
-
-#if AUDIO_BACKEND_SDL2
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
 
@@ -246,182 +170,6 @@ static u32 audio_backend_queued_samples(void)
     return 0;
 }
 
-#endif /* AUDIO_BACKEND_SDL2 */
-
-#if AUDIO_BACKEND_WASAPI
-
-static IAudioClient*        s_wasapi_client = NULL;
-static IAudioRenderClient*  s_wasapi_render = NULL;
-static HANDLE               s_wasapi_event  = NULL;
-static UINT32               s_wasapi_buf_frames = 0;
-
-static int audio_backend_init(void)
-{
-    HRESULT hr;
-
-    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr) && hr != S_FALSE && hr != RPC_E_CHANGED_MODE) {
-        printf("[cellAudio] CoInitializeEx failed: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    IMMDeviceEnumerator* enumerator = NULL;
-    hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
-                          &IID_IMMDeviceEnumerator, (void**)&enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to create device enumerator: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    IMMDevice* device = NULL;
-    hr = enumerator->lpVtbl->GetDefaultAudioEndpoint(enumerator, eRender,
-                                                      eConsole, &device);
-    enumerator->lpVtbl->Release(enumerator);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get default audio endpoint: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    hr = device->lpVtbl->Activate(device, &IID_IAudioClient, CLSCTX_ALL,
-                                   NULL, (void**)&s_wasapi_client);
-    device->lpVtbl->Release(device);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to activate audio client: 0x%08lX\n", hr);
-        return -1;
-    }
-
-    WAVEFORMATEX wfx;
-    wfx.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-    wfx.nChannels       = 2;
-    wfx.nSamplesPerSec  = CELL_AUDIO_SAMPLE_RATE;
-    wfx.wBitsPerSample  = 32;
-    wfx.nBlockAlign     = wfx.nChannels * (wfx.wBitsPerSample / 8);
-    wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
-    wfx.cbSize          = 0;
-
-    /* Event-driven mode, with an AUDIO_BUF_MS buffer (default 40 ms). The
-     * mixer below keeps it nearly full, so this is how long a scheduling
-     * hiccup -- the mixer or the guest's audio thread held off the CPU --
-     * can last before the device runs dry. 20 ms stuttered on Drakengard 3
-     * under load; the PS3's own output path is several 5.33 ms blocks deep. */
-    long buf_ms = 40;
-    { const char* e = getenv("AUDIO_BUF_MS"); if (e && atol(e) > 0) buf_ms = atol(e); }
-    REFERENCE_TIME buf_duration = (REFERENCE_TIME)buf_ms * 10000; /* 100 ns units */
-    s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-
-    /* AUTOCONVERTPCM | SRC_DEFAULT_QUALITY: let the shared-mode mixer convert
-     * and resample. Without them Initialize answers
-     * AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008) on an endpoint whose mix
-     * format is not 48 kHz stereo float -- a 44.1 kHz or 7.1 device -- and
-     * the title ran silent. */
-    const DWORD convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-    hr = s_wasapi_client->lpVtbl->Initialize(
-        s_wasapi_client,
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convert,
-        buf_duration, 0, &wfx, NULL);
-
-    if (FAILED(hr)) {
-        /* Fallback: try without event callback */
-        hr = s_wasapi_client->lpVtbl->Initialize(
-            s_wasapi_client,
-            AUDCLNT_SHAREMODE_SHARED,
-            convert, buf_duration, 0, &wfx, NULL);
-        if (FAILED(hr)) {
-            printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-            s_wasapi_client = NULL;
-            CloseHandle(s_wasapi_event);
-            s_wasapi_event = NULL;
-            return -1;
-        }
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
-    } else {
-        s_wasapi_client->lpVtbl->SetEventHandle(s_wasapi_client, s_wasapi_event);
-    }
-
-    s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
-
-    hr = s_wasapi_client->lpVtbl->GetService(
-        s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
-    if (FAILED(hr)) {
-        printf("[cellAudio] Failed to get render client: 0x%08lX\n", hr);
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
-        return -1;
-    }
-
-    s_wasapi_client->lpVtbl->Start(s_wasapi_client);
-    return 0;
-}
-
-static void audio_backend_shutdown(void)
-{
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Stop(s_wasapi_client);
-    }
-    if (s_wasapi_render) {
-        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
-        s_wasapi_render = NULL;
-    }
-    if (s_wasapi_client) {
-        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
-        s_wasapi_client = NULL;
-    }
-    if (s_wasapi_event) {
-        CloseHandle(s_wasapi_event);
-        s_wasapi_event = NULL;
-    }
-}
-
-static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
-{
-    if (!s_wasapi_render) return;
-
-    UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
-
-    UINT32 available = s_wasapi_buf_frames - padding;
-    if (num_samples > available) {
-        g_audio_dropped += num_samples - available;
-        num_samples = available;
-    }
-    if (num_samples == 0) return;
-
-    BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
-    if (SUCCEEDED(hr) && buf) {
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
-    }
-}
-
-/* Frames the device can take right now; -1 with no device open. */
-static int audio_backend_room(void)
-{
-    if (!s_wasapi_client) return -1;
-    UINT32 padding = 0;
-    const HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
-    if (FAILED(hr)) {
-        /* Device gone (AUDCLNT_E_DEVICE_INVALIDATED on a default-device
-         * change, sleep, ...): pace on the clock rather than spin. */
-        static int _n = 0; if (_n < 4 && ++_n)
-            fprintf(stderr, "[cellAudio] GetCurrentPadding failed 0x%08lX -- clock pacing%c", (unsigned long)hr, 10);
-        return -1;
-    }
-    return (int)(s_wasapi_buf_frames - padding);
-}
-
-/* Block until the device has consumed some of its buffer. */
-static void audio_backend_wait(void)
-{
-    if (s_wasapi_event) WaitForSingleObject(s_wasapi_event, 10);
-    else Sleep(1);
-}
-
-
-#endif /* AUDIO_BACKEND_WASAPI */
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -654,127 +402,12 @@ static void audio_notify_event_queues(void)
     }
 }
 
-#ifdef _WIN32
-static unsigned __stdcall audio_mix_thread_func(void* arg)
-{
-    (void)arg;
-    /* The mixer is what keeps the device fed: MMCSS "Pro Audio" puts it in
-     * the scheduler class Windows reserves for audio engines, ahead of every
-     * normal and high-priority thread of the game. AUDIO_MMCSS=0 turns it
-     * off; without avrt (or if it refuses) the thread is TIME_CRITICAL. */
-    { const char* e = getenv("AUDIO_MMCSS");
-      DWORD task_index = 0;
-      HANDLE mm = (e && e[0] == '0') ? NULL : AvSetMmThreadCharacteristicsW(L"Pro Audio", &task_index);
-      if (mm) AvSetMmThreadPriority(mm, AVRT_PRIORITY_HIGH);
-      else SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-      SetThreadDescription(GetCurrentThread(), L"cellAudio mixer");
-      printf("[cellAudio] Mixing thread started (%s)\n", mm ? "MMCSS Pro Audio" : "TIME_CRITICAL"); }
-
-    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
-     * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
-     * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
-     * dropped the surplus: 20% of the audio thrown away, and a guest mixer
-     * (GH3's FMOD) that could not keep ahead of the read index played gaps.
-     * With no device, pace on the performance counter instead. */
-    /* One block every 5.33 ms by the clock, as the hardware delivers them.
-     *
-     * Pacing on device room alone mixed in BURSTS: WASAPI drains its buffer
-     * a 10 ms period at a time, so two blocks' worth of room opened at once
-     * and two blocks went out back to back, each with a notify. The title's
-     * notify queue is one event deep (it expects one interrupt per block),
-     * the second event was lost, it wrote one block for the two consumed,
-     * and one block in every seven or eight played as silence: 13% of
-     * Drakengard 3's battle audio missing, a regular crackle, while the Mac
-     * (SDL, one block per callback) was clean. The device buffer is now only
-     * a safety valve: full means our clock runs ahead of the DAC's, so the
-     * schedule slips a block; nearly empty means it runs behind, so the
-     * schedule gains one. */
-    LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
-    unsigned long long blocks = 0;
-    const long long period = (long long)CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE;
-    HANDLE pace_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-    while (s_mix_thread_running) {
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
-        const long long due = q0.QuadPart + (long long)blocks * period;
-        if (now.QuadPart < due) {
-            const long long wait_us = (due - now.QuadPart) * 1000000LL / qf.QuadPart;
-            if (wait_us > 1200 && pace_timer) {
-                LARGE_INTEGER rel; rel.QuadPart = -(wait_us - 400) * 10;   /* leave the tail to the spin */
-                SetWaitableTimer(pace_timer, &rel, 0, NULL, NULL, FALSE);
-                WaitForSingleObject(pace_timer, 5);
-            } else {
-                SwitchToThread();
-            }
-            continue;
-        }
-        /* More than 50 ms behind (a debugger stop, the device going away):
-         * drop the backlog instead of mixing it in a burst. */
-        if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart = now.QuadPart - (long long)blocks * period;
-        const int room = audio_backend_room();
-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { q0.QuadPart += period; continue; }   /* DAC slower: slip */
-        if (room >= 0 && (UINT32)room >= s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES && blocks > 8)
-            q0.QuadPart -= period;                                                                /* DAC faster: gain */
-        blocks++;
-        if (g_audio_hold == 2) {
-            memset(s_mix_buffer, 0, sizeof s_mix_buffer);
-            audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-            continue;
-        }
-        /* Mix and submit one block */
-        audio_mix_one_block();
-        if (g_audio_hold) memset(s_mix_buffer, 0, sizeof s_mix_buffer);
-        /* AUDIO_PEAK=1: report the mixed block's peak amplitude periodically so
-         * "is any port producing sound" is answerable (LBP Bink movie audio). */
-        { static int _ap = -1; if (_ap < 0) _ap = getenv("AUDIO_PEAK") ? 1 : 0;
-          if (_ap) { static unsigned _n = 0; float pk = 0.0f;
-            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-                float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
-            if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
-                fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
-         * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-        { static FILE* _wf = (FILE*)-1;
-          if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
-          if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
-        { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
-          if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0;
-            ULONGLONG now = GetTickCount64(); if (!t0) t0 = now; n++;
-            { int nz = 0; for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) if (s_mix_buffer[i] != 0.0f) { nz = 1; break; }
-              if (!nz) z++; }
-            if (now - t0 >= 5000) {
-                static unsigned long long g0, gb0;
-                fprintf(stderr, "[audio-rate] gaps %llu (%llu blocks, %.1f%% of the window); ",
-                        g_audio_gaps - g0, g_audio_gap_blocks - gb0, n ? 100.0 * (g_audio_gap_blocks - gb0) / n : 0.0);
-                g0 = g_audio_gaps; gb0 = g_audio_gap_blocks;
-                fprintf(stderr, "%.1f blocks/s (real time 187.5), silent %.1f%%, dropped %.0f frames/s, device buf %u%c",
-                        n * 1000.0 / (now - t0), n ? 100.0 * z / n : 0.0, (g_audio_dropped - d0) * 1000.0 / (now - t0),
-                #if AUDIO_BACKEND_WASAPI
-                        (unsigned)s_wasapi_buf_frames, 10);
-#else
-                        0u, 10);
-#endif
-                n = z = 0; d0 = g_audio_dropped; t0 = now; } } }
-
-        /* Notify event queues */
-        audio_notify_event_queues();
-    }
-
-    printf("[cellAudio] Mixing thread stopped\n");
-    return 0;
-}
-#else
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
-#ifdef __APPLE__
-    /* The mixer is what keeps the device fed: let the scheduler treat it so. */
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
 
-    /* Pace to the device, as the Windows loop does. This used to mix a block
+    /* Pace to the device. This used to mix a block
      * and then sleep a flat 2 ms (5 ms once four blocks were queued): faster
      * than the 5.33 ms a block lasts, so the mixer ran ahead of real time and
      * read the guest's port ring before the guest had written the block --
@@ -804,7 +437,7 @@ static void* audio_mix_thread_func(void* arg)
             if (el - due > 0.05) t0 = now, blocks = 0;   /* far behind: drop the backlog */
         }
         blocks++;
-        if (g_audio_hold == 2) {   /* paused: as the Windows loop */
+        if (g_audio_hold == 2) {   /* paused */
             memset(s_mix_buffer, 0, sizeof s_mix_buffer);
             audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
             continue;
@@ -833,39 +466,22 @@ static void* audio_mix_thread_func(void* arg)
     printf("[cellAudio] Mixing thread stopped\n");
     return NULL;
 }
-#endif
 
 static int audio_start_mix_thread(void)
 {
     s_mix_thread_running = 1;
 
-#ifdef _WIN32
-    s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
-                                           NULL, 0, NULL);
-    if (!s_mix_thread) {
-        s_mix_thread_running = 0;
-        return -1;
-    }
-#else
     if (pthread_create(&s_mix_thread, NULL, audio_mix_thread_func, NULL) != 0) {
         s_mix_thread_running = 0;
         return -1;
     }
     s_mix_thread_live = 1;
-#endif
     return 0;
 }
 
 static void audio_stop_mix_thread(void)
 {
     s_mix_thread_running = 0;
-#ifdef _WIN32
-    if (s_mix_thread) {
-        WaitForSingleObject(s_mix_thread, 2000);
-        CloseHandle(s_mix_thread);
-        s_mix_thread = NULL;
-    }
-#else
     /* Same guard. Init leaves s_audio_initialized set even when the mixing
      * thread failed to start ("continuing silently" -- a title without audio
      * still runs), so Quit reaches here with s_mix_thread never assigned.
@@ -876,7 +492,6 @@ static void audio_stop_mix_thread(void)
         pthread_join(s_mix_thread, NULL);
         s_mix_thread_live = 0;
     }
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -908,15 +523,8 @@ s32 cellAudioInit(void)
     }
 
 
-#ifdef _WIN32
-    { LARGE_INTEGER f, c;
-      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
-          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
-#else
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
       s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
-#endif
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }

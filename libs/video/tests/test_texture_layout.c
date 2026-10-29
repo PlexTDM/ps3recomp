@@ -149,7 +149,7 @@ static void test_unknown_format_degrades(void)
     CHECK_EQ(L.face_bytes, 64u * 64u);
 }
 
-/* --- the formats added for the Metal backend ---------------------------- */
+/* --- packed 16-bit formats ---------------------------------------------- */
 
 /* Source and destination row sizes are tracked separately because a packed
  * 16-bit texel is two bytes in guest memory and four after the decode. */
@@ -592,11 +592,10 @@ static void test_remap_identity(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(z[i], m[i]);
 }
 
-/* Packed the way D3D12 wants it, the identity must equal
- * D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (0x1688). That constant is not
- * available here, so it is spelled out -- it is what makes this assertion
- * meaningful rather than self-referential. */
-static void test_remap_identity_packs_to_d3d_default(void)
+/* Packed three bits per channel, the identity must equal 0x1688, the default
+ * four-component shader mapping. It is spelled out -- that is what makes this
+ * assertion meaningful rather than self-referential. */
+static void test_remap_identity_packs_to_default(void)
 {
     u8 m[4];
     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, m);
@@ -717,7 +716,7 @@ int main(void)
     test_decode_compressed_is_verbatim();
     test_decode_rejects_nonsense();
     test_remap_identity();
-    test_remap_identity_packs_to_d3d_default();
+    test_remap_identity_packs_to_default();
     test_remap_b8_lanes();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();

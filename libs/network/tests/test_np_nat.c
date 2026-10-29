@@ -11,12 +11,8 @@
 #include "../np_psnr.c"
 
 #include <assert.h>
-#ifdef _WIN32
-#  define sleep_ms(n) Sleep(n)
-#else
 #  include <unistd.h>
 #  define sleep_ms(n) usleep((n) * 1000)
-#endif
 
 const char* np_fake_username(void) { return "PS3Player"; }
 

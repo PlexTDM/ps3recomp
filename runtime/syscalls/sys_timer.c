@@ -25,34 +25,6 @@
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
-#ifdef _WIN32
-static LARGE_INTEGER s_qpc_freq;
-static int           s_qpc_init = 0;
-
-static void ensure_qpc_init(void)
-{
-    if (!s_qpc_init) {
-        QueryPerformanceFrequency(&s_qpc_freq);
-        s_qpc_init = 1;
-    }
-}
-
-int64_t lv2_usec_deadline(uint64_t usec)
-{
-    LARGE_INTEGER now;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&now);
-    return now.QuadPart +
-        (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-}
-
-int lv2_deadline_passed(int64_t deadline)
-{
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    return now.QuadPart >= deadline;
-}
-#endif
 
 /* ---------------------------------------------------------------------------
  * PPU timebase (mftb/mftbu) -- THE guest clock.
@@ -67,23 +39,11 @@ int lv2_deadline_passed(int64_t deadline)
  * -----------------------------------------------------------------------*/
 uint64_t ppu_timebase_now(void)
 {
-#ifdef _WIN32
-    static LONGLONG t0 = 0;
-    ensure_qpc_init();
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (!t0) t0 = now.QuadPart;   /* benign race: same anchor either way */
-    const int64_t g = ps3_guest_ticks(now.QuadPart);
-    uint64_t d = g > t0 ? (uint64_t)(g - t0) : 0;
-    uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
-    return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const uint64_t ns = (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);
     return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
            (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
-#endif
 }
 
 /* Guest time = host time - the time spent paused, held at s_guest_hold while
@@ -102,16 +62,9 @@ int64_t ps3_guest_ticks(int64_t host)
 
 void ps3_guest_clock_pause(int paused)
 {
-#ifdef _WIN32
-    LARGE_INTEGER c;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&c);
-    const int64_t now = c.QuadPart, ms = s_qpc_freq.QuadPart / 1000;
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     const int64_t now = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec, ms = 1000000;
-#endif
     const int64_t hold = __atomic_load_n(&s_guest_hold, __ATOMIC_ACQUIRE);
     if (paused && hold == INT64_MAX) {
         /* A millisecond on: a reader that took its host time just before this
@@ -126,7 +79,7 @@ void ps3_guest_clock_pause(int paused)
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 24) & 0xFF) | ((val >> 8) & 0xFF00) |
           ((val <<  8) & 0xFF0000) | ((val << 24) & 0xFF000000u);
 #endif
@@ -136,7 +89,7 @@ static void write_be32(uint32_t addr, uint32_t val)
 static void write_be64(uint32_t addr, uint64_t val)
 {
     uint64_t* p = (uint64_t*)vm_to_host(addr);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     val = ((val >> 56) & 0xFFULL) |
           ((val >> 40) & 0xFF00ULL) |
           ((val >> 24) & 0xFF0000ULL) |
@@ -299,98 +252,12 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         extern void ppu_log_host_chain(const char*);
         ppu_log_host_chain("usleep1ms"); } }
 
-#ifdef _WIN32
-    /* A high-resolution waitable timer, one per thread and kept: a plain
-     * waitable timer rounds to the scheduler's clock interval (1 ms with
-     * timeBeginPeriod(1), 15.6 ms otherwise, and since Windows 10 2004 the
-     * 1 ms is per process and not always honoured), so a guest audio or
-     * render loop's usleep(1000) could take 2-16 ms. The HIGH_RESOLUTION
-     * flag (Windows 10 1803+) fires within ~0.5 ms regardless; where the
-     * flag is unknown the plain timer is the fallback. Creating and closing
-     * a kernel object per call was also measurable at this title's rate. */
-    if (usec >= 1000) {
-        static __declspec(thread) HANDLE timer = NULL;
-        if (!timer) {
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-            if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
-        }
-        if (timer) {
-            /* PS3_USLEEP_LOG=<ms>: a sleep that asked for, or took, more than
-             * that, with its caller and the frame -- whether a long frame was
-             * the guest asking to sleep or the sleep running over. */
-            static long ul = -1;
-            if (ul < 0) { const char* e = getenv("PS3_USLEEP_LOG"); ul = e ? atol(e) : 0; }
-            LARGE_INTEGER uq0, uq1, uqf;
-            if (ul > 0) { QueryPerformanceFrequency(&uqf); QueryPerformanceCounter(&uq0); }
-            LARGE_INTEGER due;
-            due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
-            SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
-            WaitForSingleObject(timer, INFINITE);
-            if (ul > 0) {
-                QueryPerformanceCounter(&uq1);
-                const double took = (double)(uq1.QuadPart - uq0.QuadPart) * 1000.0 / (double)uqf.QuadPart;
-                if (usec > (uint64_t)ul * 1000u || took > (double)ul) {
-                    extern uint32_t g_rsx_engine_frame;
-                    fprintf(stderr, "[usleep] frame %u tid %u lr=0x%08X asked %.2f ms, slept %.2f ms\n",
-                            g_rsx_engine_frame, (unsigned)ctx->thread_id, (uint32_t)ctx->lr, usec / 1000.0, took);
-                }
-            }
-        } else {
-            Sleep((DWORD)(usec / 1000));
-        }
-    } else if (usec > 0 && usec >= (uint64_t)g_usleep_spin_below) {
-        /* 0.5-1 ms: on the thread's high-resolution timer for all but the
-         * last 250 us, spinning only those. The audio system loop's 800 us
-         * polls spun two thirds of a core for their whole length, a core a
-         * 6-core machine's game, render and RSX threads need. Below
-         * g_usleep_spin_below (DOD3_AB=usleepspin sets it past 1000, the old
-         * all-spin behaviour) the spin below as before. */
-        ensure_qpc_init();
-        LARGE_INTEGER q0, qn;
-        QueryPerformanceCounter(&q0);
-        const int64_t deadline = q0.QuadPart + (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        static __declspec(thread) HANDLE hr = NULL;
-        if (!hr) hr = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (hr) {
-            LARGE_INTEGER due;
-            due.QuadPart = -((LONGLONG)(usec - 250) * 10);
-            SetWaitableTimer(hr, &due, 0, NULL, NULL, FALSE);
-            WaitForSingleObject(hr, INFINITE);
-        }
-        do {
-            SwitchToThread();
-            QueryPerformanceCounter(&qn);
-        } while (qn.QuadPart < deadline);
-    } else if (usec > 0) {
-        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
-         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
-         * on accurate microsecond pacing -- a short usleep() spin waiting on
-         * another thread to make progress otherwise collapses to a single yield
-         * and busy-spins at full speed (so the wait is effectively a no-op).
-         * Busy-wait to a precise QPC deadline, yielding inside the spin
-         * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
-        ensure_qpc_init();
-        LARGE_INTEGER qpc_start, qpc_now;
-        QueryPerformanceCounter(&qpc_start);
-        const int64_t qpc_deadline = qpc_start.QuadPart +
-            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        do {
-            SwitchToThread();
-            QueryPerformanceCounter(&qpc_now);
-        } while (qpc_now.QuadPart < qpc_deadline);
-    }
-#else
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);
         ts.tv_nsec = (long)((usec % 1000000) * 1000);
         nanosleep(&ts, NULL);
     }
-#endif
 
     return CELL_OK;
 }
@@ -404,11 +271,7 @@ int64_t sys_timer_sleep(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
 
-#ifdef _WIN32
-    Sleep(sec * 1000);
-#else
     sleep(sec);
-#endif
 
     return CELL_OK;
 }
@@ -432,37 +295,6 @@ int64_t sys_timer_sleep(ppu_context* ctx)
  * PS3_TIME_LOG=1: the first answer of this call and of sys_time_get_timezone,
  * once each.
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
-static void wall_clock_now(uint64_t* sec, uint64_t* nsec)
-{
-    static volatile LONG s_lock = 0;
-    static volatile LONG s_have = 0;
-    static int64_t  s_base_ticks;
-    static uint64_t s_base_100ns;      /* 100 ns units since 1970 */
-    LARGE_INTEGER now;
-    ensure_qpc_init();
-    QueryPerformanceCounter(&now);
-    const int64_t g = ps3_guest_ticks(now.QuadPart);
-    if (!s_have) {
-        FILETIME ft;
-        ULARGE_INTEGER u;
-        GetSystemTimePreciseAsFileTime(&ft);
-        u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
-        while (InterlockedCompareExchange(&s_lock, 1, 0) != 0) YieldProcessor();
-        if (!s_have) {
-            s_base_100ns = u.QuadPart - 116444736000000000ULL;   /* 1601 -> 1970 */
-            s_base_ticks = g;
-            InterlockedExchange(&s_have, 1);
-        }
-        InterlockedExchange(&s_lock, 0);
-    }
-    const int64_t d = g - s_base_ticks;
-    const uint64_t el = d > 0 ? (uint64_t)d : 0, q = (uint64_t)s_qpc_freq.QuadPart;
-    const uint64_t t = s_base_100ns + (el / q) * 10000000ULL + ((el % q) * 10000000ULL) / q;
-    *sec = t / 10000000ULL;
-    *nsec = (t % 10000000ULL) * 100ULL;
-}
-#endif
 
 /* LV2 144: r3/r4 point to signed BE32 minute offsets. The first is the
  * standard UTC offset; the second is the current seasonal adjustment.
@@ -477,14 +309,6 @@ int64_t sys_time_get_timezone(ppu_context* ctx)
     time_t now = time(NULL);
     struct tm local;
     int32_t standard_minutes, daylight_minutes;
-#ifdef _WIN32
-    _tzset();
-    long west_seconds, daylight_bias;
-    if (localtime_s(&local, &now) || _get_timezone(&west_seconds) || _get_dstbias(&daylight_bias))
-        return (int32_t)CELL_EAGAIN;
-    standard_minutes = (int32_t)(-west_seconds / 60);
-    daylight_minutes = local.tm_isdst > 0 ? (int32_t)(-daylight_bias / 60) : 0;
-#else
     if (!localtime_r(&now, &local)) return (int32_t)CELL_EAGAIN;
     daylight_minutes = 0;
     if (local.tm_isdst > 0) {
@@ -495,7 +319,6 @@ int64_t sys_time_get_timezone(ppu_context* ctx)
         daylight_minutes = (int32_t)(difftime(standard_epoch, now) / 60);
     }
     standard_minutes = (int32_t)(local.tm_gmtoff / 60) - daylight_minutes;
-#endif
     write_be32(zone_addr, (uint32_t)standard_minutes);
     write_be32(dst_addr, (uint32_t)daylight_minutes);
     { static int said = 0;
@@ -512,14 +335,10 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
 
     uint64_t sec, nsec;
 
-#ifdef _WIN32
-    wall_clock_now(&sec, &nsec);
-#else
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     sec  = (uint64_t)ts.tv_sec;
     nsec = (uint64_t)ts.tv_nsec;
-#endif
 
     if (sec_addr != 0) {
         write_be64(sec_addr, sec);
@@ -531,11 +350,7 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
       if (!said && (said = 1) && getenv("PS3_TIME_LOG")) {
           const time_t t = (time_t)sec;
           struct tm u;
-#ifdef _WIN32
-          gmtime_s(&u, &t);
-#else
           gmtime_r(&t, &u);
-#endif
           fprintf(stderr, "[SYS] sys_time_get_current_time: %llu s since 1970 (%04d-%02d-%02d %02d:%02d:%02d UTC)\n",
                   (unsigned long long)sec, u.tm_year + 1900, u.tm_mon + 1, u.tm_mday, u.tm_hour, u.tm_min, u.tm_sec);
       } }
@@ -561,28 +376,6 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
-#ifdef _WIN32
-static DWORD WINAPI timer_thread_proc(LPVOID param)
-{
-    sys_timer_info* t = (sys_timer_info*)param;
-
-    while (t->running) {
-        DWORD ms = (DWORD)(t->period_usec / 1000);
-        if (ms == 0) ms = 1;
-
-        DWORD result = WaitForSingleObject(t->stop_event, ms);
-        if (result == WAIT_OBJECT_0) {
-            break; /* stop signaled */
-        }
-
-        if (t->running) {
-            timer_send_event(t);
-        }
-    }
-
-    return 0;
-}
-#else
 static void* timer_thread_proc(void* param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
@@ -611,7 +404,6 @@ static void* timer_thread_proc(void* param)
 
     return NULL;
 }
-#endif
 
 static void timer_send_event(sys_timer_info* t)
 {
@@ -629,28 +421,16 @@ static void timer_send_event(sys_timer_info* t)
     evt.data3  = 0;
 
     /* Push event (ignore if queue full) */
-#ifdef _WIN32
-    EnterCriticalSection(&q->lock);
-#else
     pthread_mutex_lock(&q->lock);
-#endif
 
     if (q->count < q->capacity) {
         q->buffer[q->tail] = evt;
         q->tail = (q->tail + 1) % q->capacity;
         q->count++;
-#ifdef _WIN32
-        WakeConditionVariable(&q->not_empty);
-#else
         pthread_cond_signal(&q->not_empty);
-#endif
     }
 
-#ifdef _WIN32
-    LeaveCriticalSection(&q->lock);
-#else
     pthread_mutex_unlock(&q->lock);
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -675,15 +455,9 @@ int64_t sys_timer_create(ppu_context* ctx)
     t->running = 0;
     t->event_queue_id = 0;
 
-#ifdef _WIN32
-    t->stop_event    = NULL;
-    t->thread_handle = NULL;
-    t->timer_handle  = NULL;
-#else
     pthread_mutex_init(&t->mtx, NULL);
     pthread_cond_init(&t->cv, NULL);
     t->stop_flag = 0;
-#endif
 
     uint32_t timer_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -712,14 +486,6 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     /* Stop if running */
     if (t->running) {
         t->running = 0;
-#ifdef _WIN32
-        if (t->stop_event) SetEvent(t->stop_event);
-        if (t->thread_handle) {
-            WaitForSingleObject(t->thread_handle, 3000);
-            CloseHandle(t->thread_handle);
-        }
-        if (t->stop_event) CloseHandle(t->stop_event);
-#else
         pthread_mutex_lock(&t->mtx);
         t->stop_flag = 1;
         pthread_cond_signal(&t->cv);
@@ -727,7 +493,6 @@ int64_t sys_timer_destroy(ppu_context* ctx)
         pthread_join(t->thread, NULL);
         pthread_mutex_destroy(&t->mtx);
         pthread_cond_destroy(&t->cv);
-#endif
     }
 
     t->active = 0;
@@ -815,13 +580,8 @@ int64_t sys_timer_start(ppu_context* ctx)
     t->period_usec = period;
     t->running     = 1;
 
-#ifdef _WIN32
-    t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);
-    t->thread_handle = CreateThread(NULL, 0, timer_thread_proc, t, 0, NULL);
-#else
     t->stop_flag = 0;
     pthread_create(&t->thread, NULL, timer_thread_proc, t);
-#endif
 
     return CELL_OK;
 }
@@ -847,24 +607,11 @@ int64_t sys_timer_stop(ppu_context* ctx)
 
     t->running = 0;
 
-#ifdef _WIN32
-    if (t->stop_event) SetEvent(t->stop_event);
-    if (t->thread_handle) {
-        WaitForSingleObject(t->thread_handle, 3000);
-        CloseHandle(t->thread_handle);
-        t->thread_handle = NULL;
-    }
-    if (t->stop_event) {
-        CloseHandle(t->stop_event);
-        t->stop_event = NULL;
-    }
-#else
     pthread_mutex_lock(&t->mtx);
     t->stop_flag = 1;
     pthread_cond_signal(&t->cv);
     pthread_mutex_unlock(&t->mtx);
     pthread_join(t->thread, NULL);
-#endif
 
     return CELL_OK;
 }
@@ -876,9 +623,6 @@ void sys_timer_init(lv2_syscall_table* tbl)
 {
     memset(g_sys_timers, 0, sizeof(g_sys_timers));
 
-#ifdef _WIN32
-    ensure_qpc_init();
-#endif
 
     lv2_syscall_register(tbl, SYS_TIMER_CREATE,                   sys_timer_create);
     lv2_syscall_register(tbl, SYS_TIMER_DESTROY,                  sys_timer_destroy);

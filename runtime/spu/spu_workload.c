@@ -12,9 +12,6 @@
 #define _GNU_SOURCE 1
 #endif
 #include "spu_workload.h"
-#if defined(__APPLE__)
-#include <pthread/qos.h>
-#endif
 #include "spu_lifted_job.h"   /* spu_run_lifted_job */
 #include "../ps3_log.h"      /* ps3_log_verbose */
 #include <stdio.h>
@@ -25,13 +22,9 @@
  * answer from the pointer-keyed cache (ps3emu/env_cache.h). */
 #include "ps3emu/env_cache.h"
 #define getenv(name) ps3_env(name)
-#ifdef _WIN32
-#include <windows.h>
-#else
 #include <pthread.h>
 #include <errno.h>
 #include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
-#endif
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
  * real video-payload GET (>256B from a non-context EA) = it actually decoded,
@@ -73,29 +66,14 @@ uint64_t spu_workload_fingerprint(const void* data, size_t n)
  * thread so no lock is needed; 32 quadwords spread over the image are
  * re-checked on every hit, so a different blob loaded at the same address
  * still gets hashed in full. */
-#if defined(_MSC_VER)
-#  define SPU_WL_TLS __declspec(thread)
-#else
 #  define SPU_WL_TLS __thread
-#endif
 
-#ifdef _WIN32
-#include <windows.h>
-static uint64_t spu_wl_now_ns(void)
-{
-    static LARGE_INTEGER f; LARGE_INTEGER c;
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&c);
-    return (uint64_t)((double)c.QuadPart * 1e9 / (double)f.QuadPart);
-}
-#else
 #include <time.h>
 static uint64_t spu_wl_now_ns(void)
 {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
-#endif
 static uint64_t spu_workload_fingerprint_cached(const uint8_t* image, uint32_t n)
 {
     typedef struct { const uint8_t* image; uint32_t size; uint64_t fp;
@@ -405,11 +383,7 @@ static struct {
     long next_ticket, now_serving;
     int  limit;                 /* tasks running at once; 0 = any number (start order only) */
     int  running;
-#ifdef _WIN32
-    CRITICAL_SECTION m; CONDITION_VARIABLE cv;
-#else
     pthread_mutex_t m; pthread_cond_t cv;
-#endif
 } s_serial_ts[SERIAL_TS_MAX];
 static int s_serial_ts_n;
 
@@ -443,13 +417,8 @@ static int serial_ts_add(uint32_t taskset_ea, int limit)
     s_serial_ts[s_serial_ts_n].limit = limit;
     s_serial_ts[s_serial_ts_n].running = 0;
     s_serial_ts[s_serial_ts_n].next_ticket = s_serial_ts[s_serial_ts_n].now_serving = 0;
-#ifdef _WIN32
-    InitializeCriticalSection(&s_serial_ts[s_serial_ts_n].m);
-    InitializeConditionVariable(&s_serial_ts[s_serial_ts_n].cv);
-#else
     pthread_mutex_init(&s_serial_ts[s_serial_ts_n].m, NULL);
     pthread_cond_init(&s_serial_ts[s_serial_ts_n].cv, NULL);
-#endif
     return s_serial_ts_n++;
 }
 
@@ -474,11 +443,7 @@ static long serial_ts_take_ticket(uint32_t ea)
     int i = serial_ts_find_or_add(ea);
     if (i < 0) return -1;
     long t;
-#ifdef _WIN32
-    EnterCriticalSection(&s_serial_ts[i].m); t = s_serial_ts[i].next_ticket++; LeaveCriticalSection(&s_serial_ts[i].m);
-#else
     pthread_mutex_lock(&s_serial_ts[i].m); t = s_serial_ts[i].next_ticket++; pthread_mutex_unlock(&s_serial_ts[i].m);
-#endif
     return t;
 }
 
@@ -490,17 +455,6 @@ static int serial_ts_wait_turn(uint32_t ea, long ticket)
     int i = serial_ts_find(ea);
     if (i < 0 || ticket < 0) return 0;
     int took;
-#ifdef _WIN32
-    EnterCriticalSection(&s_serial_ts[i].m);
-    while (s_serial_ts[i].now_serving != ticket ||
-           (s_serial_ts[i].limit && s_serial_ts[i].running >= s_serial_ts[i].limit))
-        SleepConditionVariableCS(&s_serial_ts[i].cv, &s_serial_ts[i].m, INFINITE);
-    took = s_serial_ts[i].limit != 0;
-    s_serial_ts[i].running += took;
-    s_serial_ts[i].now_serving = ticket + 1;
-    WakeAllConditionVariable(&s_serial_ts[i].cv);
-    LeaveCriticalSection(&s_serial_ts[i].m);
-#else
     pthread_mutex_lock(&s_serial_ts[i].m);
     while (s_serial_ts[i].now_serving != ticket ||
            (s_serial_ts[i].limit && s_serial_ts[i].running >= s_serial_ts[i].limit))
@@ -510,7 +464,6 @@ static int serial_ts_wait_turn(uint32_t ea, long ticket)
     s_serial_ts[i].now_serving = ticket + 1;
     pthread_cond_broadcast(&s_serial_ts[i].cv);
     pthread_mutex_unlock(&s_serial_ts[i].m);
-#endif
     return took;
 }
 
@@ -518,11 +471,7 @@ static void serial_ts_done_turn(uint32_t ea, int took)
 {
     int i = serial_ts_find(ea);
     if (i < 0 || !took) return;
-#ifdef _WIN32
-    EnterCriticalSection(&s_serial_ts[i].m); s_serial_ts[i].running--; WakeAllConditionVariable(&s_serial_ts[i].cv); LeaveCriticalSection(&s_serial_ts[i].m);
-#else
     pthread_mutex_lock(&s_serial_ts[i].m); s_serial_ts[i].running--; pthread_cond_broadcast(&s_serial_ts[i].cv); pthread_mutex_unlock(&s_serial_ts[i].m);
-#endif
 }
 
 /* ---- Persistent per-taskset local store (LBP_PERSIST_LS) ------------------
@@ -550,20 +499,12 @@ typedef struct {
                             * DMA-polled a NULL control EA for the whole run. */
     uint8_t* ls;           /* persistent LS (NULL until first task loads it) */
     int      loaded;       /* image loaded into ls */
-#ifdef _WIN32
-    SRWLOCK  lock;         /* serializes re-dispatches of this ONE task */
-#else
     pthread_mutex_t lock;
-#endif
 } spu_ts_ls_slot;
 
 #define SPU_TS_LS_MAX 24
 static spu_ts_ls_slot s_ts_ls[SPU_TS_LS_MAX];
-#ifdef _WIN32
-static SRWLOCK s_ts_ls_dir = SRWLOCK_INIT;
-#else
 static pthread_mutex_t s_ts_ls_dir = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 static int spu_persist_ls_enabled(void)
 { static int _p = -1; if (_p < 0) _p = getenv("LBP_PERSIST_LS") ? 1 : 0; return _p; }
@@ -580,26 +521,16 @@ static int spu_persist_ls_enabled(void)
  * task drains and releases. Opt-in; default keeps concurrent per-thread SPU. */
 static int spu_serial_enabled(void)
 { static int _s = -1; if (_s < 0) _s = getenv("LBP_SPU_SERIAL") ? 1 : 0; return _s; }
-#ifdef _WIN32
-static SRWLOCK s_spu_serial = SRWLOCK_INIT;
-void spu_serial_acquire(void){ if (spu_serial_enabled()) AcquireSRWLockExclusive(&s_spu_serial); }
-void spu_serial_release(void){ if (spu_serial_enabled()) ReleaseSRWLockExclusive(&s_spu_serial); }
-#else
 static pthread_mutex_t s_spu_serial = PTHREAD_MUTEX_INITIALIZER;
 void spu_serial_acquire(void){ if (spu_serial_enabled()) pthread_mutex_lock(&s_spu_serial); }
 void spu_serial_release(void){ if (spu_serial_enabled()) pthread_mutex_unlock(&s_spu_serial); }
-#endif
 
 /* Find-or-create the slot for a (taskset, task) pair (directory lock held
  * briefly). Per-task keying is load-bearing: see spu_ts_ls_slot.taskid. */
 static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
 {
     spu_ts_ls_slot* slot = NULL;
-#ifdef _WIN32
-    AcquireSRWLockExclusive(&s_ts_ls_dir);
-#else
     pthread_mutex_lock(&s_ts_ls_dir);
-#endif
     for (int i = 0; i < SPU_TS_LS_MAX && !slot; i++)
         if (s_ts_ls[i].taskset_ea == taskset_ea && s_ts_ls[i].taskid == taskid)
             slot = &s_ts_ls[i];
@@ -607,18 +538,10 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
         if (s_ts_ls[i].taskset_ea == 0) {
             s_ts_ls[i].taskset_ea = taskset_ea;
             s_ts_ls[i].taskid = taskid;
-#ifdef _WIN32
-            InitializeSRWLock(&s_ts_ls[i].lock);
-#else
             pthread_mutex_init(&s_ts_ls[i].lock, NULL);
-#endif
             slot = &s_ts_ls[i];
         }
-#ifdef _WIN32
-    ReleaseSRWLockExclusive(&s_ts_ls_dir);
-#else
     pthread_mutex_unlock(&s_ts_ls_dir);
-#endif
     return slot;
 }
 
@@ -788,33 +711,20 @@ static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
 
 /* spu_lifted_job.h: a run whose local store is thrown away afterwards skips
  * the 256 KB copy back out. */
-#ifdef _WIN32
-__declspec(thread) int g_spu_job_ls_discard;
-#else
 _Thread_local int g_spu_job_ls_discard;
-#endif
 
 /* A pool thread keeps one local store for every task it runs, cleared per
  * task: calloc's fresh pages cost a page fault per 16 KiB on first touch, on
  * ~1000 Havok tasks a second in Drakengard 3's destruction scene. A thread
  * per task (SPU_TASK_POOL=0) still callocs and frees. */
-#ifdef _WIN32
-static __declspec(thread) int t_spu_pool_thread;
-static __declspec(thread) uint8_t* t_spu_ls_scratch;
-#else
 static _Thread_local int t_spu_pool_thread;
 static _Thread_local uint8_t* t_spu_ls_scratch;
-#endif
 static uint8_t* spu_task_ls_get(void)
 {
     if (t_spu_pool_thread) {
         if (!t_spu_ls_scratch) {
-#ifdef _WIN32
-            t_spu_ls_scratch = (uint8_t*)_aligned_malloc(SPU_LS_SIZE, 128);
-#else
             void* p = NULL;
             if (posix_memalign(&p, 128, SPU_LS_SIZE) == 0) t_spu_ls_scratch = (uint8_t*)p;
-#endif
         }
         if (t_spu_ls_scratch) { memset(t_spu_ls_scratch, 0, SPU_LS_SIZE); return t_spu_ls_scratch; }
     }
@@ -837,11 +747,7 @@ static void spu_async_run(spu_async_job* j)
         ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
     uint8_t* ls;
     if (ts_slot) {
-#ifdef _WIN32
-        AcquireSRWLockExclusive(&ts_slot->lock);   /* serialize this taskset */
-#else
         pthread_mutex_lock(&ts_slot->lock);
-#endif
         if (!ts_slot->ls) ts_slot->ls = (uint8_t*)calloc(1, SPU_LS_SIZE);
         ls = ts_slot->ls;
         { static int _n = 0; if (_n < 24 && ++_n)
@@ -1004,9 +910,6 @@ static void spu_async_run(spu_async_job* j)
             if (j->image_id != spu_cri_image()) {
                 const char* d = getenv("LBP_TASK_DELAY");
                 if (d && *d) {
-#ifdef _WIN32
-                    Sleep((unsigned)(atoi(d) * 1000));
-#endif
                 }
             }
             /* A generic SPURS taskset task (image != cri 22) MUST get its
@@ -1137,14 +1040,10 @@ static void spu_async_run(spu_async_job* j)
              * only decodes if the PPU genuinely populated real work meanwhile. */
             if (j->image_id == spu_cri_image() && getenv("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
-#ifdef _WIN32
-                    Sleep(3);
-#else
                     /* The pause is the point: it is the window in which the
                      * PPU marks work ready. Without it the 400 attempts are
                      * spent before the producer runs at all. */
                     { struct timespec _d = { 0, 3 * 1000 * 1000 }; nanosleep(&_d, NULL); }
-#endif
                     memset(ls, 0, SPU_LS_SIZE);
                     uint32_t e2 = 0;
                     if (!spu_elf_load_to_ls(j->image, j->image_size, ls, &e2)) break;
@@ -1189,46 +1088,11 @@ static void spu_async_run(spu_async_job* j)
         if (!ts_slot) spu_task_ls_put(ls);
     }
     if (ts_slot) {
-#ifdef _WIN32
-        ReleaseSRWLockExclusive(&ts_slot->lock);
-#else
         pthread_mutex_unlock(&ts_slot->lock);
-#endif
     }
     free(j);
 }
 
-#ifdef _WIN32
-static DWORD WINAPI spu_async_thread(LPVOID p) {
-    /* Reserve handler headroom so a stack overflow in lifted SPU code (e.g. a
-     * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
-     * instead of killing the process silently with 0x80000001. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at
-     * THREAD_PRIORITY_HIGHEST -- an audio mixer, which must finish each block
-     * in time however busy the rest of the machine is (the macOS pool thread
-     * raises its QoS the same way; see PPU_QOS_INTERACTIVE in
-     * sys_ppu_thread.c). The thread is this task's alone, so nothing to
-     * restore. */
-    { const spu_async_job* j = (const spu_async_job*)p;
-      { wchar_t nm[32]; swprintf(nm, 32, L"spu img %d", j->image_id); SetThreadDescription(GetCurrentThread(), nm); }
-      const char* list = getenv("SPU_QOS_INTERACTIVE");
-      while (list && *list) {
-          char* end;
-          const long id = strtol(list, &end, 0);
-          if (end == list) break;
-          if (id == j->image_id) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); break; }
-          list = *end == ',' ? end + 1 : NULL;
-      } }
-    spu_async_run((spu_async_job*)p);
-    /* Nothing on this stack may stay in the lock-line reserver set. */
-    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
-      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi);
-      spu_mfc_forget_range((uintptr_t)lo, (uintptr_t)hi); }
-    return 0;
-}
-#else
 static void* spu_async_thread(void* p)
 {
     spu_async_run((spu_async_job*)p);
@@ -1238,11 +1102,6 @@ static void* spu_async_thread(void* p)
      * gone, and the next coherent store walked into the freed stack
      * (spu_coh_notify_write, ~25 s into Drakengard 3 on macOS). */
     { uintptr_t lo = 0, hi = 0;
-#if defined(__APPLE__)
-      pthread_t self = pthread_self();
-      hi = (uintptr_t)pthread_get_stackaddr_np(self);     /* top of stack */
-      lo = hi - pthread_get_stacksize_np(self);
-#else
       pthread_attr_t a; void* base; size_t size;
       if (pthread_getattr_np(pthread_self(), &a) == 0) {
           if (pthread_attr_getstack(&a, &base, &size) == 0) {
@@ -1250,112 +1109,12 @@ static void* spu_async_thread(void* p)
           }
           pthread_attr_destroy(&a);
       }
-#endif
       extern void spu_coh_forget_range(uintptr_t, uintptr_t);
       if (hi > lo) spu_coh_forget_range(lo, hi); }
     return NULL;
 }
-#endif
 
-#ifdef _WIN32
-/* The pool described below, for Windows. It was POSIX-only, so Windows went
- * on creating a thread per task: CreateThread with a 256 MB reservation, the
- * DLL_THREAD_ATTACH round of every loaded module, and the same again in
- * reverse at exit. Drakengard 3's PhysX starts a handful of tasks a frame in
- * a quiet scene and several times that when scenery breaks up, each from the
- * thread the game thread is waiting on: with the pieces flying the frame rate
- * fell to 16-34 fps with every core mostly idle. SPU_TASK_POOL=0: a thread
- * per task. */
-typedef struct spu_pool_worker {
-    SRWLOCK            mu;
-    CONDITION_VARIABLE cv;
-    spu_async_job*     job;
-    struct spu_pool_worker* next;
-} spu_pool_worker;
-static SRWLOCK          s_pool_mu = SRWLOCK_INIT;
-static spu_pool_worker* s_pool_idle;
 
-static int spu_task_pool_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("SPU_TASK_POOL"); on = !(e && e[0] == '0'); }
-    return on;
-}
-
-static DWORD WINAPI spu_pool_thread(LPVOID p)
-{
-    spu_pool_worker* w = (spu_pool_worker*)p;
-    int named_image = -1;
-    t_spu_pool_thread = 1;
-    /* Handler headroom for a stack overflow in lifted SPU code, as in
-     * spu_async_thread. */
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    for (;;) {
-        AcquireSRWLockExclusive(&w->mu);
-        while (!w->job) SleepConditionVariableSRW(&w->cv, &w->mu, INFINITE, 0);
-        spu_async_job* j = w->job;
-        w->job = NULL;
-        ReleaseSRWLockExclusive(&w->mu);
-        extern void spu_task_begin(void);
-        spu_task_begin();
-        if (j->image_id != named_image) {
-            wchar_t nm[32]; swprintf(nm, 32, L"spu img %d", j->image_id);
-            SetThreadDescription(GetCurrentThread(), nm);
-            named_image = j->image_id;
-        }
-        /* SPU_QOS_INTERACTIVE=<image id>[,...]: see spu_async_thread. The
-         * thread goes on to other tasks, so the priority is put back. */
-        int raised = 0;
-        { const char* list = getenv("SPU_QOS_INTERACTIVE");
-          while (list && *list) {
-              char* end;
-              const long id = strtol(list, &end, 0);
-              if (end == list) break;
-              if (id == j->image_id) { raised = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST) != 0; break; }
-              list = *end == ',' ? end + 1 : NULL;
-          } }
-        spu_async_run(j);
-        if (raised) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
-        /* Nothing on this stack may stay in the lock-line reserver set. */
-        { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
-          extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-          spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
-        AcquireSRWLockExclusive(&s_pool_mu);
-        w->next = s_pool_idle;
-        s_pool_idle = w;
-        ReleaseSRWLockExclusive(&s_pool_mu);
-    }
-    return 0;
-}
-
-/* Hand j to an idle worker, or start a new one. 0: no thread could be made. */
-static int spu_task_pool_submit(spu_async_job* j)
-{
-    AcquireSRWLockExclusive(&s_pool_mu);
-    spu_pool_worker* w = s_pool_idle;
-    if (w) s_pool_idle = w->next;
-    ReleaseSRWLockExclusive(&s_pool_mu);
-    if (w) {
-        AcquireSRWLockExclusive(&w->mu);
-        w->job = j;
-        ReleaseSRWLockExclusive(&w->mu);
-        WakeConditionVariable(&w->cv);
-        return 1;
-    }
-    w = (spu_pool_worker*)calloc(1, sizeof *w);
-    if (!w) return 0;
-    InitializeSRWLock(&w->mu);
-    InitializeConditionVariable(&w->cv);
-    w->job = j;
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_pool_thread, w,
-                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { free(w); return 0; }
-    CloseHandle(th);   /* detached */
-    return 1;
-}
-#endif
-
-#ifndef _WIN32
 /* SPU task threads are kept and reused. A thread per task -- a 256 MB stack
  * reservation created and torn down each time -- cost the dispatching PPU
  * thread well over 100 us, and Drakengard 3's PhysX dispatches 20-30 tasks a
@@ -1383,17 +1142,11 @@ static int spu_task_pool_on(void)
 static void spu_forget_own_stack(void)
 {
     uintptr_t lo = 0, hi = 0;
-#if defined(__APPLE__)
-    pthread_t self = pthread_self();
-    hi = (uintptr_t)pthread_get_stackaddr_np(self);
-    lo = hi - pthread_get_stacksize_np(self);
-#else
     pthread_attr_t a; void* base; size_t size;
     if (pthread_getattr_np(pthread_self(), &a) == 0) {
         if (pthread_attr_getstack(&a, &base, &size) == 0) { lo = (uintptr_t)base; hi = lo + size; }
         pthread_attr_destroy(&a);
     }
-#endif
     extern void spu_coh_forget_range(uintptr_t, uintptr_t);
     if (hi > lo) spu_coh_forget_range(lo, hi);
 }
@@ -1410,32 +1163,7 @@ static void* spu_pool_thread(void* p)
         pthread_mutex_unlock(&w->mu);
         extern void spu_task_begin(void);
         spu_task_begin();
-#if defined(__APPLE__)
-        { char nm[32]; snprintf(nm, sizeof nm, "spu img %d", j->image_id); pthread_setname_np(nm); }
-        /* SPU_QOS_INTERACTIVE=<image id>[,...]: those images' tasks run at
-         * user-interactive QoS -- an audio mixer, which must finish each block
-         * in time however busy the rest of the machine is (see
-         * PPU_QOS_INTERACTIVE in sys_ppu_thread.c). */
-        qos_class_t qos_was = QOS_CLASS_DEFAULT;
-        int qos_raised = 0;
-        { const char* list = getenv("SPU_QOS_INTERACTIVE");
-          while (list && *list) {
-              char* end;
-              const long id = strtol(list, &end, 0);
-              if (end == list) break;
-              if (id == j->image_id) {
-                  qos_was = qos_class_self();
-                  if (qos_was == QOS_CLASS_UNSPECIFIED) qos_was = QOS_CLASS_DEFAULT;
-                  qos_raised = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0;
-                  break;
-              }
-              list = *end == ',' ? end + 1 : NULL;
-          } }
-#endif
         spu_async_run(j);
-#if defined(__APPLE__)
-        if (qos_raised) pthread_set_qos_class_self_np(qos_was, 0);
-#endif
         spu_forget_own_stack();
         pthread_mutex_lock(&s_pool_mu);
         w->next = s_pool_idle;
@@ -1479,7 +1207,6 @@ static int spu_task_pool_submit(spu_async_job* j)
     pthread_detach(th);
     return 1;
 }
-#endif
 
 int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
                               uint32_t job_ea, uint32_t job_desc_size)
@@ -1575,13 +1302,8 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
  * to block and wake the task's host thread. */
 #include "../../libs/spurs/spurs_taskset.h"
 
-#ifdef _WIN32
-static SRWLOCK            s_sig_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE s_sig_cv;   /* zero-init == CONDITION_VARIABLE_INIT */
-#else
 static pthread_mutex_t s_sig_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  s_sig_cv   = PTHREAD_COND_INITIALIZER;
-#endif
 
 /* Which (taskset, task) pairs are currently parked in WAIT_SIGNAL.
  *
@@ -1699,17 +1421,10 @@ int spu_taskset_signal_parked_obj(uint32_t taskset_ea, uint32_t wait_obj)
 void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
 {
     if (!taskset_ea || taskId >= 128) return;
-#ifdef _WIN32
-    AcquireSRWLockExclusive(&s_sig_lock);
-    spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
-    WakeAllConditionVariable(&s_sig_cv);
-    ReleaseSRWLockExclusive(&s_sig_lock);
-#else
     pthread_mutex_lock(&s_sig_lock);
     spurs_bitset_set(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_cond_broadcast(&s_sig_cv);
     pthread_mutex_unlock(&s_sig_lock);
-#endif
     { static int _n = 0; if (_n < 24 && ++_n)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
@@ -1753,15 +1468,9 @@ void spu_taskset_line_committed(uint32_t line)
     for (int i = 0; i < SPU_PARKED_MAX; i++) {
         const uint64_t k = s_parked[i];
         if (!k || (((uint32_t)(k >> 32) + CSTS_SIGNALLED) & ~127u) != line) continue;
-#ifdef _WIN32
-        AcquireSRWLockExclusive(&s_sig_lock);
-        WakeAllConditionVariable(&s_sig_cv);
-        ReleaseSRWLockExclusive(&s_sig_lock);
-#else
         pthread_mutex_lock(&s_sig_lock);
         pthread_cond_broadcast(&s_sig_cv);
         pthread_mutex_unlock(&s_sig_lock);
-#endif
         return;
     }
 }
@@ -1829,20 +1538,6 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     /* Release the global SPU-serial lock while parked so another SPU task can
      * run (and possibly signal us); re-acquired before returning to resume. */
     spu_serial_release();
-#ifdef _WIN32
-    AcquireSRWLockExclusive(&s_sig_lock);
-    while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
-        if (!SleepConditionVariableSRW(&s_sig_cv, &s_sig_lock, 1000, 0)) {
-            static int _n = 0;
-            if (++secs && _n < 16) { _n++;
-                fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) sleeping "
-                        "%us in WAIT_SIGNAL\n", taskId, taskset_ea, secs); fflush(stderr); }
-            if (drain && secs >= drain) { drained = 1; break; }
-        }
-    }
-    if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
-    ReleaseSRWLockExclusive(&s_sig_lock);
-#else
     pthread_mutex_lock(&s_sig_lock);
     while (!spurs_bitset_test(taskset_ea + CSTS_SIGNALLED, taskId)) {
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
@@ -1856,7 +1551,6 @@ int spu_taskset_wait_signal(uint32_t taskset_ea, uint32_t taskId)
     }
     if (!drained) spurs_bitset_clear(taskset_ea + CSTS_SIGNALLED, taskId);
     pthread_mutex_unlock(&s_sig_lock);
-#endif
     if (drained) { static int _d = 0; if (_d < 24 && ++_d)
         fprintf(stderr, "[spu_workload] task %u (taskset 0x%08X) WS_DRAIN resume "
                 "after %us (no signal)\n", taskId, taskset_ea, secs); fflush(stderr); }
@@ -1972,17 +1666,6 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
                 fprintf(stderr, "\n");
             } } }
 
-#ifdef _WIN32
-    if (spu_task_pool_on() && spu_task_pool_submit(j)) return 1;
-    /* 256MB RESERVE (not commit): the Bink SPU decoder's per-macroblock brsl
-     * chains are deep host call chains with fat lifted frames -- a 1MB stack
-     * blew the guard page (STATUS_GUARD_PAGE_VIOLATION 0x80000001, silent
-     * process death) the moment the real decode path first executed. */
-    HANDLE th = CreateThread(NULL, 256u << 20, spu_async_thread, j,
-                             STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!th) { free(j); return 0; }
-    CloseHandle(th);   /* detached */
-#else
     /* Same 256 MB reservation, for the same reason: pthread stacks are
      * mmap'd and committed on touch, so this reserves address space rather
      * than memory. The default is 512 KB on Darwin, half the 1 MB that blew
@@ -2002,6 +1685,5 @@ int spu_workload_dispatch_task(const uint8_t* image, uint32_t image_size,
         prc = pthread_create(&th, NULL, spu_async_thread, j);
     if (prc != 0) { free(j); return 0; }
     pthread_detach(th);
-#endif
     return 1;
 }

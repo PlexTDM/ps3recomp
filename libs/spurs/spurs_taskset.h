@@ -31,9 +31,8 @@
  * it needs. Tokyo Jungle references SPURS, which drags cellSpurs.c in, and the
  * link then failed with five duplicate symbols.
  *
- * It is also a hard error on Clang, which rejects the non-static
- * re-declaration outright where MSVC accepted it -- so this is what kept
- * the tree from compiling on macOS at all. */
+ * It is also a hard error on Clang, which rejects a non-static
+ * re-declaration outright. */
 #include "../../runtime/ppu/ppu_memory.h"
 
 /* ---- CellSpursTaskset (main memory, 128-byte aligned) --------------------

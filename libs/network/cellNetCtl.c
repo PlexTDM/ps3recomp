@@ -19,16 +19,10 @@
  * a host pointer (struct out-params) or write scalars big-endian via vm_write32. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <ifaddrs.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -60,39 +54,6 @@ static NetCtlHandlerSlot s_handlers[CELL_NET_CTL_HANDLER_MAX];
 /* Try to get the host machine's IP address */
 static int netctl_get_host_ip(char* buf, size_t buflen)
 {
-#ifdef _WIN32
-    WSADATA wsa;
-    char hostname[256];
-    struct addrinfo hints, *res;
-    int ret;
-
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-        goto fallback;
-
-    if (gethostname(hostname, sizeof(hostname)) != 0) {
-        WSACleanup();
-        goto fallback;
-    }
-
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    ret = getaddrinfo(hostname, NULL, &hints, &res);
-    if (ret != 0 || !res) {
-        WSACleanup();
-        goto fallback;
-    }
-
-    {
-        struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
-        u8* ip = (u8*)&addr->sin_addr;
-        snprintf(buf, buflen, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-    }
-    freeaddrinfo(res);
-    /* Don't WSACleanup here -- we may need it later */
-    return 1;
-#else
     char hostname[256];
     struct addrinfo hints, *res;
     int ret;
@@ -115,7 +76,6 @@ static int netctl_get_host_ip(char* buf, size_t buflen)
     }
     freeaddrinfo(res);
     return 1;
-#endif
 
 fallback:
     snprintf(buf, buflen, "192.168.1.100");

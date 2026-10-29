@@ -3,7 +3,7 @@
  *
  * Cooperative multitasking fibers. On PS3, fibers provide lightweight
  * user-level context switching within a single SPU or PPU thread.
- * Implementation uses OS fibers (Windows) or ucontext (POSIX).
+ * Implementation uses POSIX ucontext.
  */
 
 #ifndef PS3RECOMP_CELL_FIBER_H

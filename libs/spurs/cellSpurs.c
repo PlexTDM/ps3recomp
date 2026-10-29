@@ -38,18 +38,6 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
  * pointer is enough here. */
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
-#ifdef _WIN32
-#include <windows.h>
-typedef CRITICAL_SECTION    jc_mutex_t;
-typedef CONDITION_VARIABLE  jc_cond_t;
-#define JC_MUTEX_INIT(m)    InitializeCriticalSection(m)
-#define JC_COND_INIT(c)     InitializeConditionVariable(c)
-#define JC_LOCK(m)          EnterCriticalSection(m)
-#define JC_UNLOCK(m)        LeaveCriticalSection(m)
-#define JC_WAIT(c, m)       SleepConditionVariableCS((c), (m), INFINITE)
-#define JC_SIGNAL(c)        WakeConditionVariable(c)
-#define JC_BROADCAST(c)     WakeAllConditionVariable(c)
-#else
 #include <pthread.h>
 typedef pthread_mutex_t     jc_mutex_t;
 typedef pthread_cond_t      jc_cond_t;
@@ -61,7 +49,6 @@ typedef pthread_cond_t      jc_cond_t;
 #define JC_SIGNAL(c)        pthread_cond_signal(c)
 #define JC_BROADCAST(c)     pthread_cond_broadcast(c)
 #include <time.h>
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal workload tracking
@@ -109,13 +96,8 @@ static u32           s_next_task_id = 0;
 
 typedef struct {
     uint32_t            ea;      /* guest EA of the 128-byte flag */
-#ifdef _WIN32
-    CRITICAL_SECTION    cs;
-    CONDITION_VARIABLE  cv;
-#else
     pthread_mutex_t     mtx;
     pthread_cond_t      cond;
-#endif
     int                 initialized;
     /* A PPU thread is blocked in cellSpursEventFlagWait on this flag -- the
      * HLE's stand-in for ctrl.ppuWaitMask. Guarded by the sync lock. */
@@ -138,11 +120,7 @@ static void ef_line_committed(uint32_t line)
         if (!s->initialized || (s->ea & ~127u) != line) continue;
         /* Take the waiter's lock so the wake cannot fall between its check of
          * the flag and its sleep. Caller holds no lock-line lock. */
-#ifdef _WIN32
-        EnterCriticalSection(&s->cs); WakeAllConditionVariable(&s->cv); LeaveCriticalSection(&s->cs);
-#else
         pthread_mutex_lock(&s->mtx); pthread_cond_broadcast(&s->cond); pthread_mutex_unlock(&s->mtx);
-#endif
     }
 }
 
@@ -163,13 +141,8 @@ static EventFlagSync* ef_sync_alloc(uint32_t ea)
             s_ef_sync[i].ppu_waiting = 0;
             { extern void (*g_spu_line_commit_hook)(uint32_t);
               g_spu_line_commit_hook = ef_line_committed; }
-#ifdef _WIN32
-            InitializeCriticalSection(&s_ef_sync[i].cs);
-            InitializeConditionVariable(&s_ef_sync[i].cv);
-#else
             pthread_mutex_init(&s_ef_sync[i].mtx, NULL);
             pthread_cond_init(&s_ef_sync[i].cond, NULL);
-#endif
             s_ef_sync[i].initialized = 1;
             return &s_ef_sync[i];
         }
@@ -194,55 +167,34 @@ static EventFlagSync* ef_sync_get(uint32_t ea)
 static void ef_sync_free(EventFlagSync* sync)
 {
     if (!sync) return;
-#ifdef _WIN32
-    DeleteCriticalSection(&sync->cs);
-    /* CONDITION_VARIABLE has no destroy on Windows */
-#else
     pthread_mutex_destroy(&sync->mtx);
     pthread_cond_destroy(&sync->cond);
-#endif
     sync->ea = 0;
     sync->initialized = 0;
 }
 
 static inline void ef_lock(EventFlagSync* s)
 {
-#ifdef _WIN32
-    EnterCriticalSection(&s->cs);
-#else
     pthread_mutex_lock(&s->mtx);
-#endif
 }
 
 static inline void ef_unlock(EventFlagSync* s)
 {
-#ifdef _WIN32
-    LeaveCriticalSection(&s->cs);
-#else
     pthread_mutex_unlock(&s->mtx);
-#endif
 }
 
 /* Returns 1 if signaled, 0 if it timed out after `ms`. */
 static inline int ef_wait_timed(EventFlagSync* s, unsigned ms)
 {
-#ifdef _WIN32
-    return SleepConditionVariableCS(&s->cv, &s->cs, ms) ? 1 : 0;
-#else
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += ms / 1000; ts.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     return pthread_cond_timedwait(&s->cond, &s->mtx, &ts) == 0 ? 1 : 0;
-#endif
 }
 
 static inline void ef_broadcast(EventFlagSync* s)
 {
-#ifdef _WIN32
-    WakeAllConditionVariable(&s->cv);
-#else
     pthread_cond_broadcast(&s->cond);
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -1758,9 +1710,6 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
 {
     struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
     struct SpursInst* si = slot->instance;
-#ifdef _WIN32
-    { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-#endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
@@ -2689,11 +2638,7 @@ static int jg_wait(u32 ea)
             vm_write32(ea, s_jobguards[i].count);
             return 1;
         }
-#ifdef _WIN32
-        Sleep(1);
-#else
         usleep(1000);
-#endif
     }
     printf("[cellSpurs] guard 0x%08X still closed after %d ms%s -- chain gives up\n", ea, spins,
            s_jobguards[i].ever_notified ? "" : " (never notified)");
@@ -2708,13 +2653,8 @@ static int jg_wait(u32 ea)
  * this queue, and would only notify again after the event arrives -- so
  * signalling at walker exit deadlocks both sides. Signal when the WORK
  * completes: at END, and on reaching a guard with jobs run this lap. */
-/* __declspec(thread) for MSVC only: MinGW GCC ignores it, which would make
- * these process-wide. spurs_job.c and cellSpurs.c must agree. */
-#if defined(_MSC_VER)
-#  define SPURS_JOB_TLS __declspec(thread)
-#else
+/* Thread-local job mailboxes; spurs_job.c and cellSpurs.c must agree. */
 #  define SPURS_JOB_TLS __thread
-#endif
 extern SPURS_JOB_TLS uint32_t g_spurs_job_mbox, g_spurs_job_mbox_intr, g_spurs_job_cmd;
 extern SPURS_JOB_TLS int g_spurs_job_mbox_valid;
 
@@ -2899,11 +2839,7 @@ static struct {
 
 static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc);
 
-#ifdef _WIN32
-static DWORD WINAPI jc_pool_worker(LPVOID arg)
-#else
 static void* jc_pool_worker(void* arg)
-#endif
 {
     (void)arg;
     for (;;) {
@@ -2925,17 +2861,9 @@ static void* jc_pool_worker(void* arg)
 }
 
 static void jc_spawn(
-#ifdef _WIN32
-    DWORD (WINAPI *fn)(LPVOID),
-#else
     void* (*fn)(void*),
-#endif
     void* arg, const char* what)
 {
-#ifdef _WIN32
-    HANDLE th = CreateThread(NULL, 8u << 20, fn, arg, 0, NULL);
-    if (th) CloseHandle(th); else fprintf(stderr, "[cellSpurs] %s: CreateThread failed\n", what);
-#else
     pthread_attr_t a; pthread_t th;
     pthread_attr_init(&a);
     pthread_attr_setstacksize(&a, 8u << 20);   /* lifted SPU code runs on it */
@@ -2943,7 +2871,6 @@ static void jc_spawn(
     if (pthread_create(&th, &a, fn, arg) != 0)
         fprintf(stderr, "[cellSpurs] %s: pthread_create failed\n", what);
     pthread_attr_destroy(&a);
-#endif
 }
 
 static void jc_pool_init(int workers)
@@ -3033,11 +2960,7 @@ static void jc_execute_async(int slot)
            jc_ea, jobs);
 }
 
-#ifdef _WIN32
-static DWORD WINAPI jc_slot_walker(LPVOID p)
-#else
 static void* jc_slot_walker(void* p)
-#endif
 {
     int slot = (int)(intptr_t)p;
     for (;;) {
@@ -3092,13 +3015,8 @@ int g_spurs_jc_par = -1;
 double g_jc_walk_ms; unsigned g_jc_walks;
 static double jc_now_ms(void)
 {
-#ifdef _WIN32
-    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
-#else
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
-#endif
 }
 static DWORD WINAPI jc_thread_par(LPVOID p)
 {
@@ -3171,12 +3089,8 @@ static s32 jc_start(u64 jc_ea, const char* who)
       if (st) {
           static unsigned long long runs, last_ms;
           unsigned long long now_ms;
-#ifdef _WIN32
-          now_ms = GetTickCount64();
-#else
           struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
           now_ms = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
-#endif
           runs++;
           if (!last_ms) last_ms = now_ms;
           if (now_ms - last_ms >= 5000) {
@@ -3296,11 +3210,7 @@ s32 cellSpursJoinJobChain(u64 jc_ea)
     for (int i = 0; i < MAX_JOBCHAINS; i++) {
         if (s_jobchains[i].jc_ea != (u32)jc_ea) continue;
         while (s_jobchains[i].running) {
-#ifdef _WIN32
-            Sleep(0);
-#else
             usleep(0);
-#endif
         }
     }
     return CELL_OK;

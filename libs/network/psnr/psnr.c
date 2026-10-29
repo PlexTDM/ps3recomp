@@ -10,24 +10,6 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
-#  if !defined(_WIN32_WINNT) || _WIN32_WINNT < 0x0600
-#    undef _WIN32_WINNT
-#    define _WIN32_WINNT 0x0600   /* WSAPoll, GetTickCount64 (MinGW defaults older) */
-#  endif
-#  define WIN32_LEAN_AND_MEAN
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-#  ifdef _MSC_VER
-#    pragma comment(lib, "ws2_32.lib")
-#  endif
-   typedef SOCKET sock_t;
-#  define BAD_SOCK INVALID_SOCKET
-#  define sock_close closesocket
-#  define WOULD_BLOCK() (WSAGetLastError() == WSAEWOULDBLOCK)
-#  define poll WSAPoll
-   typedef WSAPOLLFD pollfd_t;
-#else
 #  include <sys/socket.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
@@ -41,20 +23,15 @@
 #  define sock_close close
 #  define WOULD_BLOCK() (errno == EAGAIN || errno == EWOULDBLOCK)
    typedef struct pollfd pollfd_t;
-#endif
 
 #include "../host_socket_send.h"
 #define HEARTBEAT_SECS 20
 
 static uint64_t now_ms(void)
 {
-#ifdef _WIN32
-    return GetTickCount64();
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-#endif
 }
 
 typedef struct node { psnr_msg m; struct node* next; } node;
@@ -196,10 +173,6 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
     char portstr[8];
     sock_t s = BAD_SOCK;
 
-#ifdef _WIN32
-    WSADATA w;
-    WSAStartup(MAKEWORD(2, 2), &w);
-#endif
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -219,11 +192,7 @@ psnr_client* psnr_connect(const char* host, uint16_t port,
         int one = 1;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
     }
-#ifdef _WIN32
-    { u_long nb = 1; ioctlsocket(s, FIONBIO, &nb); }
-#else
     fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
-#endif
 
     psnr_client* c = (psnr_client*)calloc(1, sizeof(psnr_client));
     c->s = s;

@@ -385,7 +385,7 @@ Creating main PPU thread...
 
 ### Debugging Strategy
 
-1. **Run under a debugger** (GDB/LLDB/Visual Studio)
+1. **Run under a debugger** (GDB or LLDB)
 2. **Set `break_on_unimplemented = true`** to catch missing functions immediately
 3. **Compare with RPCS3** — run the same game in RPCS3 with logging and compare the call sequences
 4. **Use log output** — `log_hle_calls = true` shows every HLE function call
@@ -449,7 +449,7 @@ RSX graphics is the hardest part of any PS3 port. The game writes NV47xx GPU com
 - Identify the vertex formats, shader programs, and draw call patterns
 
 **Phase 3: Graphics backend**
-- Implement a Vulkan or D3D12 renderer that consumes the command buffer
+- Implement a Vulkan renderer that consumes the command buffer, or start from the null backend
 - Start with basic triangle rendering
 - Progressively add shader translation, texture sampling, blending modes
 
@@ -473,16 +473,19 @@ RSX graphics is the hardest part of any PS3 port. The game writes NV47xx GPU com
 - Backend callback interface (`rsx_backend`) with 12 dispatch points
 
 **Null backend** (`libs/video/rsx_null_backend.h/.c`):
-- Win32 window creation
-- Displays RSX clear color via GDI
-- FPS counter and debug overlay
-- Proves command flow works before implementing a real backend
+- Headless CPU rasteriser into a host-memory framebuffer
+- Clears to the RSX clear colour, flat-shades triangles
+- Proves command flow on a machine with no GPU or display
+
+**Vulkan backend** (`libs/video/rsx_vulkan_backend.c`, opt-in):
+- Device, offscreen targets and an optional SDL2 window
+- The shared draw engine's surfaces, render-to-texture, MRT and depth textures
+- Guest vertex and fragment programs, decompiled to HLSL and translated to SPIR-V by glslang
+- Texture upload, sampling and mip chains
 
 **What's NOT done yet:**
-- D3D12/Vulkan backend (actual triangle rendering)
-- Vertex/fragment program translation (RSX shaders → HLSL/SPIR-V)
-- Texture upload and sampling
-- Framebuffer management and resolve
+- The remaining RSX state combinations listed in [RSX_FRAGMENT_PROGRAM.md](RSX_FRAGMENT_PROGRAM.md)
+- Coverage of every title's shader instruction mix
 
 ---
 
@@ -497,15 +500,16 @@ cellAudio provides real audio output. Most games just need:
 
 **Common issues:**
 - Audio crackling → increase buffer size in config
-- No sound → check that the audio backend matches your OS
+- No sound → check that SDL2 opened an audio device
+  (`PS3RECOMP_AUDIO=0` disables output for debugging)
 - Wrong sample rate → PS3 native is 48000 Hz
 
 ### Input
 
-cellPad provides real gamepad input via XInput (Windows) or SDL2.
+cellPad provides real gamepad input via SDL2.
 
-**Button mapping (XInput → PS3):**
-| XInput | PS3 |
+**Button mapping (controller → PS3):**
+| Controller | PS3 |
 |--------|-----|
 | A | Cross |
 | B | Circle |
@@ -598,7 +602,7 @@ void hle_spu_audio_mixer(spu_context* ctx)
 5. **Check RPCS3's game compatibility wiki** — known issues are documented
 6. **Join the community** — other porters may have solved your problem
 7. **Don't fight the lifter** — if generated code is wrong, fix the lifter, not individual functions (unless it's truly a one-off issue)
-8. **Test on multiple platforms** — if you're only on Windows, test on Linux too (or vice versa)
+8. **Test on a second machine** — GPU drivers and distributions differ; a title that renders on one may expose a gap on another
 
 ---
 
@@ -629,9 +633,9 @@ The first game port actively in progress using ps3recomp. This section tracks re
 | CRT startup | **Working** — TLS init, mutex creation, enters game code |
 | HLE module bridges | **7/12 real** — cellSysutil, cellGcmSys, cellAudio, cellPad, cellFs, cellSysmodule, sysPrxForUser |
 | Game main loop | **In progress** — crashes in early init due to address sign-extension |
-| Graphics (RSX → D3D12) | Not started |
-| Audio (cellAudio → WASAPI) | **Wired** — real WASAPI backend via ps3recomp |
-| Input (cellPad → XInput) | **Wired** — real XInput backend via ps3recomp |
+| Graphics (RSX → Vulkan) | **In progress** — offscreen Vulkan backend, guest shaders, textures |
+| Audio (cellAudio → SDL2) | **Wired** — real SDL2 backend via ps3recomp |
+| Input (cellPad → SDL2) | **Wired** — real SDL2 backend via ps3recomp |
 
 ### Key Technical Lessons
 
@@ -670,10 +674,6 @@ static int64_t bridge_cellVideoOutGetResolution(ppu_context* ctx) {
 
 The PS3 uses 32-bit effective addresses in 64-bit GPRs. Arithmetic like `sp -= 0xA0` can sign-extend the result to 64 bits. The `vm_bridge.cpp` truncates addresses with `(uint32_t)addr`, but code that uses GPRs for address comparison or branching may need masking in the lifter.
 
-**4. WASAPI COM GUIDs**
-
-When linking cellAudio's WASAPI backend on MSVC, the COM interface GUIDs (`IID_IAudioClient`, etc.) aren't automatically defined. **Fix:** Define them manually in `cellAudio.c` using `DEFINE_GUID()` macros rather than relying on `uuid.lib`.
-
 ### Analysis Numbers
 
 ```
@@ -681,7 +681,7 @@ Binary:          EBOOT.elf (10.1 MB, ELF64 big-endian PowerPC64)
 Functions found: 51,658 (36,827 OPD + 14,831 heuristic)
 Functions lifted: 51,658 (100%)
 Generated C++:   156 MB (3.14 million lines)
-Native binary:   37 MB (x86-64 Windows)
+Native binary:   37 MB (x86-64 Linux)
 Import libraries: 12 (cellSysutil, cellGcmSys, cellSysmodule, cellSpurs,
                       cellAudio, cellSync, cellNetCtl, sceNp, sys_net,
                       sys_io, sys_fs, sysPrxForUser)

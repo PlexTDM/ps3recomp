@@ -24,13 +24,8 @@ int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: the decrementer s
 #include <setjmp.h>
 /* Plain setjmp/longjmp save and restore the signal mask on macOS -- a system
  * call each, on every SPURS job. Nothing in the SPU runtime touches the mask. */
-#ifndef _WIN32
 #define SPU_SETJMP(env)     _setjmp(env)
 #define SPU_LONGJMP(env, v) _longjmp(env, v)
-#else
-#define SPU_SETJMP(env)     setjmp(env)
-#define SPU_LONGJMP(env, v) longjmp(env, v)
-#endif
 /* SPU_NOUNWIND(env), right after setjmp's first return: on Windows x64 a
  * longjmp unwinds every frame back to the setjmp through RtlUnwindEx unless
  * the buffer's Frame is 0 -- then it restores the registers and jumps
@@ -39,14 +34,8 @@ int64_t ps3_guest_ticks(int64_t host_ticks);   /* sys_timer.c: the decrementer s
  * the unwind (_NLG_Return2, RtlVirtualUnwind2) was 6-8% of the walker. The
  * frames in between are lifted SPU code and this C runtime: no __try, no
  * destructors, nothing an unwind would run. */
-#if defined(_WIN32) && defined(_M_X64)
-#define SPU_NOUNWIND(env)   (((_JUMP_BUFFER*)(env))->Frame = 0)
-#else
 #define SPU_NOUNWIND(env)   ((void)0)
-#endif
-#ifndef _WIN32
 #include <sched.h>   /* sched_yield */
-#endif
 #include <time.h>
 #include "../platform/win32_compat.h"
 
@@ -66,22 +55,9 @@ extern "C" {
 
 static uint64_t spu_host_ns(void)
 {
-#ifdef _WIN32
-    static LARGE_INTEGER s_freq;
-    LARGE_INTEGER c;
-    if (!s_freq.QuadPart) QueryPerformanceFrequency(&s_freq);
-    QueryPerformanceCounter(&c);
-    c.QuadPart = ps3_guest_ticks(c.QuadPart);
-    /* Split the divide to keep the multiply from overflowing: QPC counters are
-     * large enough that (count * 1e9) wraps a u64 within hours of uptime. */
-    return (uint64_t)(c.QuadPart / s_freq.QuadPart) * 1000000000ull
-         + (uint64_t)(c.QuadPart % s_freq.QuadPart) * 1000000000ull
-           / (uint64_t)s_freq.QuadPart;
-#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ps3_guest_ticks((int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec);
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -89,11 +65,7 @@ static uint64_t spu_host_ns(void)
  * spins can't be escaped by setting a status flag (lifted code never checks
  * it), so spu_halt() longjmps back to spu_run_with_halt() in the dispatcher.
  * -----------------------------------------------------------------------*/
-#if defined(_MSC_VER)
-#  define SPU_TLS __declspec(thread)
-#else
 #  define SPU_TLS __thread
-#endif
 /* Called after an SPU atomic commits a 128-byte line, with the lock-line lock
  * released. cellSpurs sets it so a PPU blocked in cellSpursEventFlagWait wakes
  * when a task sets the flag, instead of on its next 2 ms poll. */
@@ -617,11 +589,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
               if (ea == t_pea && memcmp(now, t_prev, MFC_ATOMIC_LINE) == 0) {
                   if (++t_pn > 64) {
                       struct timespec d = { 0, t_pn > 1024 ? 200000 : 50000 };
-#ifdef _WIN32
-                      Sleep(t_pn > 1024 ? 1 : 0);
-#else
                       nanosleep(&d, NULL);
-#endif
                   }
               } else { t_pea = ea; t_pn = 0; }
               memcpy(t_prev, now, MFC_ATOMIC_LINE);
@@ -2815,14 +2783,6 @@ void spu_indirect_branch(spu_context* ctx)
       if ((s_img < 0 || ctx->image_id == s_img) && misspc >= s_pcmin && (_n < 2 && ++_n)) {
         fprintf(stderr, "[SPU] branch-to-0 lr=0x%05X r1=0x%05X\n",
                 ctx->gpr[0]._u32[0] & SPU_LS_MASK, ctx->gpr[1]._u32[0] & SPU_LS_MASK);
-#ifdef _WIN32
-        void* frames[24]; unsigned short fn = RtlCaptureStackBackTrace(0, 24, frames, NULL);
-        char* base = (char*)GetModuleHandleA(NULL);
-        fprintf(stderr, "[SPU] host bt RVAs:");
-        for (unsigned short i = 0; i < fn; i++)
-            fprintf(stderr, " 0x%zX", (size_t)((char*)frames[i] - base));
-        fprintf(stderr, "\n");
-#endif
         /* State-diff oracle: dump full LS + all GPRs at the branch-to-0 so it can
          * be compared byte-for-byte against the RPCS3 savestate LS of the same
          * (cri_mpv) task. Path from YDKJ_SPU_LSDUMP, else ./recomp_spu_ls.bin. */

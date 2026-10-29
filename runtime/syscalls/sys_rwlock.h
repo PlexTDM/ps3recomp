@@ -2,7 +2,7 @@
  * ps3recomp - Reader-writer lock syscalls
  */
 
-#ifndef SYS_RWLOCK_H
+#if !defined(SYS_RWLOCK_H)
 #define SYS_RWLOCK_H
 
 #include "lv2_syscall_table.h"
@@ -12,12 +12,7 @@
 
 #include <stdint.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <pthread.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,13 +25,6 @@ typedef struct sys_rwlock_info {
     uint32_t protocol;
     char     name[8];
 
-#ifdef _WIN32
-    SRWLOCK  srw;
-    /* Track exclusive ownership for proper unlock dispatch */
-    volatile LONG  readers;
-    volatile LONG  writer;
-    uint64_t       writer_tid;   /* owning thread of the write lock (EDEADLK/EPERM) */
-#else
     pthread_rwlock_t rwl;
     /* Same exclusive-ownership tracking as the Win32 branch. One field is
      * enough here: writer_tid is nonzero exactly while a thread holds the
@@ -45,7 +33,6 @@ typedef struct sys_rwlock_info {
      * because this header is reachable from C++ through extern "C", the same
      * reason win32_compat.h gives for its own choice. */
     uint64_t         writer_tid;
-#endif
 
 } sys_rwlock_info;
 
@@ -68,4 +55,4 @@ void sys_rwlock_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_RWLOCK_H */
+#endif

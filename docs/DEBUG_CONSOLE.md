@@ -7,7 +7,7 @@ command into it and the answer is appended to `<path>.out`, then the command
 file is truncated ready for the next one.
 
 ```bash
-RSX_LIVE_DRAW=1 PS3_DEBUG=dbg.txt ./build/simpsons.exe vfs/PS3_GAME/USRDIR/EBOOT.elf &
+PS3_DEBUG=dbg.txt ./build/simpsons vfs/PS3_GAME/USRDIR/EBOOT.elf &
 
 echo stat            > dbg.txt ; sleep 1 ; cat dbg.txt.out
 echo threads         > dbg.txt

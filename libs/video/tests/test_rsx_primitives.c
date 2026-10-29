@@ -5,10 +5,9 @@
  *
  * rsx_primitives.h is header-only, so there is nothing to link.
  *
- * This pins a truth table that three places in the tree previously answered
- * differently: the D3D12 backend (bare numbers), the Metal backend (its own
- * list), and a set of helpers in this header that nothing called. The two that
- * were live disagreed about LINE_LOOP and POLYGON.
+ * This pins a truth table that earlier backends answered differently: one used
+ * bare numbers, another kept its own list, and a set of helpers in this header
+ * went uncalled. The live paths disagreed about LINE_LOOP and POLYGON.
  */
 #include "rsx_primitives.h"
 
@@ -87,8 +86,8 @@ static void test_unknown_is_unsupported(void)
     CHECK(!rsx_primitive_needs_expansion(255));
 }
 
-/* UNSUPPORTED must stay 0: the D3D12 backend's legacy path tests the returned
- * topology for falsity to decide whether it can draw at all. */
+/* UNSUPPORTED must stay 0: callers test the returned topology for falsity to
+ * decide whether they can draw at all. */
 static void test_unsupported_is_zero(void)
 {
     CHECK_EQ(RSX_TOPOLOGY_UNSUPPORTED, 0);

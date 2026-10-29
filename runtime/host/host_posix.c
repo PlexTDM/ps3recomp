@@ -4,7 +4,7 @@
  * Drives the cellGcm -> RSX -> backend bridge with no lifted game: it builds a
  * real big-endian NV4097 command buffer by hand, hands it to the FIFO, and runs
  * the flip loop. That exercises the whole graphics path a real title uses to
- * clear and flip, which is exactly the state the D3D12 backend reaches today.
+ * clear and flip.
  *
  * Its value is as a bring-up and regression harness for backends. A backend
  * that renders the right colour here has its clear, surface and present paths
@@ -15,8 +15,7 @@
  */
 /* --threads reads the host stack's size back through pthread_getattr_np,
  * which glibc declares only under _GNU_SOURCE, and that has to be set before
- * the first system header of the translation unit. Darwin has its own
- * pthread_get_stacksize_np and needs nothing. */
+ * the first system header of the translation unit. */
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
@@ -24,23 +23,10 @@
 #include "../memory/vm.h"           /* VM_HLE_INJECT_BASE */
 #include "rsx_commands.h"
 
-/* Backend selection. Metal where there is one, otherwise the null backend's
- * headless software path -- which is what lets this harness run on Linux,
- * where no real backend exists yet. Both expose the same four entry points
+/* Backend selection: the Vulkan backend when built in, otherwise the null
+ * backend's headless software path. Both expose the same four entry points
  * plus the same two test hooks, so the body below is backend-agnostic. */
-#if defined(__APPLE__)
-#  include "rsx_metal_backend.h"
-#  define HOST_BACKEND_NAME     "Metal"
-#  define HOST_BACKEND_GUEST_SHADERS 1
-#  define host_backend_init     rsx_metal_backend_init
-#  define host_backend_shutdown rsx_metal_backend_shutdown
-#  define host_backend_pump     rsx_metal_backend_pump_messages
-#  define host_backend_present  rsx_metal_backend_present
-#  define host_backend_color    rsx_metal_backend_debug_color
-#  define host_backend_center   rsx_metal_backend_readback_center
-#  define host_backend_guest_draws rsx_metal_backend_guest_draws
-#  define HOST_BACKEND_DEPTH_BOUNDS 0
-#elif defined(PS3RECOMP_RSX_VULKAN)
+#if defined(PS3RECOMP_RSX_VULKAN)
 /* Opt-in (-DPS3RECOMP_RSX_VULKAN=ON): same entry points and test hooks. */
 #  include "rsx_vulkan_backend.h"
 #  define HOST_BACKEND_NAME     "Vulkan"
@@ -284,7 +270,7 @@ static void upload_texture(void)
 
 /* Guest memory behind the --rtt surface, filled with a colour that is not the
  * one the surface gets rendered: titles CPU-initialise their render-target
- * buffers, so those bytes are really there, and the D3D12 backend seeds a new
+ * buffers, so those bytes are really there, and the backend seeds a new
  * offscreen target from them for exactly that reason.
  *
  * It is also what gives the check teeth. A backend that misses the
@@ -993,19 +979,16 @@ static void submit_frame(int with_draw)
  *
  * sys_ppu_thread_create reserves a big host stack because every recompiled
  * guest call is a real host call and a guest call chain nests just as deeply
- * on the host. The Win32 branch has always done that; the POSIX branch used
- * to take the default, which is 512 KB on Darwin. Nothing about that shows up
- * until a title recurses a few hundred frames deep and the process dies with
- * no diagnosis, so check the number here instead.
+ * on the host. This branch used to take the default stack size (512 KB on
+ * some systems). Nothing about that shows up until a title recurses a few
+ * hundred frames deep and the process dies with no diagnosis, so check the
+ * number here instead.
  * -----------------------------------------------------------------------*/
 static size_t g_reported_stack = 0;
 static int    g_thread_ran     = 0;
 
 static size_t host_self_stack_bytes(void)
 {
-#if defined(__APPLE__)
-    return pthread_get_stacksize_np(pthread_self());
-#elif defined(__GLIBC__) || defined(__linux__)
     pthread_attr_t a;
     size_t sz = 0;
     if (pthread_getattr_np(pthread_self(), &a) == 0) {
@@ -1013,9 +996,6 @@ static size_t host_self_stack_bytes(void)
         pthread_attr_destroy(&a);
     }
     return sz;
-#else
-    return 0;
-#endif
 }
 
 static void thread_probe_entry(ppu_context* ctx)
@@ -1257,11 +1237,9 @@ static int run_thread_check(void)
 /* ---------------------------------------------------------------------------
  * --audio-pad: bring the SDL2 audio and pad backends up and back down
  *
- * Neither had ever been initialised off Windows -- the Windows build takes
- * WASAPI and XInput -- so nothing said whether they even run. This is not a
- * sound or input test: it is the assertion that init, a few polls and
- * shutdown complete, twice, and that a shutdown with no device open is
- * survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
+ * This is not a sound or input test: it is the assertion that init, a few
+ * polls and shutdown complete, twice, and that a shutdown with no device open
+ * is survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
  * needs no hardware, which is what lets CI run it.
  * -----------------------------------------------------------------------*/
 static int run_audio_pad_check(void)
@@ -1571,7 +1549,7 @@ int main(int argc, char** argv)
     int rc = (got == CLEAR_ARGB) ? 0 : 2;
     if (back) {
         /* Headless: the drawable is ours, so verify what actually landed.
-         * RSX ARGB -> Metal BGRA8Unorm keeps R, G and B in the same bytes. */
+         * The present format keeps R, G and B in the same bytes. */
         /* Without a draw the centre pixel is the clear colour; with the test
          * triangle it is the triangle's red, which proves the vertex fetch,
          * primitive path, pipeline state and draw all worked. With --tex it is

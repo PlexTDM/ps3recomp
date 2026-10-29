@@ -6,7 +6,7 @@
  * and the current instruction address (CIA).
  */
 
-#ifndef PPU_CONTEXT_H
+#if !defined(PPU_CONTEXT_H)
 #define PPU_CONTEXT_H
 
 #include "../../include/ps3emu/ps3types.h"
@@ -22,12 +22,8 @@ extern "C" {
  * in sync with -- code reaches one or the other depending on whether it
  * built against a generated ppu_recomp.h. The #ifndef makes including both
  * harmless. */
-#ifndef PPU_THREAD_LOCAL
-#  ifdef _MSC_VER
-#    define PPU_THREAD_LOCAL __declspec(thread)
-#  else
+#if !defined(PPU_THREAD_LOCAL)
 #    define PPU_THREAD_LOCAL __thread
-#  endif
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -59,11 +55,7 @@ typedef struct ppu_context {
 
     /* Vector registers (vr0-vr31) for VMX/AltiVec
      * Each is 128 bits, aligned to 16 bytes. */
-#ifdef _MSC_VER
-    __declspec(align(16)) u128 vr[32];
-#else
     u128     vr[32] __attribute__((aligned(16)));
-#endif
 
     /* Condition register -- 8 x 4-bit fields packed into 32 bits.
      * CR0 is bits 31:28, CR1 is 27:24, ..., CR7 is 3:0. */
@@ -225,4 +217,4 @@ static inline uint64_t ppu_get_sp(const ppu_context* ctx)
 } /* extern "C" */
 #endif
 
-#endif /* PPU_CONTEXT_H */
+#endif

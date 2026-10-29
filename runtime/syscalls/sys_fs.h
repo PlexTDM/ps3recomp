@@ -4,7 +4,7 @@
  * Kernel-level filesystem with PS3 path -> host path translation.
  */
 
-#ifndef SYS_FS_H
+#if !defined(SYS_FS_H)
 #define SYS_FS_H
 
 #include "lv2_syscall_table.h"
@@ -15,13 +15,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
-  #include <windows.h>
-#else
   #include <dirent.h>
   #include <sys/stat.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,13 +88,7 @@ typedef struct sys_fs_dir_info {
     int    active;
     char   path[512];
 
-#ifdef _WIN32
-    HANDLE           find_handle;
-    WIN32_FIND_DATAA find_data;
-    int              first_read;
-#else
     DIR*   dp;
-#endif
 
 } sys_fs_dir_info;
 
@@ -136,4 +125,4 @@ void sys_fs_init(lv2_syscall_table* tbl);
 }
 #endif
 
-#endif /* SYS_FS_H */
+#endif

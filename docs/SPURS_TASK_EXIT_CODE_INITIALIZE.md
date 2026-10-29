@@ -27,5 +27,4 @@ task creation, and result publication/retrieval/wakeup remain separate work.
 handler and the actual generated target NID registration. Synthetic guest
 memory verifies errors, exact clearing with canaries, repeated initialization,
 guest pointer narrowing, and backing failures. The standalone fixture uses a
-POSIX C/C++ toolchain; Windows skips it explicitly. It runs through CTest when
-tests and Python are enabled.
+POSIX C/C++ toolchain and runs through CTest when tests and Python are enabled.

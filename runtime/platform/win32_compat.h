@@ -5,8 +5,7 @@
  * synchronisation and timing API (SRWLOCK, CONDITION_VARIABLE, QPC, events),
  * the interlocked intrinsics behind the PPU reservation spinlock, and the
  * scalar typedefs (DWORD, ULONGLONG, SIZE_T, ...) those call sites use. This
- * header supplies all of it on POSIX so the call sites compile unchanged. On
- * Windows it is a no-op passthrough to <windows.h>.
+ * header supplies all of it over POSIX so the call sites compile unchanged.
  *
  * Usable from C AND C++. That is deliberate: the runtime library is C but the
  * PPU boot scaffold is C++, and both need these names. Nothing in here may use
@@ -21,13 +20,12 @@
  *   - functions that need state shared across translation units (waitable
  *     handles -- events, semaphores, threads, timers -- WaitOnAddress, and the
  *     VirtualAlloc region table). Those are declared here and implemented in
- *     win32_compat.c, which the runtime library compiles on every POSIX host.
- *     A standalone tool that calls one of them links that file too.
+ *     win32_compat.c, which the runtime library always compiles.
  *
  * IMPORTANT -- storage size. Win32 SRWLOCK and CONDITION_VARIABLE are exactly
  * pointer-sized and zero-initialise validly, so several structs (notably
  * spu_context::ch_wait_lock / ch_wait_cv) store them inline in a `void*` slot.
- * pthread_rwlock_t (200 B on Darwin) and pthread_cond_t (48 B) do NOT fit
+ * pthread_rwlock_t and pthread_cond_t do NOT fit
  * there; casting the slot and writing a pthread object through it would
  * overflow into adjacent members. So on POSIX these map to `void*` and the
  * real object is heap-allocated on first use and published into the slot with
@@ -43,15 +41,9 @@
  * that spelt its target `volatile long` fails to compile instead: change it to
  * `volatile LONG`, which is what it always meant.
  */
-#ifndef PS3RECOMP_WIN32_COMPAT_H
+#if !defined(PS3RECOMP_WIN32_COMPAT_H)
 #define PS3RECOMP_WIN32_COMPAT_H
 
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
 
 #include <pthread.h>
 #include <errno.h>
@@ -730,16 +722,8 @@ static inline UINT  timeEndPeriod(UINT period)        { (void)period; return TIM
  * and only failed once Clang rejected it. Hence the CI symbol check. */
 static inline DWORD GetCurrentThreadId(void)
 {
-#if defined(__APPLE__)
-    uint64_t tid = 0;
-    pthread_threadid_np(NULL, &tid);
-    return (DWORD)tid;
-#elif defined(__linux__)
     /* Not gettid(3): that wrapper only appeared in glibc 2.30. */
     return (DWORD)syscall(SYS_gettid);
-#else
-    return (DWORD)(uintptr_t)pthread_self();
-#endif
 }
 static inline DWORD  GetCurrentProcessId(void) { return (DWORD)getpid(); }
 static inline HANDLE GetCurrentProcess(void)   { return (HANDLE)(intptr_t)-1; }   /* pseudo-handle */
@@ -1244,5 +1228,4 @@ static inline BOOL SetProcessInformation(HANDLE process, PROCESS_INFORMATION_CLA
 } /* extern "C" */
 #endif
 
-#endif /* !_WIN32 */
-#endif /* PS3RECOMP_WIN32_COMPAT_H */
+#endif

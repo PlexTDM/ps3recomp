@@ -47,5 +47,5 @@ implementation, generated NID table, and production PPU HLE bridge. It checks ev
 internal ID against a literal policy table, query/load/unload transitions, namespace
 separation, upper argument bits, and unused argument registers containing invalid
 addresses. Guest-memory canaries allow only the bridge's ABI-required TOC linkage
-write. All runners bound execution and skip standalone compilation on Windows.
-The existing macOS/Linux `tools/test_*.py` discovery runs them without another CI step.
+write. All runners bound execution. The existing Linux `tools/test_*.py` discovery
+runs them without another CI step.

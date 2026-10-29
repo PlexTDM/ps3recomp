@@ -32,21 +32,12 @@
 #  undef st_ctime
 #endif
 
-#ifdef _WIN32
-#  include <windows.h>
-#  include <io.h>
-#  include <direct.h>
-#  define HOST_MKDIR(p) _mkdir(p)
-#  define HOST_STAT     _stat64
-#  define HOST_STAT_T   struct __stat64
-#else
 #  include <unistd.h>
 #  include <dirent.h>
 #  include <sys/types.h>
 #  define HOST_MKDIR(p) mkdir(p, 0755)
 #  define HOST_STAT     stat
 #  define HOST_STAT_T   struct stat
-#endif
 
 /* ---------------------------------------------------------------------------
  * Internal helpers
@@ -86,11 +77,6 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
     save_root_init();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
-#ifdef _WIN32
-    for (char* p = buf; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
 }
 
 /* The generic HLE adapter passes PPC register values raw, so string args
@@ -109,11 +95,7 @@ static int dir_exists(const char* path)
     HOST_STAT_T st;
     if (HOST_STAT(path, &st) != 0)
         return 0;
-#ifdef _WIN32
-    return (st.st_mode & _S_IFDIR) != 0;
-#else
     return S_ISDIR(st.st_mode);
-#endif
 }
 
 /* Does this directory hold an actual save, as opposed to merely existing?
@@ -452,37 +434,6 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
     save_root_init();
     ensure_dirs(s_save_root);
 
-#ifdef _WIN32
-    {
-        char search[1024];
-        snprintf(search, sizeof(search), "%s\\*", s_save_root);
-        for (char* p = search; *p; p++) {
-            if (*p == '/') *p = '\\';
-        }
-
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(search, &fd);
-        if (hFind == INVALID_HANDLE_VALUE)
-            return 0;
-
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                continue;
-            if (fd.cFileName[0] == '.')
-                continue;
-            if (prefix && prefix[0] && strncmp(fd.cFileName, prefix, strlen(prefix)) != 0)
-                continue;
-            if (count < max && dirList) {
-                memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
-                strncpy(dirList[count].dirName, fd.cFileName,
-                        CELL_SAVEDATA_DIRNAME_SIZE - 1);
-            }
-            count++;
-        } while (FindNextFileA(hFind, &fd));
-
-        FindClose(hFind);
-    }
-#else
     {
         DIR* dp = opendir(s_save_root);
         if (!dp)
@@ -508,7 +459,6 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
         }
         closedir(dp);
     }
-#endif
 
     return count;
 }
@@ -537,9 +487,6 @@ static u32 savedata_content_type(const char* name)
 static void pfd_path(const char* save_path, char* out, size_t n)
 {
     snprintf(out, n, "%s/PARAM.PFD", save_path);
-#ifdef _WIN32
-    for (char* p = out; *p; p++) if (*p == '/') *p = '\\';
-#endif
 }
 
 static int pfd_has(const char* save_path, const char* name)
@@ -579,34 +526,6 @@ static u32 enumerate_save_files(const char* save_path,
 {
     u32 count = 0;
 
-#ifdef _WIN32
-    {
-        char search[1024];
-        snprintf(search, sizeof(search), "%s\\*", save_path);
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(search, &fd);
-        if (hFind == INVALID_HANDLE_VALUE)
-            return 0;
-
-        do {
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || savedata_system_file(fd.cFileName))
-                continue;
-            if (count < max && fileList) {
-                memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
-                fileList[count].fileType = savedata_file_type(save_path, fd.cFileName);
-                strncpy(fileList[count].fileName, fd.cFileName,
-                        CELL_SAVEDATA_FILENAME_SIZE - 1);
-                ULARGE_INTEGER sz;
-                sz.HighPart = fd.nFileSizeHigh;
-                sz.LowPart  = fd.nFileSizeLow;
-                fileList[count].st_size = (u64)sz.QuadPart;
-            }
-            count++;
-        } while (FindNextFileA(hFind, &fd));
-
-        FindClose(hFind);
-    }
-#else
     {
         DIR* dp = opendir(save_path);
         if (!dp)
@@ -621,39 +540,22 @@ static u32 enumerate_save_files(const char* save_path,
             HOST_STAT_T st;
             if (HOST_STAT(full, &st) != 0)
                 continue;
-#ifdef _WIN32
-            if (st.st_mode & _S_IFDIR)
-                continue;
-#else
             if (S_ISDIR(st.st_mode))
                 continue;
-#endif
             if (count < max && fileList) {
                 memset(&fileList[count], 0, sizeof(CellSaveDataFileStat));
                 fileList[count].fileType = savedata_file_type(save_path, de->d_name);
                 strncpy(fileList[count].fileName, de->d_name,
                         CELL_SAVEDATA_FILENAME_SIZE - 1);
                 fileList[count].st_size = (u64)st.st_size;
-#ifdef _WIN32
-                fileList[count].st_atime = (s64)st.st_atime;
-                fileList[count].st_mtime = (s64)st.st_mtime;
-                fileList[count].st_ctime = (s64)st.st_ctime;
-#elif defined(__APPLE__)
-/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-                fileList[count].st_atime = (s64)st.st_atimespec.tv_sec;
-                fileList[count].st_mtime = (s64)st.st_mtimespec.tv_sec;
-                fileList[count].st_ctime = (s64)st.st_ctimespec.tv_sec;
-#else
                 fileList[count].st_atime = (s64)st.st_atim.tv_sec;
                 fileList[count].st_mtime = (s64)st.st_mtim.tv_sec;
                 fileList[count].st_ctime = (s64)st.st_ctim.tv_sec;
-#endif
             }
             count++;
         }
         closedir(dp);
     }
-#endif
 
     return count;
 }
@@ -678,11 +580,6 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         return CELL_SAVEDATA_ERROR_PARAM;
     char file_path[1024];
     snprintf(file_path, sizeof(file_path), "%s/%s", save_path, name);
-#ifdef _WIN32
-    for (char* p = file_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
 
     switch (set->fileOperation) {
     case CELL_SAVEDATA_FILEOP_READ: {
@@ -692,11 +589,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
-#ifdef _MSC_VER
-            _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
-#else
             fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
-#endif
         }
         size_t read_size = (size_t)set->fileSize;
         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
@@ -724,11 +617,7 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
             return CELL_SAVEDATA_ERROR_ACCESS_ERROR;
         }
         if (set->fileOffset > 0) {
-#ifdef _MSC_VER
-            _fseeki64(fp, (long long)set->fileOffset, SEEK_SET);
-#else
             fseeko(fp, (off_t)set->fileOffset, SEEK_SET);
-#endif
         }
         size_t write_size = (size_t)set->fileSize;
         if (write_size > set->fileBufSize) write_size = set->fileBufSize;
@@ -757,11 +646,6 @@ static void write_param_sfo(const char* save_path, const CellSaveDataSystemFileP
 
     char sfo_path[1024];
     snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
 
     /* SAVEDATA_DIRECTORY is the last path component of the save directory */
     const char* dir = save_path;
@@ -795,11 +679,6 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
 
     char sfo_path[1024];
     snprintf(sfo_path, sizeof(sfo_path), "%s/PARAM.SFO", save_path);
-#ifdef _WIN32
-    for (char* p = sfo_path; *p; p++) {
-        if (*p == '/') *p = '\\';
-    }
-#endif
 
     FILE* fp = fopen(sfo_path, "rb");
     if (!fp) return;
@@ -888,20 +767,9 @@ static s32 savedata_execute(const char* dirName, int is_save,
     if (!is_new) {
         HOST_STAT_T hst;
         if (HOST_STAT(save_path, &hst) == 0) {
-#ifdef _WIN32
-            statGet.dir.st_atime = (s64)hst.st_atime;
-            statGet.dir.st_mtime = (s64)hst.st_mtime;
-            statGet.dir.st_ctime = (s64)hst.st_ctime;
-#elif defined(__APPLE__)
-/* Darwin names the sub-second stat fields st_*timespec, not glibc's st_*tim. */
-            statGet.dir.st_atime = (s64)hst.st_atimespec.tv_sec;
-            statGet.dir.st_mtime = (s64)hst.st_mtimespec.tv_sec;
-            statGet.dir.st_ctime = (s64)hst.st_ctimespec.tv_sec;
-#else
             statGet.dir.st_atime = (s64)hst.st_atim.tv_sec;
             statGet.dir.st_mtime = (s64)hst.st_mtim.tv_sec;
             statGet.dir.st_ctime = (s64)hst.st_ctim.tv_sec;
-#endif
         }
         read_param_sfo(save_path, &statGet.getParam);
     }

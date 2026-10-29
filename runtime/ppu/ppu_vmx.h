@@ -504,9 +504,9 @@ VMX_INL uint32_t vmx_vcmpgtfp(VMX_D, VMX_A, VMX_B) {
  * arm64 (NEON) forms, as the x86-64-v3 ones: one rev32 puts a register's
  * big-endian words in host order in the lanes, element i in lane i, and back.
  * Each form is its scalar twin above step for step. Threads run with FPCR.FZ
- * and FPCR.DN clear (macOS's and Linux's default), so a denormal is computed
- * here as the scalar code computes it; VSCR[NJ] flushing and the NaN rules
- * are done on the bits, as there.
+ * and FPCR.DN clear (the Linux default), so a denormal is computed here as the
+ * scalar code computes it; VSCR[NJ] flushing and the NaN rules are done on the
+ * bits, as there.
  * ==================================================================== */
 #include <arm_neon.h>
 #define VMX_N static inline __attribute__((always_inline))

@@ -1,11 +1,10 @@
 /*
  * ps3recomp - tests/fiber_switch/main.c
  *
- * cellFiber cooperative switching, on whatever mechanism the host uses:
- * Windows fibers on Windows, ucontext elsewhere. Apple marks the ucontext
- * routines deprecated and hides them behind _XOPEN_SOURCE, which raises the
- * fair question of whether they still work on arm64 -- so ask, several
- * thousand switches at a time, instead of assuming either way.
+ * cellFiber cooperative switching on the host's ucontext. The routines are
+ * deprecated on some hosts and hidden behind _XOPEN_SOURCE, which raises the
+ * fair question of whether they still work -- so ask, several thousand
+ * switches at a time, instead of assuming either way.
  *
  * Two shapes matter and they are not the same code path:
  *
