@@ -227,6 +227,12 @@ typedef struct CellPadHostInput {
 typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
 
+/* A button pressed into port 0 from outside the host's own devices: what the
+ * window's Esc key does (the pad's back/cancel button). The press lasts
+ * `hold_ms` (100 if 0) so a title that polls slowly still sees the edge, and
+ * a run of calls -- a key held down -- keeps it held. Any thread. */
+void cellPad_host_button_press(u16 mask, u32 hold_ms);
+
 #ifdef __cplusplus
 }
 #endif

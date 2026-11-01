@@ -69,7 +69,8 @@ int  rsx_vulkan_backend_init(u32 width, u32 height, const char* title);
 void rsx_vulkan_backend_shutdown(void);
 
 /* Headless: always 0. Windowed: drains SDL's event queue; -1 once the
- * window has been closed or Esc pressed. */
+ * window has been closed. Esc is not an exit: it presses the pad's Circle
+ * button, the back/cancel one, unless PS3RECOMP_ESCAPE_QUITS is set. */
 int  rsx_vulkan_backend_pump_messages(void);
 
 /* Read the frame back to host memory (and to PS3RECOMP_VK_DUMP if set). */

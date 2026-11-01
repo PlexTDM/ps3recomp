@@ -55,6 +55,7 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_shader_spirv.h"
 #include "rsx_draw_engine.h"
+#include "../input/cellPad.h"
 #include "vulkan/rsx_vk_fallback_vert.spv.h"
 #include "vulkan/rsx_vk_fallback_frag.spv.h"
 
@@ -4399,7 +4400,7 @@ void rsx_vulkan_backend_shutdown(void)
     (void)vk_batch_flush();
     if (s_vk.windowed && s_vk.swapchain && s_vk.presented && s_vk.hold_seconds > 0.0) {
         VK_LOG("holding the last frame on screen for %.1f s "
-               "(Esc or closing the window ends it early)\n", s_vk.hold_seconds);
+               "(closing the window ends it early)\n", s_vk.hold_seconds);
         const Uint32 end = SDL_GetTicks() + (Uint32)(s_vk.hold_seconds * 1000.0);
         while (s_vk.windowed && !SDL_TICKS_PASSED(SDL_GetTicks(), end)) {
             if (rsx_vulkan_backend_pump_messages() != 0) break;
@@ -4451,6 +4452,18 @@ void rsx_vulkan_backend_shutdown(void)
     memset(&s_vk, 0, sizeof s_vk);
 }
 
+/* Esc closes the window only on request: PS3RECOMP_ESCAPE_QUITS=1. Unset, it
+ * is the pad's back/cancel button instead (see the event pump). */
+static int vk_escape_quits(void)
+{
+    static int quits = -1;
+    if (quits < 0) {
+        const char* e = getenv("PS3RECOMP_ESCAPE_QUITS");
+        quits = e && *e && strcmp(e, "0") != 0;
+    }
+    return quits;
+}
+
 int rsx_vulkan_backend_pump_messages(void)
 {
     if (!s_vk.windowed) return 0;
@@ -4459,7 +4472,13 @@ int rsx_vulkan_backend_pump_messages(void)
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) quit = 1;
-        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) quit = 1;
+        else if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) {
+            /* Back, not exit: the pad's Circle (B on an Xbox pad), which is
+             * back in a menu and the guard in play. Closing the window or
+             * Alt+F4 still ends the run, as does PS3RECOMP_ESCAPE_QUITS=1. */
+            if (vk_escape_quits()) quit = 1;
+            else cellPad_host_button_press(CELL_PAD_CTRL_CIRCLE, 100);
+        }
         else if (e.type == SDL_WINDOWEVENT &&
                  (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                   e.window.event == SDL_WINDOWEVENT_RESIZED) &&
