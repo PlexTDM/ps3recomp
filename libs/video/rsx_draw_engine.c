@@ -3350,6 +3350,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     (void)user; (void)r;
     if (!g.ready || !dc.n_packets) return;
     eng_draw_stats_tick();
+    { static double pms[5]; static unsigned long pn;
+      const double p0 = eng_now_ms();
+      double pv = p0;
+#define PPH(i) do { const double pn2 = eng_now_ms(); pms[i] += pn2 - pv; pv = pn2; } while (0)
 
     const u32 prim = g.rsx.current_primitive;
     /* Everything that becomes triangles -- lists, strips, fans, quads, quad
@@ -3424,6 +3428,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         s_dstat.refs += dc.n_source_refs; s_dstat.verts += dc.n_verts;
         s_dstat.vbytes += (unsigned long long)dc.n_verts * layout.stride;
     }
+    PPH(0);
     if (!dc.n_verts || !dc.fetch_ok) { s_dstat.drop_fetch++; eng_draw_trace(dc.fetch_ok ? "DROP-noverts" : "DROP-fetch", prim, 0, 0, 0, 0); return; }
 
     if (!vce) {
@@ -3478,6 +3483,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                                             textures, samplers);
     const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                     vsamplers);
+    PPH(1);
 
     /* A guest program pair that will not translate has no fallback: the draw
      * is dropped, as the reference engine drops it. Substituting the built-in
@@ -3502,6 +3508,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u32 pipeline = eng_pipeline_get(&layout, &rs, rt_fmt,
                                           n_targets, &pipeline_is_fixed);
     if (!pipeline) { s_dstat.drop_pipeline++; eng_draw_trace("DROP-pipeline", prim, indexed, n_draw, 0, tex_mask); return; }
+    PPH(2);
     /* RSX_SURF_DUMP_AT_FP=<hash>: the first time (from RSX_SURF_DUMP_FROM) a
      * draw with that fragment program is about to run, finish the GPU work
      * recorded so far and dump every surface -- what the draw will read. */
@@ -3711,6 +3718,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (rs.color_mask) { rsx_dsp_vertex_attr a7; rsx_dsp_get_vertex_attr(&g.rsx, 7, &a7);
         if (a7.type == 7) { s_skin_draws++; s_skin_verts += dc.n_verts; } }
     eng_draw_trace(pipeline_is_fixed ? "OK-fixed" : "OK", prim, indexed, n_draw, pipeline, tex_mask);
+    PPH(3);
     /* RSX_PICK=<x>,<y>,<frame>: after every draw of that frame into a
      * full-size target, finish the GPU work and read pixel (x, y) of the
      * draw's first target back -- which draws touch a pixel, and what each

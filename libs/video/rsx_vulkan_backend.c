@@ -1909,10 +1909,30 @@ static void vk_grab_ppm(const unsigned char* rgba)
     remove(req);
 }
 
+/* Does this present have to move the whole frame back to host memory?  Only
+ * a PPM dump or a grab request needs the pixels; without either, the center
+ * pixel alone is enough for readback_center().  Copying 3.7 MB and waiting
+ * for it every presented frame costs more than the whole draw walker. */
+static int vk_grab_requested(void)
+{
+    if (!s_vk.grab_prefix || !*s_vk.grab_prefix) return 0;
+    char req[1024];
+    snprintf(req, sizeof req, "%s.req", s_vk.grab_prefix);
+    FILE* r = fopen(req, "rb");
+    if (!r) return 0;
+    fclose(r);
+    return 1;
+}
+
 static void vk_cb_present(void* ud, u32 buffer_id)
 {
     (void)ud; (void)buffer_id;
     if (!s_vk.device) return;
+
+    const int grab = vk_grab_requested();
+    const int full = s_vk.dump_path != NULL || grab;
+    const unsigned char* px = NULL;
+    size_t center_off = 0;
 
     if (vk_begin()) return;
     vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
@@ -1920,6 +1940,15 @@ static void vk_cb_present(void* ud, u32 buffer_id)
         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { s_vk.width, s_vk.height, 1 },
     };
+    if (!full) {
+        /* One texel at the centre; buffer offset 0 keeps the read trivial. */
+        region.imageOffset.x = (int32_t)(s_vk.width / 2);
+        region.imageOffset.y = (int32_t)(s_vk.height / 2);
+        region.imageOffset.z = 0;
+        region.imageExtent.width = 1;
+        region.imageExtent.height = 1;
+        region.imageExtent.depth = 1;
+    }
     pvkCmdCopyImageToBuffer(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL,
                             s_vk.readback.buf, 1, &region);
     VkBufferMemoryBarrier host = {
@@ -1933,14 +1962,15 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     if (vk_submit_and_wait()) return;
 
     vk_invalidate(&s_vk.readback);
-    const unsigned char* px = (const unsigned char*)s_vk.readback.ptr;
-    size_t c = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
-    s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
+    px = (const unsigned char*)s_vk.readback.ptr;
+    if (full) center_off = ((size_t)(s_vk.height / 2) * s_vk.width + s_vk.width / 2) * 4;
+    s_vk.last_center = ((u32)px[center_off] << 16) | ((u32)px[center_off + 1] << 8)
+                     | (u32)px[center_off + 2];
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
     s_g.draws = 0;
     if (s_vk.dump_path) vk_dump_ppm(px);
-    vk_grab_ppm(px);
+    if (grab) vk_grab_ppm(px);
     vk_present_window();
 }
 
@@ -2682,16 +2712,29 @@ static struct {
 
 /* Draws are pipelined through these slots: each has its own command buffer,
  * descriptor set, uniform buffer and vertex/index buffers, so the CPU records
- * the next draw while the GPU still owns the previous one. 64 in flight is
- * enough to cover UE3's biggest pass; a slot is waited on only when reused. */
+ * the next draw while the GPU still owns the previous one. 64 slots, and the
+ * recorded draws are handed to the queue VK_ENG_BATCH at a time: one submit
+ * and one fence per batch rather than one per draw. A batch stays in flight
+ * while the next is recorded; a slot is waited on only when its batch is
+ * reused. 121 draws a frame were 121 submissions, and on RADV that alone was
+ * most of the walker's time. */
 #define VK_ENG_SLOTS 64
+#define VK_ENG_BATCH 16
+#define VK_ENG_BATCHES (VK_ENG_SLOTS / VK_ENG_BATCH)
 
 typedef struct {
     VkCommandBuffer cmd;
-    VkFence         fence;
     VkDescriptorSet set;
     vk_buffer       ubo, vbuf, ibuf;
-    int             pending;
+    int             pending;              /* submitted, GPU may still read it */
+    u32             batch;                /* s_batch index while pending */
+    /* What `set` was last written with. A repeated draw then skips the 32
+     * texture/sampler descriptor writes; only the UBO contents differ, and
+     * those are copied into this slot's own buffer anyway. */
+    VkBuffer            d_ubo;
+    u32                 d_vs, d_ps, d_mask;
+    u32                 d_tex[RSX_BE_MAX_TEXTURES];
+    rsx_be_sampler_desc d_samp[RSX_BE_MAX_TEXTURES];
 } vk_eng_slot;
 
 static vk_eng_slot s_eslot[VK_ENG_SLOTS];
@@ -2700,14 +2743,56 @@ static VkCommandPool s_eslot_cmd_pool;
 static VkDescriptorPool s_eslot_desc_pool;
 static int s_eslot_ready;
 
+/* Recorded command buffers not yet handed to the queue, and the in-flight
+ * batches: one fence and the slots each covers. */
+static u32 s_eslot_pend[VK_ENG_BATCH];
+static u32 s_eslot_npend;
+
+static struct {
+    VkFence fence;
+    u32     n;
+    u32     slot[VK_ENG_BATCH];
+    int     pending;
+} s_batch[VK_ENG_BATCHES];
+static u32 s_batch_next;
+
+static void vk_eng_batch_done(u32 b)
+{
+    if (!s_batch[b].pending) return;
+    pvkWaitForFences(s_vk.device, 1, &s_batch[b].fence, VK_TRUE, UINT64_MAX);
+    for (u32 i = 0; i < s_batch[b].n; i++) s_eslot[s_batch[b].slot[i]].pending = 0;
+    s_batch[b].n = 0;
+    s_batch[b].pending = 0;
+}
+
+static void vk_eng_flush(void)
+{
+    if (!s_eslot_ready || !s_vk.device || !s_eslot_npend) return;
+    const u32 b = s_batch_next++ % VK_ENG_BATCHES;
+    vk_eng_batch_done(b);
+    VkCommandBuffer cmds[VK_ENG_BATCH];
+    for (u32 i = 0; i < s_eslot_npend; i++) cmds[i] = s_eslot[s_eslot_pend[i]].cmd;
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .commandBufferCount = s_eslot_npend, .pCommandBuffers = cmds };
+    pvkResetFences(s_vk.device, 1, &s_batch[b].fence);
+    const u32 n = s_eslot_npend;
+    s_eslot_npend = 0;
+    if (pvkQueueSubmit(s_vk.queue, 1, &si, s_batch[b].fence) != VK_SUCCESS) return;
+    s_batch[b].n = n;
+    for (u32 i = 0; i < n; i++) {
+        const u32 s = s_eslot_pend[i];
+        s_eslot[s].batch = b;
+        s_eslot[s].pending = 1;
+        s_batch[b].slot[i] = s;
+    }
+    s_batch[b].pending = 1;
+}
+
 static void vk_eng_slots_wait_all(void)
 {
     if (!s_eslot_ready || !s_vk.device) return;
-    for (u32 i = 0; i < VK_ENG_SLOTS; i++)
-        if (s_eslot[i].pending) {
-            pvkWaitForFences(s_vk.device, 1, &s_eslot[i].fence, VK_TRUE, UINT64_MAX);
-            s_eslot[i].pending = 0;
-        }
+    vk_eng_flush();
+    for (u32 b = 0; b < VK_ENG_BATCHES; b++) vk_eng_batch_done(b);
 }
 
 static int vk_eng_slots_init(void)
@@ -2730,11 +2815,10 @@ static int vk_eng_slots_init(void)
     if (pvkAllocateCommandBuffers(s_vk.device, &cai, cmds) != VK_SUCCESS) goto fail_pool;
 
     VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    for (u32 i = 0; i < VK_ENG_SLOTS; i++) {
-        s_eslot[i].cmd = cmds[i];
-        if (pvkCreateFence(s_vk.device, &fci, NULL, &s_eslot[i].fence) != VK_SUCCESS)
+    for (u32 i = 0; i < VK_ENG_SLOTS; i++) s_eslot[i].cmd = cmds[i];
+    for (u32 b = 0; b < VK_ENG_BATCHES; b++)
+        if (pvkCreateFence(s_vk.device, &fci, NULL, &s_batch[b].fence) != VK_SUCCESS)
             goto fail_fences;
-    }
 
     VkDescriptorPoolSize ps[3] = {
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_ENG_SLOTS * 2u },
@@ -2756,6 +2840,8 @@ static int vk_eng_slots_init(void)
         .pSetLayouts = layouts };
     if (pvkAllocateDescriptorSets(s_vk.device, &dai, sets) != VK_SUCCESS) goto fail_desc;
     for (u32 i = 0; i < VK_ENG_SLOTS; i++) s_eslot[i].set = sets[i];
+    s_eslot_npend = 0;
+    s_batch_next = 0;
     s_eslot_ready = 1;
     return 0;
 
@@ -2763,10 +2849,10 @@ fail_desc:
     pvkDestroyDescriptorPool(s_vk.device, s_eslot_desc_pool, NULL);
     s_eslot_desc_pool = VK_NULL_HANDLE;
 fail_fences:
-    for (u32 i = 0; i < VK_ENG_SLOTS; i++)
-        if (s_eslot[i].fence) {
-            pvkDestroyFence(s_vk.device, s_eslot[i].fence, NULL);
-            s_eslot[i].fence = VK_NULL_HANDLE;
+    for (u32 b = 0; b < VK_ENG_BATCHES; b++)
+        if (s_batch[b].fence) {
+            pvkDestroyFence(s_vk.device, s_batch[b].fence, NULL);
+            s_batch[b].fence = VK_NULL_HANDLE;
         }
 fail_pool:
     pvkDestroyCommandPool(s_vk.device, s_eslot_cmd_pool, NULL);
@@ -2782,11 +2868,15 @@ static void vk_eng_slots_destroy(void)
         vk_destroy_buffer(&s_eslot[i].ubo);
         vk_destroy_buffer(&s_eslot[i].vbuf);
         vk_destroy_buffer(&s_eslot[i].ibuf);
-        if (s_eslot[i].fence) pvkDestroyFence(s_vk.device, s_eslot[i].fence, NULL);
     }
+    for (u32 b = 0; b < VK_ENG_BATCHES; b++)
+        if (s_batch[b].fence) pvkDestroyFence(s_vk.device, s_batch[b].fence, NULL);
     if (s_eslot_desc_pool) pvkDestroyDescriptorPool(s_vk.device, s_eslot_desc_pool, NULL);
     if (s_eslot_cmd_pool) pvkDestroyCommandPool(s_vk.device, s_eslot_cmd_pool, NULL);
+    memset(s_batch, 0, sizeof s_batch);
     memset(s_eslot, 0, sizeof s_eslot);
+    s_eslot_npend = 0;
+    s_batch_next = 0;
     s_eslot_desc_pool = VK_NULL_HANDLE;
     s_eslot_cmd_pool = VK_NULL_HANDLE;
     s_eslot_ready = 0;
@@ -3232,8 +3322,7 @@ static VkImageView vk_eng_sample_view(u32 handle)
 
 static void vk_eng_write_descriptors(VkDescriptorSet set, VkBuffer ubo,
                                      u32 vs_bytes, u32 ps_bytes)
-{
-    VkDescriptorBufferInfo bi[2] = {
+{    VkDescriptorBufferInfo bi[2] = {
         { ubo, 0, vs_bytes ? vs_bytes : 16u },
         { ubo, s_g.ps_off, ps_bytes ? ps_bytes : 16u },
     };
@@ -3261,10 +3350,35 @@ static void vk_eng_write_descriptors(VkDescriptorSet set, VkBuffer ubo,
     pvkUpdateDescriptorSets(s_vk.device, 4, w, 0, NULL);
 }
 
+/* ---- temporary draw-path profiling (DOD3_VKPROF=1) --------------------- */
+static int s_vkprof = -1;
+static double s_vkp_t[5];
+static unsigned long s_vkp_n;
+static int vkp_on(void)
+{
+    if (s_vkprof < 0) s_vkprof = getenv("DOD3_VKPROF") ? 1 : 0;
+    return s_vkprof;
+}
+static double vkp_now(void)
+{
+    return (double)SDL_GetPerformanceCounter() * 1000.0 / (double)SDL_GetPerformanceFrequency();
+}
+static void vkp_add(int i, double t0) { if (s_vkprof) s_vkp_t[i] += vkp_now() - t0; }
+static void vkp_end(void)
+{
+    if (!s_vkprof) return;
+    if (++s_vkp_n % 600) return;
+    fprintf(stderr, "[vkprof] 600 draws: wait %.2f mem %.2f desc %.2f record %.2f submit %.2f ms\n",
+            s_vkp_t[0], s_vkp_t[1], s_vkp_t[2], s_vkp_t[3], s_vkp_t[4]);
+    memset(s_vkp_t, 0, sizeof s_vkp_t);
+}
+
 static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices, u32 vertex_count,
                         u32 stride, const u32* indices, u32 index_count)
 {
     (void)user;
+    const int prof = vkp_on();
+    double t0 = prof ? vkp_now() : 0.0;
     if (!s_e2.pipeline || !vertices || !vertex_count || !stride) return;
     if (topology < RSX_TOPOLOGY_POINTS || topology > RSX_TOPOLOGY_TRIANGLE_STRIP) return;
     vk_eng_pipe* P = &s_epipe[s_e2.pipeline - 1];
@@ -3303,10 +3417,8 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
 
     if (vk_eng_slots_init()) return;
     vk_eng_slot* S = &s_eslot[s_eslot_next++ % VK_ENG_SLOTS];
-    if (S->pending) {
-        pvkWaitForFences(s_vk.device, 1, &S->fence, VK_TRUE, UINT64_MAX);
-        S->pending = 0;
-    }
+    if (S->pending) vk_eng_batch_done(S->batch);
+    if (prof) { vkp_add(0, t0); t0 = vkp_now(); }
 
     const VkDeviceSize ubo_size = (VkDeviceSize)s_g.ps_off + sizeof s_e2.ps_data;
     if (vk_ensure_buffer(&S->ubo, ubo_size, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) return;
@@ -3323,7 +3435,20 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
         if (vk_ensure_buffer(&S->ibuf, ibytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) return;
         memcpy(S->ibuf.ptr, indices, (size_t)ibytes);
     }
-    vk_eng_write_descriptors(S->set, S->ubo.buf, s_e2.vs_bytes, s_e2.ps_bytes);
+    if (prof) { vkp_add(1, t0); t0 = vkp_now(); }
+    if (S->d_ubo != S->ubo.buf || S->d_vs != s_e2.vs_bytes || S->d_ps != s_e2.ps_bytes ||
+        S->d_mask != s_e2.tex_mask ||
+        memcmp(S->d_tex, s_e2.tex, sizeof S->d_tex) ||
+        memcmp(S->d_samp, s_e2.samp, sizeof S->d_samp)) {
+        vk_eng_write_descriptors(S->set, S->ubo.buf, s_e2.vs_bytes, s_e2.ps_bytes);
+        S->d_ubo = S->ubo.buf;
+        S->d_vs = s_e2.vs_bytes;
+        S->d_ps = s_e2.ps_bytes;
+        S->d_mask = s_e2.tex_mask;
+        memcpy(S->d_tex, s_e2.tex, sizeof S->d_tex);
+        memcpy(S->d_samp, s_e2.samp, sizeof S->d_samp);
+    }
+    if (prof) { vkp_add(2, t0); t0 = vkp_now(); }
 
     VkCommandBufferBeginInfo bi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -3376,12 +3501,14 @@ static void vk_eng_draw(void* user, rsx_topology topology, const void* vertices,
     }
     pvkCmdEndRenderPass(S->cmd);
     if (pvkEndCommandBuffer(S->cmd) != VK_SUCCESS) return;
+    if (prof) { vkp_add(3, t0); t0 = vkp_now(); }
 
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .commandBufferCount = 1, .pCommandBuffers = &S->cmd };
-    pvkResetFences(s_vk.device, 1, &S->fence);
-    if (pvkQueueSubmit(s_vk.queue, 1, &si, S->fence) != VK_SUCCESS) return;
-    S->pending = 1;
+    /* Hand the recorded draw to the queue only when a batch is full; every
+     * flush before a synchronous operation (present, upload, snapshot,
+     * release) submits whatever is left. */
+    s_eslot_pend[s_eslot_npend++] = (u32)(S - s_eslot);
+    if (s_eslot_npend >= VK_ENG_BATCH) vk_eng_flush();
+    if (prof) { vkp_add(4, t0); vkp_end(); }
 }
 
 static const rsx_draw_backend s_vk_engine_backend = {
