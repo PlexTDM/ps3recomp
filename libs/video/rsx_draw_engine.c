@@ -743,7 +743,13 @@ static void eng_zdepth_copy_size(const eng_zdepth* z, u32 tw, u32 th, u32* w, u3
 static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    /* A cleared target is a valid depth map even before its first writing
+     * draw: the backend initialises it to the far plane and the clear left a
+     * defined value across the region.  Requiring had_write made a shadow
+     * projection that ran before its casters' depth pass sample the guest's
+     * stale bytes instead -- the whole projection came out dark (a rectangle
+     * the size of the shadow volume) until some later pass wrote the zeta. */
+    if (!z->handle || (!z->had_write && !z->cleared)) return 0;
     u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
     if (z->snapshot_valid && z->snapshot && z->snap_w == cw && z->snap_h == ch) return z->snapshot;
     if (!g.be->depth_snapshot) return 0;
@@ -770,7 +776,7 @@ static u32 eng_zdepth_snapshot(u32 slot, u32 tw, u32 th)
 static u32 eng_zdepth_packed(u32 slot, u32 tw, u32 th)
 {
     eng_zdepth* z = &g.zdepths[slot];
-    if (!z->handle || !z->had_write) return 0;
+    if (!z->handle || (!z->had_write && !z->cleared)) return 0;
     u32 cw, ch; eng_zdepth_copy_size(z, tw, th, &cw, &ch);
     if (z->packed_valid && z->packed && z->packed_w == cw && z->packed_h == ch) return z->packed;
     if (!g.be->depth_snapshot_rgba8) return 0;
