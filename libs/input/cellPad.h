@@ -229,6 +229,12 @@ typedef struct CellPadHostInput {
 typedef int (*cellPad_host_input_fn)(void* user, int focused, CellPadHostInput* out);
 void cellPad_set_host_input(cellPad_host_input_fn fn, void* user);
 
+/* Press a button from outside the host's devices (a CELL_PAD_CTRL_* mask),
+ * held for at least hold_ms (100 when 0): how a port's window key can be the
+ * pad's back button. Merged into the packet the guest reads, not into the
+ * host pads' state, so the button prompts keep following a real pad. */
+void cellPad_host_button_press(u16 mask, u32 hold_ms);
+
 #ifdef __cplusplus
 }
 #endif

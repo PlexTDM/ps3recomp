@@ -909,6 +909,18 @@ static unsigned long long pad_now_ms(void)
 #endif
 }
 
+/* Buttons pressed from outside the host's devices, and the earliest monotonic
+ * time their press may end (cellPad_host_button_press, cellPad.h). */
+static volatile u16 s_host_button_mask;
+static volatile unsigned long long s_host_button_until;
+
+void cellPad_host_button_press(u16 mask, u32 hold_ms)
+{
+    if (!mask) return;
+    s_host_button_mask  = mask;
+    s_host_button_until = pad_now_ms() + (hold_ms ? hold_ms : 100);
+}
+
 /* The port's keyboard and mouse into port 0, beside whatever pad is there. */
 static void pad_poll_host_input(void)
 {
@@ -1170,6 +1182,16 @@ skip_inject: ;
      * (via sagemono, PR #42) */
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)(hs->buttons & 0xFF);
     data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = (u16)((hs->buttons >> 8) & 0xFF);
+
+    /* A button pressed from outside the host's devices -- the window's Esc
+     * key, as the back button. The host's own pads say nothing about it, so
+     * it is merged here rather than into s_host_state (a real pad's state,
+     * which the prompts follow, is left as it is). */
+    { const u16 mask = s_host_button_mask;
+      if (mask && s_host_button_until > pad_now_ms()) {
+          data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= (u16)(mask & 0xFF);
+          data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((mask >> 8) & 0xFF);
+      } }
 
     /* PAD_AUTOPRESS: headless bring-up input -- pulse CROSS then START every few
      * seconds of polling so boot screens that wait for input advance without a

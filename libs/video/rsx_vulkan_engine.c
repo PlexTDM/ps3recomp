@@ -72,6 +72,7 @@
 #include "rsx_shader_spirv.h"
 #include "rsx_vulkan_engine.h"
 #include "rsx_host_mouse.h"
+#include "../input/cellPad.h"
 #include "rsx_present_pace.h"
 #include "rsx_present_passes.h"
 #include "rsx_hdr_display.h"
@@ -1199,9 +1200,15 @@ static void eng_sdl_event(const SDL_Event* e)
     case SDL_KEYUP:
         if ((unsigned)e->key.keysym.scancode < SDL_NUM_SCANCODES)
             s_key_down[e->key.keysym.scancode] = e->type == SDL_KEYDOWN;
-        /* Escape closes the window unless the port wants the key (Alt+F4 always does) */
-        if (e->type == SDL_KEYDOWN && e->key.keysym.scancode == SDL_SCANCODE_ESCAPE && s_escape_closes)
-            s_window_closed = 1;
+        /* Escape closes the window unless the port wants the key (Alt+F4 always does). */
+        if (e->type == SDL_KEYDOWN && e->key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
+            /* A port that binds it (rsx_host_window_escape_closes(0)) gets the
+             * pad's back button instead: Circle, back in a menu and the guard
+             * in play, merged into port 0's packet for 100 ms so a title that
+             * polls the pad slowly still sees the press. */
+            if (s_escape_closes) s_window_closed = 1;
+            else cellPad_host_button_press(CELL_PAD_CTRL_CIRCLE, 100);
+        }
         break;
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP: {
