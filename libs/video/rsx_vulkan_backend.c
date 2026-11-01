@@ -275,6 +275,7 @@ typedef struct vk_state {
     u32              last_center;
     u32              presented;
     const char*      dump_path;
+    const char*      grab_prefix;      /* PS3RECOMP_FRAME_GRAB: <prefix>.req -> .ppm */
 } vk_state;
 
 static vk_state s_vk;
@@ -2434,19 +2435,49 @@ static void vk_present_frame(void)
     vk_present_submit();
 }
 
-static void vk_dump_ppm(const unsigned char* rgba)
+static int vk_write_ppm(const char* path, const unsigned char* rgba)
 {
     /* Write a complete file and rename it into place: a reader of the
      * path (a test, a screen grab loop) never sees a half-written frame. */
     char tmp[4096];
-    snprintf(tmp, sizeof tmp, "%s.tmp", s_vk.dump_path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE* f = fopen(tmp, "wb");
-    if (!f) { VK_LOG("cannot open %s for the frame dump\n", tmp); return; }
+    if (!f) { VK_LOG("cannot open %s for the frame dump\n", tmp); return -1; }
     fprintf(f, "P6\n%u %u\n255\n", s_vk.out_width, s_vk.out_height);
     for (size_t i = 0; i < (size_t)s_vk.out_width * s_vk.out_height; i++)
         fwrite(rgba + i * 4, 1, 3, f);
-    if (fclose(f) == 0) rename(tmp, s_vk.dump_path);
-    else remove(tmp);
+    if (fclose(f) != 0) { remove(tmp); return -1; }
+    if (rename(tmp, path)) { remove(tmp); return -1; }
+    return 0;
+}
+
+static void vk_dump_ppm(const unsigned char* rgba)
+{
+    if (s_vk.dump_path) vk_write_ppm(s_vk.dump_path, rgba);
+}
+
+/* A grab request: tools/autoplay.sh, tools/live_bench.sh and
+ * docs/DEBUGGING.md create <prefix>.req and expect the next presented frame
+ * written as <prefix>.ppm. Kept from the soyjxck runtime this port used to
+ * build against; the fork does not carry it. */
+static int vk_grab_requested(void)
+{
+    if (!s_vk.grab_prefix || !*s_vk.grab_prefix) return 0;
+    char req[1024];
+    snprintf(req, sizeof req, "%s.req", s_vk.grab_prefix);
+    FILE* r = fopen(req, "rb");
+    if (!r) return 0;
+    fclose(r);
+    return 1;
+}
+
+static void vk_grab_ppm(const unsigned char* rgba)
+{
+    char req[1024], out[1024];
+    snprintf(req, sizeof req, "%s.req", s_vk.grab_prefix);
+    snprintf(out, sizeof out, "%s.ppm", s_vk.grab_prefix);
+    if (vk_write_ppm(out, rgba)) return;
+    remove(req);
 }
 
 static void vk_cb_present(void* ud, u32 buffer_id)
@@ -2469,7 +2500,8 @@ static void vk_cb_present(void* ud, u32 buffer_id)
     /* The game does not read the frame back: its tests that do go through
      * the engine's readback, and PS3RECOMP_VK_DUMP asks here. The vtable
      * path still keeps the old full-frame readback for its pixel checks. */
-    if (!s_vk.eng_active || s_vk.dump_path) {
+    const int grab = vk_grab_requested();
+    if (!s_vk.eng_active || s_vk.dump_path || grab) {
         if (vk_begin()) return;
         vk_barrier_image(s_vk.color.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
         VkBufferImageCopy region = {
@@ -2494,6 +2526,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
         s_vk.last_center = ((u32)px[c] << 16) | ((u32)px[c + 1] << 8) | (u32)px[c + 2];
         s_vk.center_valid = 1;
         if (s_vk.dump_path) vk_dump_ppm(px);
+        if (grab) vk_grab_ppm(px);
     }
     s_vk.presented++;
     s_g.last_draws = s_g.draws;
@@ -4203,6 +4236,8 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.height = height ? height : 720;
     vk_read_scale();
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
+    s_vk.grab_prefix = getenv("PS3RECOMP_FRAME_GRAB");
+    if (!s_vk.grab_prefix) s_vk.grab_prefix = getenv("PS3RECOMP_VK_GRAB");
 
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     if (vk_load_library()) return -1;
